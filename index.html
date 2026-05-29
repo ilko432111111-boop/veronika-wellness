@@ -618,12 +618,6 @@
             messages.appendChild(userMsg);
             
             const userInput = input.value;
-
-            chatHistory.push({
-                role: "customer",
-                content: userInput
-            });
-
             input.value = '';
             messages.scrollTop = messages.scrollHeight;
             
@@ -633,22 +627,13 @@
                 headers: {
                     "Content-Type": "application/json"
                 },
-                body: JSON.stringify({
-                    message: userInput,
-                    history: chatHistory
-                })
+                body: JSON.stringify({ message: userInput })
             })
             .then(response => response.json())
             .then(data => {
                 const botMsg = document.createElement('div');
                 botMsg.className = 'message bot-message';
                 botMsg.textContent = data.reply;
-
-                chatHistory.push({
-                    role: "assistant",
-                    content: data.reply
-                });
-
                 messages.appendChild(botMsg);
                 messages.scrollTop = messages.scrollHeight;
             })
