@@ -600,6 +600,8 @@
     </div>
 
     <script>
+        let chatHistory = [];
+
         function toggleChat() {
             const chatWindow = document.getElementById('chat-window');
             chatWindow.style.display = chatWindow.style.display === 'none' ? 'block' : 'none';
@@ -611,23 +613,33 @@
             
             if (!input.value.trim()) return;
             
-            // Add user message
+            const userInput = input.value;
+
+            // Add user message to the screen
             const userMsg = document.createElement('div');
             userMsg.className = 'message user-message';
-            userMsg.textContent = input.value;
+            userMsg.textContent = userInput;
             messages.appendChild(userMsg);
-            
-            const userInput = input.value;
+
+            // Save customer message to short-term chat memory
+            chatHistory.push({
+                role: "customer",
+                content: userInput
+            });
+
             input.value = '';
             messages.scrollTop = messages.scrollHeight;
             
-            // Connect to real backend
+            // Send latest message + conversation history to backend
             fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
                 },
-                body: JSON.stringify({ message: userInput })
+                body: JSON.stringify({
+                    message: userInput,
+                    history: chatHistory
+                })
             })
             .then(response => response.json())
             .then(data => {
@@ -635,6 +647,16 @@
                 botMsg.className = 'message bot-message';
                 botMsg.textContent = data.reply;
                 messages.appendChild(botMsg);
+
+                // Save assistant reply to short-term chat memory
+                chatHistory.push({
+                    role: "assistant",
+                    content: data.reply
+                });
+
+                // Keep only the latest 12 messages so it does not get too long
+                chatHistory = chatHistory.slice(-12);
+
                 messages.scrollTop = messages.scrollHeight;
             })
             .catch(() => {
