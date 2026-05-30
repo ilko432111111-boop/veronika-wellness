@@ -33,8 +33,19 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    session_id: str
     message: str
     history: Optional[List[ChatMessage]] = []
+
+def save_message(session_id: str, role: str, content: str):
+    try:
+        supabase.table("messages").insert({
+            "session_id": session_id,
+            "role": role,
+            "content": content
+        }).execute()
+    except Exception as error:
+        print(f"Could not save message: {error}")
 
 
 @app.get("/")
@@ -44,6 +55,11 @@ async def root():
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    save_message(
+        session_id=request.session_id,
+        role="user",
+        content=request.message
+    )
     response = supabase.table("documents").select("content").execute()
     context = "\n".join([item["content"] for item in response.data]) if response.data else "No information available."
 
@@ -98,4 +114,12 @@ Reply as Veronika's assistant:
         temperature=0.4
     )
 
-    return {"reply": completion.choices[0].message.content}
+    reply = completion.choices[0].message.content
+
+save_message(
+    session_id=request.session_id,
+    role="assistant",
+    content=reply
+)
+
+return {"reply": reply}
