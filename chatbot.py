@@ -48,7 +48,7 @@ async def chat(request: ChatRequest):
     context = "\n".join([item["content"] for item in response.data]) if response.data else "No information available."
 
     conversation_history = "\n".join([
-        f"{msg.role}: {msg.content}" for msg in request.history[-10:]
+        f"{msg.role}: {msg.content}" for msg in request.history[-20:]
     ])
 
     prompt = f"""
@@ -68,6 +68,13 @@ Very important:
 - Use the business information below only.
 - Do not invent prices, times, treatments, or policies.
 - If unsure, suggest calling 07943319617.
+- Stay focused only on Veronika Beauty Business. 
+- Only answer questions about treatments, prices, booking, availability, location, opening hours, preparation, aftercare, and the customer's treatment needs.
+- If the customer asks about an unrelated topic, politely say you can only help with Veronika's services and ask whether they would like help choosing or booking a treatment.
+- Do not answer general knowledge questions, news questions, personal questions, or unrelated conversation.
+- Relaxing massage is a style of normal massage, not a separate specialist treatment.
+- If someone asks for a relaxing massage, explain that a normal massage can be tailored to be relaxing and gentle.
+- Do not recommend relaxing massage as a separate treatment if another normal massage option is more appropriate.
 
 Business information:
 {context}
