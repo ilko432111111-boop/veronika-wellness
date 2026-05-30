@@ -2,12 +2,12 @@ from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel, Field
 from groq import Groq
 from supabase import create_client, Client
-import os
-import json
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
+from datetime import datetime, timezone
+import json
+import os
 
 load_dotenv()
 
@@ -41,66 +41,18 @@ class ChatRequest(BaseModel):
 
 
 def save_message(session_id: str, role: str, content: str):
-def save_conversation_overview(session_id: str, lead_data: dict):
-def extract_lead_data(conversation_history: str) -> dict:
-def update_conversation_overview(
-    session_id: str,
-    conversation_history: str
-):
-    lead_data = extract_lead_data(conversation_history)
-
-    if lead_data:
-        save_conversation_overview(
-            session_id=session_id,
-            lead_data=lead_data
-        )
     try:
-        extraction_prompt = f"""
-Read the customer conversation below and extract useful lead details.
-
-Only save information the customer has actually provided.
-Do not treat suggestions made by the assistant as confirmed customer details.
-Do not invent missing information.
-
-Return valid JSON only, using exactly these fields:
-{{
-  "name": null,
-  "phone": null,
-  "treatment": null,
-  "duration": null,
-  "preferred_date": null,
-  "preferred_time": null,
-  "notes": null,
-  "status": "new_chat",
-  "summary": null
-}}
-
-Status rules:
-- Use "new_chat" if the customer has not shown a clear interest yet.
-- Use "interested" if the customer is asking about a treatment or price.
-- Use "details_incomplete" if they want an appointment but important details are missing.
-- Use "booking_request_complete" only if treatment, duration, name, phone number, preferred date, and preferred time are all present.
-
-Keep the summary short and useful for the business owner.
-
-Conversation:
-{conversation_history}
-"""
-
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "user", "content": extraction_prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0
-        )
-
-        return json.loads(completion.choices[0].message.content)
+        supabase.table("messages").insert({
+            "session_id": session_id,
+            "role": role,
+            "content": content
+        }).execute()
 
     except Exception as error:
-        print(f"Could not extract lead details: {error}")
-        return {}
+        print(f"Could not save message: {error}")
+
+
+def save_conversation_overview(session_id: str, lead_data: dict):
     try:
         existing_response = (
             supabase.table("conversations")
@@ -151,14 +103,69 @@ Conversation:
 
     except Exception as error:
         print(f"Could not save conversation overview: {error}")
+
+
+def extract_lead_data(conversation_history: str) -> dict:
     try:
-        supabase.table("messages").insert({
-            "session_id": session_id,
-            "role": role,
-            "content": content
-        }).execute()
+        extraction_prompt = f"""
+Read the customer conversation below and extract useful lead details.
+
+Only save information the customer has actually provided.
+Do not treat suggestions made by the assistant as confirmed customer details.
+Do not invent missing information.
+
+Return valid JSON only, using exactly these fields:
+{{
+  "name": null,
+  "phone": null,
+  "treatment": null,
+  "duration": null,
+  "preferred_date": null,
+  "preferred_time": null,
+  "notes": null,
+  "status": "new_chat",
+  "summary": null
+}}
+
+Status rules:
+- Use "new_chat" if the customer has not shown a clear interest yet.
+- Use "interested" if the customer is asking about a treatment or price.
+- Use "details_incomplete" if they want an appointment but important details are missing.
+- Use "booking_request_complete" only if treatment, duration, name, phone number, preferred date, and preferred time are all present.
+
+Keep the summary short and useful for the business owner.
+
+Conversation:
+{conversation_history}
+"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "user", "content": extraction_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+
+        return json.loads(completion.choices[0].message.content)
+
     except Exception as error:
-        print(f"Could not save message: {error}")
+        print(f"Could not extract lead details: {error}")
+        return {}
+
+
+def update_conversation_overview(
+    session_id: str,
+    conversation_history: str
+):
+    lead_data = extract_lead_data(conversation_history)
+
+    if lead_data:
+        save_conversation_overview(
+            session_id=session_id,
+            lead_data=lead_data
+        )
 
 
 @app.get("/")
@@ -214,7 +221,7 @@ Very important:
 - Never take payment.
 - Never confirm that an appointment is booked.
 - After the client selects a treatment, ask naturally for their name, phone number, preferred date, and preferred time.
-- Only once the treatment, name, phone number, preferred date, and preferred time have been collected, say that Veronika will be in touch shortly to confirm.
+- Only once the treatment, duration, name, phone number, preferred date, and preferred time have been collected, say that Veronika will be in touch shortly to confirm.
 - Put the handover confirmation on a new line so the message is easy to read.
 - If unsure, suggest calling 07386 396139.
 
@@ -232,22 +239,29 @@ Reply as Veronika's assistant:
 
     completion = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
         temperature=0.4
     )
 
     reply = completion.choices[0].message.content
 
-save_message(
-    session_id=request.session_id,
-    role="assistant",
-    content=reply
-)
+    save_message(
+        session_id=request.session_id,
+        role="assistant",
+        content=reply
+    )
 
-background_tasks.add_task(
-    update_conversation_overview,
-    request.session_id,
-    conversation_history
-)
+    lead_history = f"""
+{conversation_history}
+assistant: {reply}
+"""
 
-return {"reply": reply}
+    background_tasks.add_task(
+        update_conversation_overview,
+        request.session_id,
+        lead_history
+    )
+
+    return {"reply": reply}
