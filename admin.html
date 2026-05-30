@@ -170,6 +170,34 @@
             font-size: 1.1rem;
         }
 
+        .filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: end;
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
+            background: #f8fafb;
+        }
+
+        .filter-group {
+            min-width: 170px;
+        }
+
+        .filter-group label {
+            margin: 0 0 5px;
+            font-size: 0.78rem;
+            color: var(--muted);
+        }
+
+        .filter-group select {
+            padding: 8px 10px;
+        }
+
+        .clear-filter-button {
+            padding: 9px 12px;
+        }
+
         .table-wrapper { overflow-x: auto; }
 
         table {
@@ -356,6 +384,34 @@
                     <span id="table-message" class="muted"></span>
                 </div>
 
+                <div class="filters">
+                    <div class="filter-group">
+                        <label for="ai-status-filter">AI status</label>
+                        <select id="ai-status-filter">
+                            <option value="all">All AI statuses</option>
+                            <option value="new_chat">New chat</option>
+                            <option value="interested">Interested</option>
+                            <option value="details_incomplete">Incomplete</option>
+                            <option value="booking_request_complete">Complete request</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-group">
+                        <label for="owner-status-filter">Owner status</label>
+                        <select id="owner-status-filter">
+                            <option value="all">All owner statuses</option>
+                            <option value="unreviewed">Unreviewed</option>
+                            <option value="needs_follow_up">Needs follow-up</option>
+                            <option value="contacted">Contacted</option>
+                            <option value="closed">Closed</option>
+                        </select>
+                    </div>
+
+                    <button id="clear-filters-button" class="secondary-button clear-filter-button" type="button">
+                        Clear filters
+                    </button>
+                </div>
+
                 <div class="table-wrapper">
                     <table>
                         <thead>
@@ -411,9 +467,14 @@
         const logoutButton = document.getElementById("logout-button");
         const tableBody = document.getElementById("lead-table-body");
         const tableMessage = document.getElementById("table-message");
+        const aiStatusFilter = document.getElementById("ai-status-filter");
+        const ownerStatusFilter = document.getElementById("owner-status-filter");
+        const clearFiltersButton = document.getElementById("clear-filters-button");
         const modalBackdrop = document.getElementById("modal-backdrop");
         const closeModalButton = document.getElementById("close-modal-button");
         const transcript = document.getElementById("transcript");
+
+        let allLeads = [];
 
         function showLogin() {
             loginPage.classList.remove("hidden");
@@ -474,29 +535,16 @@
             }, 1200);
         }
 
-        async function loadLeads() {
-            tableMessage.textContent = "Loading leads...";
-
-            const { data, error } = await supabaseClient
-                .from("conversations")
-                .select("*")
-                .order("updated_at", { ascending: false });
-
-            if (error) {
-                tableMessage.textContent = `Could not load leads: ${error.message}`;
-                return;
-            }
-
-            const leads = data || [];
+        function renderLeads(leads) {
             tableBody.innerHTML = "";
-            updateCounters(leads);
+            updateCounters(allLeads);
 
             if (!leads.length) {
-                tableMessage.textContent = "No leads found.";
+                tableMessage.textContent = "No leads match the selected filters.";
                 return;
             }
 
-            tableMessage.textContent = `${leads.length} lead(s)`;
+            tableMessage.textContent = `Showing ${leads.length} of ${allLeads.length} lead(s)`;
 
             for (const lead of leads) {
                 const row = document.createElement("tr");
@@ -533,12 +581,18 @@
                 const saveNote = row.querySelector(".save-note");
                 ownerSelect.value = lead.owner_status || "unreviewed";
 
-                ownerSelect.addEventListener("change", () => {
-                    updateOwnerStatus(
+                ownerSelect.addEventListener("change", async () => {
+                    await updateOwnerStatus(
                         lead.session_id,
                         ownerSelect.value,
                         saveNote
                     );
+
+                    lead.owner_status = ownerSelect.value;
+
+                    if (ownerStatusFilter.value !== "all") {
+                        applyFilters();
+                    }
                 });
 
                 row.querySelector(".small-button").addEventListener("click", () => {
@@ -547,6 +601,41 @@
 
                 tableBody.appendChild(row);
             }
+        }
+
+        function applyFilters() {
+            const selectedAiStatus = aiStatusFilter.value;
+            const selectedOwnerStatus = ownerStatusFilter.value;
+
+            const filteredLeads = allLeads.filter((lead) => {
+                const aiMatches =
+                    selectedAiStatus === "all" || lead.status === selectedAiStatus;
+
+                const ownerMatches =
+                    selectedOwnerStatus === "all" ||
+                    (lead.owner_status || "unreviewed") === selectedOwnerStatus;
+
+                return aiMatches && ownerMatches;
+            });
+
+            renderLeads(filteredLeads);
+        }
+
+        async function loadLeads() {
+            tableMessage.textContent = "Loading leads...";
+
+            const { data, error } = await supabaseClient
+                .from("conversations")
+                .select("*")
+                .order("updated_at", { ascending: false });
+
+            if (error) {
+                tableMessage.textContent = `Could not load leads: ${error.message}`;
+                return;
+            }
+
+            allLeads = data || [];
+            applyFilters();
         }
 
         async function openTranscript(sessionId) {
@@ -605,6 +694,15 @@
         });
 
         refreshButton.addEventListener("click", loadLeads);
+
+        aiStatusFilter.addEventListener("change", applyFilters);
+        ownerStatusFilter.addEventListener("change", applyFilters);
+
+        clearFiltersButton.addEventListener("click", () => {
+            aiStatusFilter.value = "all";
+            ownerStatusFilter.value = "all";
+            applyFilters();
+        });
 
         logoutButton.addEventListener("click", async () => {
             await supabaseClient.auth.signOut();
