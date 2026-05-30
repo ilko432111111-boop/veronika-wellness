@@ -600,73 +600,95 @@
     </div>
 
     <script>
-        let chatHistory = [];
+        <script>
+    let chatHistory = [];
 
-        function toggleChat() {
-            const chatWindow = document.getElementById('chat-window');
-            chatWindow.style.display = chatWindow.style.display === 'none' ? 'block' : 'none';
-        }
-        
-        function sendMessage() {
-            const input = document.getElementById('chat-input');
-            const messages = document.getElementById('chat-messages');
-            
-            if (!input.value.trim()) return;
-            
-            const userInput = input.value;
+    // Give each visitor a unique ID and keep it after page refreshes
+    let sessionId = localStorage.getItem("veronika_chat_session_id");
 
-            // Add user message to the screen
-            const userMsg = document.createElement('div');
-            userMsg.className = 'message user-message';
-            userMsg.textContent = userInput;
-            messages.appendChild(userMsg);
+    if (!sessionId) {
+        sessionId = window.crypto?.randomUUID
+            ? crypto.randomUUID()
+            : `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-            // Save customer message to short-term chat memory
+        localStorage.setItem("veronika_chat_session_id", sessionId);
+    }
+
+    function toggleChat() {
+        const chatWindow = document.getElementById("chat-window");
+        chatWindow.style.display =
+            chatWindow.style.display === "none" ? "block" : "none";
+    }
+
+    function sendMessage() {
+        const input = document.getElementById("chat-input");
+        const messages = document.getElementById("chat-messages");
+
+        if (!input.value.trim()) return;
+
+        const userInput = input.value.trim();
+
+        // Display customer message
+        const userMsg = document.createElement("div");
+        userMsg.className = "message user-message";
+        userMsg.textContent = userInput;
+        messages.appendChild(userMsg);
+
+        // Save customer message to temporary browser memory
+        chatHistory.push({
+            role: "user",
+            content: userInput
+        });
+
+        input.value = "";
+        messages.scrollTop = messages.scrollHeight;
+
+        fetch("https://veronika-chatbot-api.onrender.com/chat", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                session_id: sessionId,
+                message: userInput,
+                history: chatHistory
+            })
+        })
+        .then(response => {
+            if (!response.ok) {
+                throw new Error("Backend request failed");
+            }
+
+            return response.json();
+        })
+        .then(data => {
+            const botMsg = document.createElement("div");
+            botMsg.className = "message bot-message";
+            botMsg.textContent = data.reply;
+            messages.appendChild(botMsg);
+
+            // Save assistant reply to temporary browser memory
             chatHistory.push({
-                role: "customer",
-                content: userInput
+                role: "assistant",
+                content: data.reply
             });
 
-            input.value = '';
+            // Keep the latest 20 messages
+            chatHistory = chatHistory.slice(-20);
+
             messages.scrollTop = messages.scrollHeight;
-            
-            // Send latest message + conversation history to backend
-            fetch("https://veronika-chatbot-api.onrender.com/chat", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    message: userInput,
-                    history: chatHistory
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                const botMsg = document.createElement('div');
-                botMsg.className = 'message bot-message';
-                botMsg.textContent = data.reply;
-                messages.appendChild(botMsg);
+        })
+        .catch(() => {
+            const errorMsg = document.createElement("div");
+            errorMsg.className = "message bot-message";
+            errorMsg.textContent =
+                "Sorry, I'm having trouble connecting right now. Please call 07386 396139.";
 
-                // Save assistant reply to short-term chat memory
-                chatHistory.push({
-                    role: "assistant",
-                    content: data.reply
-                });
-
-                // Keep only the latest 12 messages so it does not get too long
-                chatHistory = chatHistory.slice(-12);
-
-                messages.scrollTop = messages.scrollHeight;
-            })
-            .catch(() => {
-                const errorMsg = document.createElement('div');
-                errorMsg.className = 'message bot-message';
-                errorMsg.textContent = "Sorry, I'm having trouble connecting right now. Please call 07386 396139.";
-                messages.appendChild(errorMsg);
-                messages.scrollTop = messages.scrollHeight;
-            });
-        }
+            messages.appendChild(errorMsg);
+            messages.scrollTop = messages.scrollHeight;
+        });
+    }
+</script>
     </script>
 </body>
 </html>
