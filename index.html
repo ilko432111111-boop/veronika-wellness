@@ -601,6 +601,7 @@
 
     <script>
         let chatHistory = [];
+        let sessionId = null;
 
         function toggleChat() {
             const chatWindow = document.getElementById('chat-window');
@@ -612,6 +613,11 @@
             const messages = document.getElementById('chat-messages');
             
             if (!input.value.trim()) return;
+if (!sessionId) {
+    sessionId = window.crypto?.randomUUID
+        ? crypto.randomUUID()
+        : `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
             
             const userInput = input.value;
 
@@ -637,9 +643,10 @@
                     "Content-Type": "application/json"
                 },
                 body: JSON.stringify({
-                    message: userInput,
-                    history: chatHistory
-                })
+    session_id: sessionId,
+    message: userInput,
+    history: chatHistory
+})
             })
             .then(response => response.json())
             .then(data => {
