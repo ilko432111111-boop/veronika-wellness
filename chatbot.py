@@ -108,7 +108,7 @@ Latest customer message:
 Reply as Veronika's assistant:
 """
 
-    completion = groq_client.chat.completions.create(
+        completion = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.4
@@ -116,10 +116,10 @@ Reply as Veronika's assistant:
 
     reply = completion.choices[0].message.content
 
-save_message(
-    session_id=request.session_id,
-    role="assistant",
-    content=reply
-)
+    save_message(
+        session_id=request.session_id,
+        role="assistant",
+        content=reply
+    )
 
-return {"reply": reply}
+    return {"reply": reply}
