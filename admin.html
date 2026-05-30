@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Veronika Admin Dashboard</title>
+    <style>
+        :root {
+            --primary: #2c3e50;
+            --accent: #27ae60;
+            --background: #f5f7f9;
+            --card: #ffffff;
+            --border: #dfe5ea;
+            --text: #24313d;
+            --muted: #6b7782;
+            --danger: #c0392b;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            font-family: Arial, Helvetica, sans-serif;
+            background: var(--background);
+            color: var(--text);
+        }
+
+        button, input { font: inherit; }
+        button { cursor: pointer; }
+        .hidden { display: none !important; }
+
+        .login-page {
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 20px;
+        }
+
+        .login-card {
+            width: min(420px, 100%);
+            background: var(--card);
+            border-radius: 18px;
+            padding: 28px;
+            box-shadow: 0 12px 36px rgba(0, 0, 0, 0.12);
+        }
+
+        .login-card h1 { margin: 0 0 8px; color: var(--primary); }
+        .login-card p { margin: 0 0 22px; color: var(--muted); }
+        label { display: block; margin: 14px 0 6px; font-weight: 700; }
+
+        input {
+            width: 100%;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 14px;
+            background: white;
+        }
+
+        .primary-button,
+        .secondary-button,
+        .small-button {
+            border: 0;
+            border-radius: 10px;
+            padding: 11px 15px;
+            font-weight: 700;
+        }
+
+        .primary-button {
+            width: 100%;
+            margin-top: 18px;
+            background: var(--accent);
+            color: white;
+        }
+
+        .secondary-button {
+            background: white;
+            color: var(--primary);
+            border: 1px solid var(--border);
+        }
+
+        .small-button {
+            background: var(--primary);
+            color: white;
+            padding: 8px 10px;
+        }
+
+        .error { margin-top: 14px; color: var(--danger); font-size: 0.94rem; }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            gap: 14px;
+            align-items: center;
+            padding: 16px 22px;
+            background: var(--primary);
+            color: white;
+        }
+
+        header h1 { margin: 0; font-size: 1.25rem; }
+        .header-actions { display: flex; gap: 8px; }
+        main { padding: 20px; }
+
+        .summary-row {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .summary-card {
+            background: white;
+            border-radius: 14px;
+            padding: 14px;
+            border: 1px solid var(--border);
+        }
+
+        .summary-card strong { display: block; font-size: 1.45rem; margin-top: 6px; }
+        .summary-card span { color: var(--muted); font-size: 0.9rem; }
+
+        .table-card {
+            background: white;
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+
+        .table-toolbar {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+            padding: 14px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .table-toolbar h2 { margin: 0; font-size: 1.1rem; }
+        .table-wrapper { overflow-x: auto; }
+
+        table {
+            width: 100%;
+            min-width: 1180px;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 12px 10px;
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+            vertical-align: top;
+            font-size: 0.9rem;
+        }
+
+        th {
+            background: #f8fafb;
+            color: var(--muted);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .status {
+            display: inline-block;
+            padding: 5px 8px;
+            border-radius: 999px;
+            font-weight: 700;
+            font-size: 0.76rem;
+            white-space: nowrap;
+        }
+
+        .status-new_chat { background: #e8eef4; color: #41566b; }
+        .status-interested { background: #e0f2fe; color: #0369a1; }
+        .status-details_incomplete { background: #fef3c7; color: #92400e; }
+        .status-booking_request_complete { background: #dcfce7; color: #166534; }
+        .status-needs_follow_up { background: #fee2e2; color: #991b1b; }
+        .muted { color: var(--muted); }
+
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.52);
+            display: grid;
+            place-items: center;
+            padding: 18px;
+            z-index: 10;
+        }
+
+        .modal {
+            width: min(760px, 100%);
+            max-height: 88vh;
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 16px;
+            background: var(--primary);
+            color: white;
+        }
+
+        .modal-header h3 { margin: 0; }
+        .close-button { border: 0; background: transparent; color: white; font-size: 1.4rem; }
+
+        .transcript {
+            padding: 16px;
+            overflow-y: auto;
+            background: #f8fafb;
+        }
+
+        .message {
+            max-width: 80%;
+            margin-bottom: 10px;
+            padding: 10px 12px;
+            border-radius: 14px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+        }
+
+        .message-user { margin-left: auto; background: var(--accent); color: white; }
+        .message-assistant { margin-right: auto; background: #e7edf2; color: var(--text); }
+
+        @media (max-width: 760px) {
+            header { align-items: flex-start; flex-direction: column; }
+            .summary-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            main { padding: 12px; }
+        }
+    </style>
+</head>
+<body>
+    <section id="login-page" class="login-page">
+        <div class="login-card">
+            <h1>Veronika Admin</h1>
+            <p>Sign in to review customer leads and chat transcripts.</p>
+
+            <form id="login-form">
+                <label for="email">Email</label>
+                <input id="email" type="email" autocomplete="email" required>
+
+                <label for="password">Password</label>
+                <input id="password" type="password" autocomplete="current-password" required>
+
+                <button class="primary-button" type="submit">Sign in</button>
+            </form>
+
+            <div id="login-error" class="error"></div>
+        </div>
+    </section>
+
+    <section id="dashboard-page" class="hidden">
+        <header>
+            <h1>Veronika Lead Dashboard</h1>
+            <div class="header-actions">
+                <button id="refresh-button" class="secondary-button" type="button">Refresh</button>
+                <button id="logout-button" class="secondary-button" type="button">Sign out</button>
+            </div>
+        </header>
+
+        <main>
+            <div class="summary-row">
+                <div class="summary-card"><span>Total chats</span><strong id="total-count">0</strong></div>
+                <div class="summary-card"><span>Complete requests</span><strong id="complete-count">0</strong></div>
+                <div class="summary-card"><span>Incomplete leads</span><strong id="incomplete-count">0</strong></div>
+                <div class="summary-card"><span>Interested</span><strong id="interested-count">0</strong></div>
+            </div>
+
+            <div class="table-card">
+                <div class="table-toolbar">
+                    <h2>Customer leads</h2>
+                    <span id="table-message" class="muted"></span>
+                </div>
+
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Updated</th>
+                                <th>Status</th>
+                                <th>Name</th>
+                                <th>Phone</th>
+                                <th>Treatment</th>
+                                <th>Duration</th>
+                                <th>Preferred date</th>
+                                <th>Preferred time</th>
+                                <th>Summary</th>
+                                <th>Transcript</th>
+                            </tr>
+                        </thead>
+                        <tbody id="lead-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </section>
+
+    <div id="modal-backdrop" class="modal-backdrop hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Chat transcript</h3>
+                <button id="close-modal-button" class="close-button" type="button">×</button>
+            </div>
+            <div id="transcript" class="transcript"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+        // Paste the browser-safe values from Supabase here.
+        // Never paste the secret key or service_role key into this file.
+        const SUPABASE_URL = "https://ivmekuukvmxqwqttemvo.supabase.co";
+        const SUPABASE_PUBLISHABLE_KEY = "sb_publishable__trVW3QjxoNyxAlUTgTmUg_WR4DEd7T";
+
+        const supabaseClient = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+
+        const loginPage = document.getElementById("login-page");
+        const dashboardPage = document.getElementById("dashboard-page");
+        const loginForm = document.getElementById("login-form");
+        const loginError = document.getElementById("login-error");
+        const refreshButton = document.getElementById("refresh-button");
+        const logoutButton = document.getElementById("logout-button");
+        const tableBody = document.getElementById("lead-table-body");
+        const tableMessage = document.getElementById("table-message");
+        const modalBackdrop = document.getElementById("modal-backdrop");
+        const closeModalButton = document.getElementById("close-modal-button");
+        const transcript = document.getElementById("transcript");
+
+        function showLogin() {
+            loginPage.classList.remove("hidden");
+            dashboardPage.classList.add("hidden");
+        }
+
+        function showDashboard() {
+            loginPage.classList.add("hidden");
+            dashboardPage.classList.remove("hidden");
+        }
+
+        function safeText(value, fallback = "—") {
+            return value ? String(value) : fallback;
+        }
+
+        function formatDate(value) {
+            if (!value) return "—";
+            return new Date(value).toLocaleString();
+        }
+
+        function statusLabel(status) {
+            const labels = {
+                new_chat: "New chat",
+                interested: "Interested",
+                details_incomplete: "Incomplete",
+                booking_request_complete: "Complete request",
+                needs_follow_up: "Needs follow-up",
+                closed: "Closed"
+            };
+            return labels[status] || safeText(status);
+        }
+
+        function updateCounters(leads) {
+            document.getElementById("total-count").textContent = leads.length;
+            document.getElementById("complete-count").textContent = leads.filter((lead) => lead.status === "booking_request_complete").length;
+            document.getElementById("incomplete-count").textContent = leads.filter((lead) => lead.status === "details_incomplete").length;
+            document.getElementById("interested-count").textContent = leads.filter((lead) => lead.status === "interested").length;
+        }
+
+        async function loadLeads() {
+            tableMessage.textContent = "Loading leads...";
+
+            const { data, error } = await supabaseClient
+                .from("conversations")
+                .select("*")
+                .order("updated_at", { ascending: false });
+
+            if (error) {
+                tableMessage.textContent = `Could not load leads: ${error.message}`;
+                return;
+            }
+
+            const leads = data || [];
+            tableBody.innerHTML = "";
+            updateCounters(leads);
+
+            if (!leads.length) {
+                tableMessage.textContent = "No leads found.";
+                return;
+            }
+
+            tableMessage.textContent = `${leads.length} lead(s)`;
+
+            for (const lead of leads) {
+                const row = document.createElement("tr");
+
+                row.innerHTML = `
+                    <td>${formatDate(lead.updated_at)}</td>
+                    <td><span class="status status-${safeText(lead.status, "new_chat")}">${statusLabel(lead.status)}</span></td>
+                    <td>${safeText(lead.name)}</td>
+                    <td>${safeText(lead.phone)}</td>
+                    <td>${safeText(lead.treatment)}</td>
+                    <td>${safeText(lead.duration)}</td>
+                    <td>${safeText(lead.preferred_date)}</td>
+                    <td>${safeText(lead.preferred_time)}</td>
+                    <td>${safeText(lead.summary)}</td>
+                    <td><button class="small-button" type="button">View</button></td>
+                `;
+
+                row.querySelector("button").addEventListener("click", () => openTranscript(lead.session_id));
+                tableBody.appendChild(row);
+            }
+        }
+
+        async function openTranscript(sessionId) {
+            transcript.innerHTML = "<p>Loading transcript...</p>";
+            modalBackdrop.classList.remove("hidden");
+
+            const { data, error } = await supabaseClient
+                .from("messages")
+                .select("role, content, created_at")
+                .eq("session_id", sessionId)
+                .order("created_at", { ascending: true });
+
+            if (error) {
+                transcript.innerHTML = `<p>Could not load transcript: ${error.message}</p>`;
+                return;
+            }
+
+            transcript.innerHTML = "";
+
+            for (const message of data || []) {
+                const bubble = document.createElement("div");
+                bubble.className = `message ${message.role === "user" ? "message-user" : "message-assistant"}`;
+                bubble.textContent = message.content;
+                transcript.appendChild(bubble);
+            }
+
+            if (!data?.length) transcript.innerHTML = "<p>No transcript messages found.</p>";
+        }
+
+        loginForm.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            loginError.textContent = "";
+
+            const email = document.getElementById("email").value.trim();
+            const password = document.getElementById("password").value;
+
+            const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+
+            if (error) {
+                loginError.textContent = "Login failed. Check the email and password.";
+                return;
+            }
+
+            showDashboard();
+            await loadLeads();
+        });
+
+        refreshButton.addEventListener("click", loadLeads);
+
+        logoutButton.addEventListener("click", async () => {
+            await supabaseClient.auth.signOut();
+            showLogin();
+        });
+
+        closeModalButton.addEventListener("click", () => modalBackdrop.classList.add("hidden"));
+        modalBackdrop.addEventListener("click", (event) => {
+            if (event.target === modalBackdrop) modalBackdrop.classList.add("hidden");
+        });
+
+        const { data: { session } } = await supabaseClient.auth.getSession();
+
+        if (session) {
+            showDashboard();
+            await loadLeads();
+        } else {
+            showLogin();
+        }
+    </script>
+</body>
+</html>
