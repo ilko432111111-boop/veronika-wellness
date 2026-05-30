@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel, Field
 from groq import Groq
 from supabase import create_client, Client
 import os
+import json
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
@@ -39,6 +41,116 @@ class ChatRequest(BaseModel):
 
 
 def save_message(session_id: str, role: str, content: str):
+def save_conversation_overview(session_id: str, lead_data: dict):
+def extract_lead_data(conversation_history: str) -> dict:
+def update_conversation_overview(
+    session_id: str,
+    conversation_history: str
+):
+    lead_data = extract_lead_data(conversation_history)
+
+    if lead_data:
+        save_conversation_overview(
+            session_id=session_id,
+            lead_data=lead_data
+        )
+    try:
+        extraction_prompt = f"""
+Read the customer conversation below and extract useful lead details.
+
+Only save information the customer has actually provided.
+Do not treat suggestions made by the assistant as confirmed customer details.
+Do not invent missing information.
+
+Return valid JSON only, using exactly these fields:
+{{
+  "name": null,
+  "phone": null,
+  "treatment": null,
+  "duration": null,
+  "preferred_date": null,
+  "preferred_time": null,
+  "notes": null,
+  "status": "new_chat",
+  "summary": null
+}}
+
+Status rules:
+- Use "new_chat" if the customer has not shown a clear interest yet.
+- Use "interested" if the customer is asking about a treatment or price.
+- Use "details_incomplete" if they want an appointment but important details are missing.
+- Use "booking_request_complete" only if treatment, duration, name, phone number, preferred date, and preferred time are all present.
+
+Keep the summary short and useful for the business owner.
+
+Conversation:
+{conversation_history}
+"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "user", "content": extraction_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+
+        return json.loads(completion.choices[0].message.content)
+
+    except Exception as error:
+        print(f"Could not extract lead details: {error}")
+        return {}
+    try:
+        existing_response = (
+            supabase.table("conversations")
+            .select("*")
+            .eq("session_id", session_id)
+            .limit(1)
+            .execute()
+        )
+
+        existing = (
+            existing_response.data[0]
+            if existing_response.data
+            else {}
+        )
+
+        fields = [
+            "name",
+            "phone",
+            "treatment",
+            "duration",
+            "preferred_date",
+            "preferred_time",
+            "notes",
+            "status",
+            "summary"
+        ]
+
+        payload = {
+            "session_id": session_id,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        for field in fields:
+            new_value = lead_data.get(field)
+
+            if new_value not in [None, ""]:
+                payload[field] = new_value
+            else:
+                payload[field] = existing.get(field)
+
+        if not payload.get("status"):
+            payload["status"] = "new_chat"
+
+        supabase.table("conversations").upsert(
+            payload,
+            on_conflict="session_id"
+        ).execute()
+
+    except Exception as error:
+        print(f"Could not save conversation overview: {error}")
     try:
         supabase.table("messages").insert({
             "session_id": session_id,
@@ -55,7 +167,10 @@ async def root():
 
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks
+):
     save_message(
         session_id=request.session_id,
         role="user",
@@ -123,10 +238,16 @@ Reply as Veronika's assistant:
 
     reply = completion.choices[0].message.content
 
-    save_message(
-        session_id=request.session_id,
-        role="assistant",
-        content=reply
-    )
+save_message(
+    session_id=request.session_id,
+    role="assistant",
+    content=reply
+)
 
-    return {"reply": reply}
+background_tasks.add_task(
+    update_conversation_overview,
+    request.session_id,
+    conversation_history
+)
+
+return {"reply": reply}
