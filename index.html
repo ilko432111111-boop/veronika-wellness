@@ -575,6 +575,7 @@
         <div class="container">
             <p>© 2026 Veronika Wellness & Aesthetics • Leeds</p>
             <p style="margin-top: 8px; font-size: 0.85rem;">Professional treatments • Real results • Genuine care</p>
+            <p style="margin-top: 8px; font-size: 0.8rem;">Website and AI assistant built by Ilko</p>
         </div>
     </footer>
 
@@ -591,6 +592,10 @@
             </div>
             
             <div id="chat-messages"></div>
+
+<div style="padding: 10px 14px; font-size: 12px; color: #666; background: #fff; border-top: 1px solid #eee;">
+    By using this chat, you agree that your messages and contact details may be stored so Veronika can respond to your enquiry.
+</div>
             
             <div id="chat-input-area">
                 <input type="text" id="chat-input" placeholder="Type your message..." onkeypress="if (event.key === 'Enter') sendMessage()">
@@ -635,9 +640,16 @@ if (!sessionId) {
 
             input.value = '';
             messages.scrollTop = messages.scrollHeight;
-            
-            // Send latest message + conversation history to backend
-            fetch("https://veronika-chatbot-api.onrender.com/chat", {
+
+// Show typing message while waiting for the AI reply
+const typingMsg = document.createElement("div");
+typingMsg.className = "message bot-message";
+typingMsg.textContent = "Veronika's assistant is typing...";
+messages.appendChild(typingMsg);
+messages.scrollTop = messages.scrollHeight;
+
+// Send latest message + conversation history to backend
+fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
@@ -648,8 +660,16 @@ if (!sessionId) {
     history: chatHistory
 })
             })
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error("Backend request failed");
+                }
+
+                return response.json();
+            })
             .then(data => {
+                typingMsg.remove();
+
                 const botMsg = document.createElement('div');
                 botMsg.className = 'message bot-message';
                 botMsg.textContent = data.reply;
@@ -661,12 +681,14 @@ if (!sessionId) {
                     content: data.reply
                 });
 
-                // Keep only the latest 12 messages so it does not get too long
-                chatHistory = chatHistory.slice(-12);
+                // Keep only the latest 20 messages so it does not get too long
+                chatHistory = chatHistory.slice(-20);
 
                 messages.scrollTop = messages.scrollHeight;
             })
             .catch(() => {
+                typingMsg.remove();
+
                 const errorMsg = document.createElement('div');
                 errorMsg.className = 'message bot-message';
                 errorMsg.textContent = "Sorry, I'm having trouble connecting right now. Please call 07386 396139.";
