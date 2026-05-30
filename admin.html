@@ -25,7 +25,7 @@
             color: var(--text);
         }
 
-        button, input { font: inherit; }
+        button, input, select { font: inherit; }
         button { cursor: pointer; }
         .hidden { display: none !important; }
 
@@ -44,15 +44,27 @@
             box-shadow: 0 12px 36px rgba(0, 0, 0, 0.12);
         }
 
-        .login-card h1 { margin: 0 0 8px; color: var(--primary); }
-        .login-card p { margin: 0 0 22px; color: var(--muted); }
-        label { display: block; margin: 14px 0 6px; font-weight: 700; }
+        .login-card h1 {
+            margin: 0 0 8px;
+            color: var(--primary);
+        }
 
-        input {
+        .login-card p {
+            margin: 0 0 22px;
+            color: var(--muted);
+        }
+
+        label {
+            display: block;
+            margin: 14px 0 6px;
+            font-weight: 700;
+        }
+
+        input, select {
             width: 100%;
             border: 1px solid var(--border);
             border-radius: 10px;
-            padding: 12px 14px;
+            padding: 10px 12px;
             background: white;
         }
 
@@ -84,7 +96,11 @@
             padding: 8px 10px;
         }
 
-        .error { margin-top: 14px; color: var(--danger); font-size: 0.94rem; }
+        .error {
+            margin-top: 14px;
+            color: var(--danger);
+            font-size: 0.94rem;
+        }
 
         header {
             display: flex;
@@ -96,8 +112,16 @@
             color: white;
         }
 
-        header h1 { margin: 0; font-size: 1.25rem; }
-        .header-actions { display: flex; gap: 8px; }
+        header h1 {
+            margin: 0;
+            font-size: 1.25rem;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+        }
+
         main { padding: 20px; }
 
         .summary-row {
@@ -114,8 +138,16 @@
             border: 1px solid var(--border);
         }
 
-        .summary-card strong { display: block; font-size: 1.45rem; margin-top: 6px; }
-        .summary-card span { color: var(--muted); font-size: 0.9rem; }
+        .summary-card strong {
+            display: block;
+            font-size: 1.45rem;
+            margin-top: 6px;
+        }
+
+        .summary-card span {
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
 
         .table-card {
             background: white;
@@ -133,12 +165,16 @@
             border-bottom: 1px solid var(--border);
         }
 
-        .table-toolbar h2 { margin: 0; font-size: 1.1rem; }
+        .table-toolbar h2 {
+            margin: 0;
+            font-size: 1.1rem;
+        }
+
         .table-wrapper { overflow-x: auto; }
 
         table {
             width: 100%;
-            min-width: 1180px;
+            min-width: 1320px;
             border-collapse: collapse;
         }
 
@@ -171,7 +207,19 @@
         .status-interested { background: #e0f2fe; color: #0369a1; }
         .status-details_incomplete { background: #fef3c7; color: #92400e; }
         .status-booking_request_complete { background: #dcfce7; color: #166534; }
-        .status-needs_follow_up { background: #fee2e2; color: #991b1b; }
+
+        .owner-select {
+            min-width: 140px;
+            padding: 8px 10px;
+        }
+
+        .save-note {
+            margin-top: 5px;
+            font-size: 0.76rem;
+            color: var(--muted);
+            min-height: 1em;
+        }
+
         .muted { color: var(--muted); }
 
         .modal-backdrop {
@@ -204,7 +252,13 @@
         }
 
         .modal-header h3 { margin: 0; }
-        .close-button { border: 0; background: transparent; color: white; font-size: 1.4rem; }
+
+        .close-button {
+            border: 0;
+            background: transparent;
+            color: white;
+            font-size: 1.4rem;
+        }
 
         .transcript {
             padding: 16px;
@@ -221,12 +275,28 @@
             white-space: pre-wrap;
         }
 
-        .message-user { margin-left: auto; background: var(--accent); color: white; }
-        .message-assistant { margin-right: auto; background: #e7edf2; color: var(--text); }
+        .message-user {
+            margin-left: auto;
+            background: var(--accent);
+            color: white;
+        }
+
+        .message-assistant {
+            margin-right: auto;
+            background: #e7edf2;
+            color: var(--text);
+        }
 
         @media (max-width: 760px) {
-            header { align-items: flex-start; flex-direction: column; }
-            .summary-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .summary-row {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
             main { padding: 12px; }
         }
     </style>
@@ -262,10 +332,22 @@
 
         <main>
             <div class="summary-row">
-                <div class="summary-card"><span>Total chats</span><strong id="total-count">0</strong></div>
-                <div class="summary-card"><span>Complete requests</span><strong id="complete-count">0</strong></div>
-                <div class="summary-card"><span>Incomplete leads</span><strong id="incomplete-count">0</strong></div>
-                <div class="summary-card"><span>Interested</span><strong id="interested-count">0</strong></div>
+                <div class="summary-card">
+                    <span>Total chats</span>
+                    <strong id="total-count">0</strong>
+                </div>
+                <div class="summary-card">
+                    <span>Complete requests</span>
+                    <strong id="complete-count">0</strong>
+                </div>
+                <div class="summary-card">
+                    <span>Incomplete leads</span>
+                    <strong id="incomplete-count">0</strong>
+                </div>
+                <div class="summary-card">
+                    <span>Interested</span>
+                    <strong id="interested-count">0</strong>
+                </div>
             </div>
 
             <div class="table-card">
@@ -279,7 +361,8 @@
                         <thead>
                             <tr>
                                 <th>Updated</th>
-                                <th>Status</th>
+                                <th>AI status</th>
+                                <th>Owner status</th>
                                 <th>Name</th>
                                 <th>Phone</th>
                                 <th>Treatment</th>
@@ -310,12 +393,15 @@
     <script type="module">
         import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
 
-        // Paste the browser-safe values from Supabase here.
+        // Paste your browser-safe values from Supabase here.
         // Never paste the secret key or service_role key into this file.
         const SUPABASE_URL = "https://ivmekuukvmxqwqttemvo.supabase.co";
         const SUPABASE_PUBLISHABLE_KEY = "sb_publishable__trVW3QjxoNyxAlUTgTmUg_WR4DEd7T";
 
-        const supabaseClient = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+        const supabaseClient = createClient(
+            SUPABASE_URL,
+            SUPABASE_PUBLISHABLE_KEY
+        );
 
         const loginPage = document.getElementById("login-page");
         const dashboardPage = document.getElementById("dashboard-page");
@@ -353,18 +439,39 @@
                 new_chat: "New chat",
                 interested: "Interested",
                 details_incomplete: "Incomplete",
-                booking_request_complete: "Complete request",
-                needs_follow_up: "Needs follow-up",
-                closed: "Closed"
+                booking_request_complete: "Complete request"
             };
+
             return labels[status] || safeText(status);
         }
 
         function updateCounters(leads) {
             document.getElementById("total-count").textContent = leads.length;
-            document.getElementById("complete-count").textContent = leads.filter((lead) => lead.status === "booking_request_complete").length;
-            document.getElementById("incomplete-count").textContent = leads.filter((lead) => lead.status === "details_incomplete").length;
-            document.getElementById("interested-count").textContent = leads.filter((lead) => lead.status === "interested").length;
+            document.getElementById("complete-count").textContent =
+                leads.filter((lead) => lead.status === "booking_request_complete").length;
+            document.getElementById("incomplete-count").textContent =
+                leads.filter((lead) => lead.status === "details_incomplete").length;
+            document.getElementById("interested-count").textContent =
+                leads.filter((lead) => lead.status === "interested").length;
+        }
+
+        async function updateOwnerStatus(sessionId, newStatus, noteElement) {
+            noteElement.textContent = "Saving...";
+
+            const { error } = await supabaseClient
+                .from("conversations")
+                .update({ owner_status: newStatus })
+                .eq("session_id", sessionId);
+
+            if (error) {
+                noteElement.textContent = `Could not save: ${error.message}`;
+                return;
+            }
+
+            noteElement.textContent = "Saved";
+            setTimeout(() => {
+                noteElement.textContent = "";
+            }, 1200);
         }
 
         async function loadLeads() {
@@ -396,7 +503,20 @@
 
                 row.innerHTML = `
                     <td>${formatDate(lead.updated_at)}</td>
-                    <td><span class="status status-${safeText(lead.status, "new_chat")}">${statusLabel(lead.status)}</span></td>
+                    <td>
+                        <span class="status status-${safeText(lead.status, "new_chat")}">
+                            ${statusLabel(lead.status)}
+                        </span>
+                    </td>
+                    <td>
+                        <select class="owner-select">
+                            <option value="unreviewed">Unreviewed</option>
+                            <option value="needs_follow_up">Needs follow-up</option>
+                            <option value="contacted">Contacted</option>
+                            <option value="closed">Closed</option>
+                        </select>
+                        <div class="save-note"></div>
+                    </td>
                     <td>${safeText(lead.name)}</td>
                     <td>${safeText(lead.phone)}</td>
                     <td>${safeText(lead.treatment)}</td>
@@ -404,10 +524,27 @@
                     <td>${safeText(lead.preferred_date)}</td>
                     <td>${safeText(lead.preferred_time)}</td>
                     <td>${safeText(lead.summary)}</td>
-                    <td><button class="small-button" type="button">View</button></td>
+                    <td>
+                        <button class="small-button" type="button">View</button>
+                    </td>
                 `;
 
-                row.querySelector("button").addEventListener("click", () => openTranscript(lead.session_id));
+                const ownerSelect = row.querySelector(".owner-select");
+                const saveNote = row.querySelector(".save-note");
+                ownerSelect.value = lead.owner_status || "unreviewed";
+
+                ownerSelect.addEventListener("change", () => {
+                    updateOwnerStatus(
+                        lead.session_id,
+                        ownerSelect.value,
+                        saveNote
+                    );
+                });
+
+                row.querySelector(".small-button").addEventListener("click", () => {
+                    openTranscript(lead.session_id);
+                });
+
                 tableBody.appendChild(row);
             }
         }
@@ -431,12 +568,19 @@
 
             for (const message of data || []) {
                 const bubble = document.createElement("div");
-                bubble.className = `message ${message.role === "user" ? "message-user" : "message-assistant"}`;
+                const roleClass =
+                    message.role === "user"
+                        ? "message-user"
+                        : "message-assistant";
+
+                bubble.className = `message ${roleClass}`;
                 bubble.textContent = message.content;
                 transcript.appendChild(bubble);
             }
 
-            if (!data?.length) transcript.innerHTML = "<p>No transcript messages found.</p>";
+            if (!data?.length) {
+                transcript.innerHTML = "<p>No transcript messages found.</p>";
+            }
         }
 
         loginForm.addEventListener("submit", async (event) => {
@@ -446,7 +590,10 @@
             const email = document.getElementById("email").value.trim();
             const password = document.getElementById("password").value;
 
-            const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+            const { error } = await supabaseClient.auth.signInWithPassword({
+                email,
+                password
+            });
 
             if (error) {
                 loginError.textContent = "Login failed. Check the email and password.";
@@ -464,12 +611,19 @@
             showLogin();
         });
 
-        closeModalButton.addEventListener("click", () => modalBackdrop.classList.add("hidden"));
-        modalBackdrop.addEventListener("click", (event) => {
-            if (event.target === modalBackdrop) modalBackdrop.classList.add("hidden");
+        closeModalButton.addEventListener("click", () => {
+            modalBackdrop.classList.add("hidden");
         });
 
-        const { data: { session } } = await supabaseClient.auth.getSession();
+        modalBackdrop.addEventListener("click", (event) => {
+            if (event.target === modalBackdrop) {
+                modalBackdrop.classList.add("hidden");
+            }
+        });
+
+        const {
+            data: { session }
+        } = await supabaseClient.auth.getSession();
 
         if (session) {
             showDashboard();
