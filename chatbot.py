@@ -52,6 +52,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
 REQUIRED_BOOKING_FIELDS = [
     "treatment",
@@ -595,6 +596,217 @@ def exchange_google_code_for_tokens(code: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def refresh_google_access_token() -> str | None:
+    refresh_token = get_google_refresh_token()
+
+    if not refresh_token:
+        return None
+
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        print("Could not refresh Google access token: missing OAuth credentials.")
+        return None
+
+    try:
+        token_payload = urllib_parse.urlencode({
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }).encode("utf-8")
+
+        token_request = urllib_request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=token_payload,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "veronika-chatbot/1.0",
+            },
+            method="POST",
+        )
+
+        with urllib_request.urlopen(token_request, timeout=15) as response:
+            token_data = json.loads(response.read().decode("utf-8"))
+
+        return token_data.get("access_token")
+
+    except urllib_error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        print(f"Could not refresh Google access token: HTTP {error.code} {body}")
+
+    except Exception as error:
+        print(f"Could not refresh Google access token: {error}")
+
+    return None
+
+
+def parse_duration_minutes(value: str | None) -> int | None:
+    if value in [None, ""]:
+        return None
+
+    cleaned = str(value).strip().lower()
+    total_minutes = 0
+
+    hours_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:hour|hours|hr|hrs)\b",
+        cleaned,
+    )
+
+    minutes_match = re.search(
+        r"(\d+)\s*(?:minute|minutes|min|mins)\b",
+        cleaned,
+    )
+
+    if hours_match:
+        total_minutes += round(float(hours_match.group(1)) * 60)
+
+    if minutes_match:
+        total_minutes += int(minutes_match.group(1))
+
+    if total_minutes > 0:
+        return total_minutes
+
+    if re.fullmatch(r"\d+", cleaned):
+        return int(cleaned)
+
+    return None
+
+
+def build_requested_slot(lead_data: dict):
+    preferred_date = lead_data.get("preferred_date")
+    preferred_time = lead_data.get("preferred_time")
+    duration_minutes = parse_duration_minutes(lead_data.get("duration"))
+
+    if not preferred_date or not preferred_time or not duration_minutes:
+        return None
+
+    try:
+        start_time = datetime.fromisoformat(
+            f"{preferred_date}T{preferred_time}"
+        ).replace(tzinfo=BUSINESS_TIMEZONE)
+
+        end_time = start_time + timedelta(minutes=duration_minutes)
+
+        return start_time, end_time
+
+    except ValueError:
+        return None
+
+
+def query_google_freebusy(
+    start_time: datetime,
+    end_time: datetime,
+) -> list[dict] | None:
+    access_token = refresh_google_access_token()
+
+    if not access_token:
+        return None
+
+    payload = {
+        "timeMin": start_time.isoformat(),
+        "timeMax": end_time.isoformat(),
+        "timeZone": "Europe/London",
+        "items": [
+            {"id": GOOGLE_CALENDAR_ID}
+        ],
+    }
+
+    try:
+        freebusy_request = urllib_request.Request(
+            "https://www.googleapis.com/calendar/v3/freeBusy",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "veronika-chatbot/1.0",
+            },
+            method="POST",
+        )
+
+        with urllib_request.urlopen(freebusy_request, timeout=15) as response:
+            freebusy_data = json.loads(response.read().decode("utf-8"))
+
+        calendar_data = (
+            freebusy_data
+            .get("calendars", {})
+            .get(GOOGLE_CALENDAR_ID, {})
+        )
+
+        if calendar_data.get("errors"):
+            print(f"Google Calendar freeBusy returned errors: {calendar_data['errors']}")
+            return None
+
+        return calendar_data.get("busy", [])
+
+    except urllib_error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        print(f"Google Calendar freeBusy failed: HTTP {error.code} {body}")
+
+    except Exception as error:
+        print(f"Google Calendar freeBusy failed: {error}")
+
+    return None
+
+
+def check_requested_calendar_slot(lead_data: dict) -> dict:
+    slot = build_requested_slot(lead_data)
+
+    if not slot:
+        return {
+            "status": "not_checked",
+            "message": "A complete date, time, and duration are not available yet.",
+        }
+
+    start_time, end_time = slot
+
+    if end_time <= datetime.now(BUSINESS_TIMEZONE):
+        return {
+            "status": "past",
+            "message": (
+                f"The requested time {start_time.strftime('%Y-%m-%d %H:%M')} "
+                "is in the past. Ask the customer for a future preferred time."
+            ),
+        }
+
+    busy_periods = query_google_freebusy(start_time, end_time)
+
+    if busy_periods is None:
+        return {
+            "status": "unknown",
+            "message": (
+                "Calendar availability could not be checked. "
+                "Do not claim that the time is free or busy. "
+                "Say Veronika will check and confirm."
+            ),
+        }
+
+    if busy_periods:
+        return {
+            "status": "busy",
+            "message": (
+                f"The requested slot from {start_time.strftime('%Y-%m-%d %H:%M')} "
+                f"to {end_time.strftime('%H:%M')} clashes with a busy calendar period. "
+                "Tell the customer that this requested time is unavailable and ask for another preferred time. "
+                "Do not reveal any appointment details."
+            ),
+        }
+
+    return {
+        "status": "free",
+        "message": (
+            f"The requested slot from {start_time.strftime('%Y-%m-%d %H:%M')} "
+            f"to {end_time.strftime('%H:%M')} currently appears free in Google Calendar. "
+            "Tell the customer it currently looks available, but make clear that Veronika still needs to confirm the booking."
+        ),
+    }
+
+
+def format_calendar_result(calendar_result: dict) -> str:
+    return (
+        f"Status: {calendar_result.get('status', 'unknown')}\n"
+        f"Instruction: {calendar_result.get('message', 'No calendar result available.')}"
+    )
+
+
 @app.get("/")
 async def root():
     return {"message": "Backend is working!"}
@@ -701,7 +913,7 @@ async def google_calendar_callback(
 async def google_calendar_status():
     return {
         "connected": bool(get_google_refresh_token()),
-        "calendar_id": "primary",
+        "calendar_id": GOOGLE_CALENDAR_ID,
         "scope": GOOGLE_CALENDAR_SCOPE,
     }
 
@@ -751,6 +963,9 @@ async def chat(
         lead_data=merged_lead
     )
 
+    calendar_result = check_requested_calendar_slot(merged_lead)
+    calendar_context = format_calendar_result(calendar_result)
+
     missing_fields = [
         field
         for field in REQUIRED_BOOKING_FIELDS
@@ -781,9 +996,13 @@ Locked rules:
 - Do not ask the customer to repeat information they already gave.
 - Never ask again for any detail listed under CONFIRMED CUSTOMER DETAILS.
 - Ask naturally for only the missing details. Ask for no more than two missing details in one reply.
-- If no required details are missing, tell the customer that Veronika will check availability and contact them shortly to confirm.
-- Never say a date or time is available, unavailable, free, fully booked, reserved, or confirmed unless that exact availability information exists in the business information.
-- Treat any requested date and time as the customer's preference only.
+- Follow the CALENDAR AVAILABILITY RESULT exactly.
+- If the calendar status is "busy", say the requested time is unavailable and ask for another preferred time.
+- If the calendar status is "free", say the requested time currently looks available, but clearly state that Veronika still needs to confirm the booking.
+- If the calendar status is "unknown" or "not_checked", do not claim the requested time is free or busy. Say Veronika will check availability and confirm.
+- If the calendar status is "past", ask for a future preferred time.
+- Never reveal private calendar event details.
+- Never say a booking is confirmed, reserved, or completed.
 - Never list every service at once unless the customer asks for a full price list.
 - If asked what services are offered, give the main categories first.
 - Then ask what they are interested in.
@@ -805,6 +1024,9 @@ CONFIRMED CUSTOMER DETAILS:
 
 MISSING REQUIRED DETAILS:
 {missing_details}
+
+CALENDAR AVAILABILITY RESULT:
+{calendar_context}
 
 Business information:
 {context}
