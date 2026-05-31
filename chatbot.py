@@ -221,14 +221,14 @@ def build_style_instructions(settings: dict) -> str:
     }
 
     reply_length_instructions = {
-        "short": "Keep replies concise. Usually use 1 to 2 short sentences.",
-        "normal": "Use a natural amount of detail up to 4 sentances. Avoid long walls of text."
+        "short": "Keep replies concise. Usually use 1 to 3 short sentences.",
+        "normal": "Use a natural amount of detail. Avoid long walls of text."
     }
 
     emoji_instructions = {
         "none": "Do not use emojis.",
-        "light": "Use emojis rarely and only when they feel natural or its a joke",
-        "friendly": "Use 1 to 3 friendly emojis in most replies when it feels natural. Keep them relevant and do not overdo it.""
+        "light": "Use emojis rarely and only when they feel natural.",
+        "friendly": "Use 1 to 3 friendly emojis in most replies when it feels natural. Keep them relevant and do not overdo it."
     }
 
     personality_notes = settings.get("personality_notes", "").strip()
