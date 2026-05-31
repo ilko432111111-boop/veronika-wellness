@@ -5,12 +5,14 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html import escape
 from urllib import request as urllib_request
 from urllib import error as urllib_error
 import json
 import os
+import re
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -35,6 +37,7 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 DASHBOARD_URL = "https://veronika-wellness.onrender.com/admin.html"
+BUSINESS_TIMEZONE = ZoneInfo("Europe/London")
 
 REQUIRED_BOOKING_FIELDS = [
     "treatment",
@@ -122,6 +125,79 @@ def merge_lead_data(existing: dict, extracted: dict) -> dict:
     return merged
 
 
+def normalise_preferred_date(value: str | None) -> str | None:
+    if value in [None, ""]:
+        return value
+
+    cleaned = str(value).strip()
+    lower_value = cleaned.lower()
+    today = datetime.now(BUSINESS_TIMEZONE).date()
+
+    if lower_value == "today":
+        return today.isoformat()
+
+    if lower_value == "tomorrow":
+        return (today + timedelta(days=1)).isoformat()
+
+    return cleaned
+
+
+def apply_simple_date_time_fallback(
+    lead_data: dict,
+    conversation_history: str
+) -> dict:
+    """
+    Preserve obvious customer date/time preferences even if the AI extractor
+    misses them. Relative dates such as today and tomorrow are converted into
+    real calendar dates so the dashboard remains clear later.
+    """
+    result = dict(lead_data)
+    lower_history = conversation_history.lower()
+    today = datetime.now(BUSINESS_TIMEZONE).date()
+
+    result["preferred_date"] = normalise_preferred_date(
+        result.get("preferred_date")
+    )
+
+    if result.get("preferred_date") in [None, ""]:
+        if re.search(r"\btoday\b", lower_history):
+            result["preferred_date"] = today.isoformat()
+        elif re.search(r"\btomorrow\b", lower_history):
+            result["preferred_date"] = (
+                today + timedelta(days=1)
+            ).isoformat()
+
+    if result.get("preferred_time") in [None, ""]:
+        time_match = re.search(
+            r"\b(?:at\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b",
+            lower_history
+        )
+
+        if time_match:
+            result["preferred_time"] = (
+                f"{int(time_match.group(1)):02d}:{time_match.group(2)}"
+            )
+        else:
+            am_pm_match = re.search(
+                r"\b(?:at\s*)?(1[0-2]|0?[1-9])(?:[:.]([0-5]\d))?\s*(am|pm)\b",
+                lower_history
+            )
+
+            if am_pm_match:
+                hour = int(am_pm_match.group(1))
+                minute = am_pm_match.group(2) or "00"
+                suffix = am_pm_match.group(3)
+
+                if suffix == "pm" and hour != 12:
+                    hour += 12
+                elif suffix == "am" and hour == 12:
+                    hour = 0
+
+                result["preferred_time"] = f"{hour:02d}:{minute}"
+
+    return result
+
+
 def save_conversation_overview(session_id: str, lead_data: dict):
     try:
         payload = {
@@ -141,12 +217,16 @@ def save_conversation_overview(session_id: str, lead_data: dict):
 
 def extract_lead_data(conversation_history: str) -> dict:
     try:
+        current_leeds_date = datetime.now(BUSINESS_TIMEZONE).date().isoformat()
+
         extraction_prompt = f"""
 Read the customer conversation below and extract useful lead details.
 
 Only save information the customer has actually provided or clearly confirmed.
 Do not treat suggestions made by the assistant as confirmed customer details.
 Do not invent missing information.
+Treat clear relative dates such as "today" and "tomorrow" as valid preferred dates.
+Convert relative dates into an ISO calendar date in YYYY-MM-DD format using the current Leeds date.
 
 Return valid JSON only, using exactly these fields:
 {{
@@ -166,6 +246,9 @@ Status rules:
 - Use "interested" if the customer is asking about a treatment or price.
 - Use "details_incomplete" if they want an appointment but important details are missing.
 - Use "booking_request_complete" only if treatment, duration, name, phone number, preferred date, and preferred time are all present.
+
+Current Leeds date:
+{current_leeds_date}
 
 Keep the summary short and useful for the business owner.
 
@@ -433,6 +516,10 @@ async def chat(
     extracted_lead = extract_lead_data(conversation_history)
     existing_lead = get_existing_conversation(request.session_id)
     merged_lead = merge_lead_data(existing_lead, extracted_lead)
+    merged_lead = apply_simple_date_time_fallback(
+        merged_lead,
+        conversation_history
+    )
 
     save_conversation_overview(
         session_id=request.session_id,
