@@ -168,6 +168,84 @@ def update_conversation_overview(
         )
 
 
+def load_chatbot_settings() -> dict:
+    defaults = {
+        "tone": "friendly",
+        "reply_length": "short",
+        "emoji_style": "light",
+        "personality_notes": ""
+    }
+
+    try:
+        response = (
+            supabase.table("chatbot_settings")
+            .select("tone, reply_length, emoji_style, personality_notes")
+            .eq("business_slug", "veronika")
+            .limit(1)
+            .execute()
+        )
+
+        if not response.data:
+            return defaults
+
+        saved = response.data[0]
+
+        tone = saved.get("tone")
+        reply_length = saved.get("reply_length")
+        emoji_style = saved.get("emoji_style")
+        personality_notes = saved.get("personality_notes") or ""
+
+        if tone in ["friendly", "professional", "relaxed", "luxury"]:
+            defaults["tone"] = tone
+
+        if reply_length in ["short", "normal"]:
+            defaults["reply_length"] = reply_length
+
+        if emoji_style in ["none", "light", "friendly"]:
+            defaults["emoji_style"] = emoji_style
+
+        defaults["personality_notes"] = personality_notes[:600]
+
+    except Exception as error:
+        print(f"Could not load chatbot settings: {error}")
+
+    return defaults
+
+
+def build_style_instructions(settings: dict) -> str:
+    tone_instructions = {
+        "friendly": "Sound warm, approachable, and helpful.",
+        "professional": "Sound polished, professional, and clear.",
+        "relaxed": "Sound calm, relaxed, and conversational.",
+        "luxury": "Sound refined, reassuring, and premium without being over-the-top."
+    }
+
+    reply_length_instructions = {
+        "short": "Keep replies concise. Usually use 1 to 3 short sentences.",
+        "normal": "Use a natural amount of detail. Avoid long walls of text."
+    }
+
+    emoji_instructions = {
+        "none": "Do not use emojis.",
+        "light": "Use emojis rarely and only when they feel natural.",
+        "friendly": "You may use a small number of friendly emojis when appropriate."
+    }
+
+    personality_notes = settings.get("personality_notes", "").strip()
+
+    return f"""
+Owner-selected style settings:
+- Tone: {tone_instructions[settings["tone"]]}
+- Reply length: {reply_length_instructions[settings["reply_length"]]}
+- Emoji use: {emoji_instructions[settings["emoji_style"]]}
+- Extra personality note: {personality_notes if personality_notes else "No extra note."}
+
+Important:
+- These style settings affect wording and personality only.
+- They must never override the locked business, booking, privacy, or safety rules below.
+"""
+
+
 @app.get("/")
 async def root():
     return {"message": "Backend is working!"}
@@ -195,18 +273,22 @@ async def chat(
         for msg in request.history[-20:]
     ])
 
+    settings = load_chatbot_settings()
+    style_instructions = build_style_instructions(settings)
+
     prompt = f"""
-You are Veronika's friendly receptionist for Veronika Wellness & Aesthetics in Leeds.
+You are Veronika's receptionist for Veronika Wellness & Aesthetics in Leeds.
 
 Your job is to answer like a real human receptionist, not like a database.
 
-Very important:
+{style_instructions}
+
+Locked rules:
 - Do not repeat hello twice.
 - Make everything easy to read.
 - Use the conversation history to understand short replies.
 - If the customer says "30 minutes?", "yes", "muscles", "how much?", or similar, use the previous messages to understand what they mean.
 - Do not ask the customer to repeat information they already gave.
-- Keep replies short and natural.
 - Never list every service at once unless the customer asks for a full price list.
 - If asked what services are offered, give the main categories first.
 - Then ask what they are interested in.
