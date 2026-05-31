@@ -237,7 +237,8 @@ def send_booking_notification(session_id: str):
             data=json.dumps(email_payload).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "User-Agent": "veronika-chatbot/1.0"
             },
             method="POST"
         )
