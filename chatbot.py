@@ -1,4 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from groq import Groq
 from supabase import create_client, Client
@@ -9,9 +10,15 @@ from datetime import datetime, timezone, timedelta
 from html import escape
 from urllib import request as urllib_request
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import time
 from zoneinfo import ZoneInfo
 
 load_dotenv()
@@ -38,6 +45,13 @@ NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 DASHBOARD_URL = "https://veronika-wellness.onrender.com/admin.html"
 BUSINESS_TIMEZONE = ZoneInfo("Europe/London")
+BUSINESS_SLUG = "veronika"
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 
 REQUIRED_BOOKING_FIELDS = [
     "treatment",
@@ -476,9 +490,220 @@ Important:
 """
 
 
+def google_oauth_is_configured() -> bool:
+    return all([
+        GOOGLE_CLIENT_ID,
+        GOOGLE_CLIENT_SECRET,
+        GOOGLE_REDIRECT_URI,
+        GOOGLE_OAUTH_STATE_SECRET,
+    ])
+
+
+def create_google_oauth_state() -> str:
+    if not GOOGLE_OAUTH_STATE_SECRET:
+        raise RuntimeError("GOOGLE_OAUTH_STATE_SECRET is missing.")
+
+    payload = f"{int(time.time())}:{secrets.token_urlsafe(18)}"
+    signature = hmac.new(
+        GOOGLE_OAUTH_STATE_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    token = f"{payload}:{signature}".encode("utf-8")
+    return base64.urlsafe_b64encode(token).decode("utf-8")
+
+
+def verify_google_oauth_state(state: str, max_age_seconds: int = 900) -> bool:
+    if not GOOGLE_OAUTH_STATE_SECRET:
+        return False
+
+    try:
+        decoded = base64.urlsafe_b64decode(state.encode("utf-8")).decode("utf-8")
+        timestamp_text, nonce, signature = decoded.split(":", 2)
+        payload = f"{timestamp_text}:{nonce}"
+
+        expected_signature = hmac.new(
+            GOOGLE_OAUTH_STATE_SECRET.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, expected_signature):
+            return False
+
+        age_seconds = int(time.time()) - int(timestamp_text)
+        return 0 <= age_seconds <= max_age_seconds
+
+    except Exception:
+        return False
+
+
+def save_google_refresh_token(refresh_token: str):
+    supabase.table("google_calendar_tokens").upsert(
+        {
+            "business_slug": BUSINESS_SLUG,
+            "refresh_token": refresh_token,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        on_conflict="business_slug",
+    ).execute()
+
+
+def get_google_refresh_token() -> str | None:
+    try:
+        response = (
+            supabase.table("google_calendar_tokens")
+            .select("refresh_token")
+            .eq("business_slug", BUSINESS_SLUG)
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0].get("refresh_token")
+
+    except Exception as error:
+        print(f"Could not load Google refresh token: {error}")
+
+    return None
+
+
+def exchange_google_code_for_tokens(code: str) -> dict:
+    if not google_oauth_is_configured():
+        raise RuntimeError("Google OAuth environment variables are incomplete.")
+
+    token_payload = urllib_parse.urlencode({
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+
+    token_request = urllib_request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=token_payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "veronika-chatbot/1.0",
+        },
+        method="POST",
+    )
+
+    with urllib_request.urlopen(token_request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 @app.get("/")
 async def root():
     return {"message": "Backend is working!"}
+
+
+@app.get("/google-calendar/connect")
+async def google_calendar_connect():
+    if not google_oauth_is_configured():
+        return HTMLResponse(
+            """
+            <h2>Google Calendar connection is not configured yet.</h2>
+            <p>Check the Google OAuth environment variables in Render.</p>
+            """,
+            status_code=500,
+        )
+
+    state = create_google_oauth_state()
+
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib_parse.urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GOOGLE_CALENDAR_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    })
+
+    return RedirectResponse(auth_url)
+
+
+@app.get("/google-calendar/callback")
+async def google_calendar_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    if error:
+        return HTMLResponse(
+            f"""
+            <h2>Google Calendar connection was cancelled.</h2>
+            <p>Error: {escape(error)}</p>
+            """,
+            status_code=400,
+        )
+
+    if not code or not state or not verify_google_oauth_state(state):
+        return HTMLResponse(
+            """
+            <h2>Google Calendar connection failed.</h2>
+            <p>The security check failed or the connection link expired. Please open the connect link again.</p>
+            """,
+            status_code=400,
+        )
+
+    try:
+        tokens = exchange_google_code_for_tokens(code)
+        refresh_token = tokens.get("refresh_token")
+
+        if not refresh_token:
+            return HTMLResponse(
+                """
+                <h2>No refresh token was returned.</h2>
+                <p>Please open the connect link again and approve access when Google asks.</p>
+                """,
+                status_code=400,
+            )
+
+        save_google_refresh_token(refresh_token)
+
+        return HTMLResponse(
+            """
+            <h2>Google Calendar connected successfully.</h2>
+            <p>You can close this page. The chatbot backend now has availability-only access.</p>
+            """
+        )
+
+    except urllib_error.HTTPError as oauth_error:
+        body = oauth_error.read().decode("utf-8", errors="replace")
+        print(f"Google OAuth token exchange failed: HTTP {oauth_error.code} {body}")
+
+        return HTMLResponse(
+            """
+            <h2>Google Calendar connection failed.</h2>
+            <p>The Google token exchange was rejected. Check the Render logs for details.</p>
+            """,
+            status_code=500,
+        )
+
+    except Exception as oauth_error:
+        print(f"Google Calendar connection failed: {oauth_error}")
+
+        return HTMLResponse(
+            """
+            <h2>Google Calendar connection failed.</h2>
+            <p>Check the Render logs for details.</p>
+            """,
+            status_code=500,
+        )
+
+
+@app.get("/google-calendar/status")
+async def google_calendar_status():
+    return {
+        "connected": bool(get_google_refresh_token()),
+        "calendar_id": "primary",
+        "scope": GOOGLE_CALENDAR_SCOPE,
+    }
 
 
 @app.post("/chat")
