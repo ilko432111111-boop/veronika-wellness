@@ -228,7 +228,7 @@ def build_style_instructions(settings: dict) -> str:
     emoji_instructions = {
         "none": "Do not use emojis.",
         "light": "Use emojis rarely and only when they feel natural or its a joke",
-        "friendly": ""friendly": "Use 1 to 3 friendly emojis in most replies when it feels natural. Keep them relevant and do not overdo it.""
+        "friendly": "Use 1 to 3 friendly emojis in most replies when it feels natural. Keep them relevant and do not overdo it.""
     }
 
     personality_notes = settings.get("personality_notes", "").strip()
