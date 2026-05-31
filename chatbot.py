@@ -36,6 +36,15 @@ NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 DASHBOARD_URL = "https://veronika-wellness.onrender.com/admin.html"
 
+REQUIRED_BOOKING_FIELDS = [
+    "treatment",
+    "duration",
+    "name",
+    "phone",
+    "preferred_date",
+    "preferred_time",
+]
+
 
 class ChatMessage(BaseModel):
     role: str
@@ -60,9 +69,9 @@ def save_message(session_id: str, role: str, content: str):
         print(f"Could not save message: {error}")
 
 
-def save_conversation_overview(session_id: str, lead_data: dict):
+def get_existing_conversation(session_id: str) -> dict:
     try:
-        existing_response = (
+        response = (
             supabase.table("conversations")
             .select("*")
             .eq("session_id", session_id)
@@ -70,39 +79,56 @@ def save_conversation_overview(session_id: str, lead_data: dict):
             .execute()
         )
 
-        existing = (
-            existing_response.data[0]
-            if existing_response.data
-            else {}
-        )
+        if response.data:
+            return response.data[0]
 
-        fields = [
-            "name",
-            "phone",
-            "treatment",
-            "duration",
-            "preferred_date",
-            "preferred_time",
-            "notes",
-            "status",
-            "summary"
-        ]
+    except Exception as error:
+        print(f"Could not load existing conversation: {error}")
 
+    return {}
+
+
+def merge_lead_data(existing: dict, extracted: dict) -> dict:
+    fields = [
+        "name",
+        "phone",
+        "treatment",
+        "duration",
+        "preferred_date",
+        "preferred_time",
+        "notes",
+        "status",
+        "summary",
+    ]
+
+    merged = {}
+
+    for field in fields:
+        new_value = extracted.get(field)
+        old_value = existing.get(field)
+
+        if new_value not in [None, ""]:
+            merged[field] = new_value
+        else:
+            merged[field] = old_value
+
+    complete = all(merged.get(field) not in [None, ""] for field in REQUIRED_BOOKING_FIELDS)
+
+    if complete:
+        merged["status"] = "booking_request_complete"
+    elif not merged.get("status"):
+        merged["status"] = "new_chat"
+
+    return merged
+
+
+def save_conversation_overview(session_id: str, lead_data: dict):
+    try:
         payload = {
             "session_id": session_id,
-            "updated_at": datetime.now(timezone.utc).isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            **lead_data,
         }
-
-        for field in fields:
-            new_value = lead_data.get(field)
-
-            if new_value not in [None, ""]:
-                payload[field] = new_value
-            else:
-                payload[field] = existing.get(field)
-
-        if not payload.get("status"):
-            payload["status"] = "new_chat"
 
         supabase.table("conversations").upsert(
             payload,
@@ -118,7 +144,7 @@ def extract_lead_data(conversation_history: str) -> dict:
         extraction_prompt = f"""
 Read the customer conversation below and extract useful lead details.
 
-Only save information the customer has actually provided.
+Only save information the customer has actually provided or clearly confirmed.
 Do not treat suggestions made by the assistant as confirmed customer details.
 Do not invent missing information.
 
@@ -161,6 +187,19 @@ Conversation:
     except Exception as error:
         print(f"Could not extract lead details: {error}")
         return {}
+
+
+def format_confirmed_details(lead_data: dict) -> str:
+    lines = []
+
+    for field in REQUIRED_BOOKING_FIELDS:
+        value = lead_data.get(field)
+
+        if value not in [None, ""]:
+            label = field.replace("_", " ").title()
+            lines.append(f"- {label}: {value}")
+
+    return "\n".join(lines) if lines else "- No confirmed booking details yet."
 
 
 def send_booking_notification(session_id: str):
@@ -238,7 +277,7 @@ def send_booking_notification(session_id: str):
             headers={
                 "Authorization": f"Bearer {RESEND_API_KEY}",
                 "Content-Type": "application/json",
-                "User-Agent": "veronika-chatbot/1.0"
+                "User-Agent": "veronika-chatbot/1.0",
             },
             method="POST"
         )
@@ -274,21 +313,6 @@ def send_booking_notification(session_id: str):
             )
         except Exception as reset_error:
             print(f"Could not reset notification marker: {reset_error}")
-
-
-def update_conversation_overview(
-    session_id: str,
-    conversation_history: str
-):
-    lead_data = extract_lead_data(conversation_history)
-
-    if lead_data:
-        save_conversation_overview(
-            session_id=session_id,
-            lead_data=lead_data
-        )
-
-        send_booking_notification(session_id)
 
 
 def load_chatbot_settings() -> dict:
@@ -391,10 +415,42 @@ async def chat(
         item["content"] for item in response.data
     ]) if response.data else "No information available."
 
-    conversation_history = "\n".join([
+    history_lines = [
         f"{msg.role}: {msg.content}"
         for msg in request.history[-20:]
-    ])
+    ]
+
+    latest_already_present = (
+        bool(request.history)
+        and request.history[-1].content.strip() == request.message.strip()
+    )
+
+    if not latest_already_present:
+        history_lines.append(f"customer: {request.message}")
+
+    conversation_history = "\n".join(history_lines[-20:])
+
+    extracted_lead = extract_lead_data(conversation_history)
+    existing_lead = get_existing_conversation(request.session_id)
+    merged_lead = merge_lead_data(existing_lead, extracted_lead)
+
+    save_conversation_overview(
+        session_id=request.session_id,
+        lead_data=merged_lead
+    )
+
+    missing_fields = [
+        field
+        for field in REQUIRED_BOOKING_FIELDS
+        if merged_lead.get(field) in [None, ""]
+    ]
+
+    confirmed_details = format_confirmed_details(merged_lead)
+    missing_details = (
+        ", ".join(field.replace("_", " ") for field in missing_fields)
+        if missing_fields
+        else "None"
+    )
 
     settings = load_chatbot_settings()
     style_instructions = build_style_instructions(settings)
@@ -410,8 +466,12 @@ Locked rules:
 - Do not repeat hello twice.
 - Make everything easy to read.
 - Use the conversation history to understand short replies.
-- If the customer says "30 minutes?", "yes", "muscles", "how much?", or similar, use the previous messages to understand what they mean.
 - Do not ask the customer to repeat information they already gave.
+- Never ask again for any detail listed under CONFIRMED CUSTOMER DETAILS.
+- Ask naturally for only the missing details. Ask for no more than two missing details in one reply.
+- If no required details are missing, tell the customer that Veronika will check availability and contact them shortly to confirm.
+- Never say a date or time is available, unavailable, free, fully booked, reserved, or confirmed unless that exact availability information exists in the business information.
+- Treat any requested date and time as the customer's preference only.
 - Never list every service at once unless the customer asks for a full price list.
 - If asked what services are offered, give the main categories first.
 - Then ask what they are interested in.
@@ -425,19 +485,20 @@ Locked rules:
 - Never ask for a deposit.
 - Never take payment.
 - Never confirm that an appointment is booked.
-- After the client selects a treatment, ask naturally for their name, phone number, preferred date, and preferred time.
-- Only once the treatment, duration, name, phone number, preferred date, and preferred time have been collected, say that Veronika will be in touch shortly to confirm.
 - Put the handover confirmation on a new line so the message is easy to read.
 - If unsure, suggest calling 07386 396139.
+
+CONFIRMED CUSTOMER DETAILS:
+{confirmed_details}
+
+MISSING REQUIRED DETAILS:
+{missing_details}
 
 Business information:
 {context}
 
 Conversation history:
 {conversation_history}
-
-Latest customer message:
-{request.message}
 
 Reply as Veronika's assistant:
 """
@@ -447,7 +508,7 @@ Reply as Veronika's assistant:
         messages=[
             {"role": "user", "content": prompt}
         ],
-        temperature=0.4
+        temperature=0.3
     )
 
     reply = completion.choices[0].message.content
@@ -458,15 +519,9 @@ Reply as Veronika's assistant:
         content=reply
     )
 
-    lead_history = f"""
-{conversation_history}
-assistant: {reply}
-"""
-
     background_tasks.add_task(
-        update_conversation_overview,
-        request.session_id,
-        lead_history
+        send_booking_notification,
+        request.session_id
     )
 
     return {"reply": reply}
