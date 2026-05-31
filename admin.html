@@ -149,6 +149,71 @@
             font-size: 0.9rem;
         }
 
+        .settings-card {
+            background: white;
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .settings-card h2 {
+            margin: 0 0 6px;
+            font-size: 1.1rem;
+        }
+
+        .settings-card p {
+            margin: 0 0 14px;
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .settings-field label {
+            display: block;
+            margin: 0 0 6px;
+            font-size: 0.8rem;
+            color: var(--muted);
+        }
+
+        .settings-field textarea {
+            width: 100%;
+            min-height: 92px;
+            resize: vertical;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            background: white;
+            font: inherit;
+        }
+
+        .settings-notes {
+            grid-column: 1 / -1;
+        }
+
+        .settings-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-top: 12px;
+        }
+
+        .settings-save-button {
+            width: auto;
+            margin-top: 0;
+        }
+
+        .settings-message {
+            min-height: 1em;
+            color: var(--muted);
+            font-size: 0.86rem;
+        }
+
         .table-card {
             background: white;
             border-radius: 14px;
@@ -325,6 +390,10 @@
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
 
+            .settings-grid {
+                grid-template-columns: 1fr;
+            }
+
             main { padding: 12px; }
         }
     </style>
@@ -375,6 +444,52 @@
                 <div class="summary-card">
                     <span>Interested</span>
                     <strong id="interested-count">0</strong>
+                </div>
+            </div>
+
+            <div class="settings-card">
+                <h2>Chatbot personality</h2>
+                <p>Change how the chatbot sounds. Important booking and safety rules stay locked.</p>
+
+                <div class="settings-grid">
+                    <div class="settings-field">
+                        <label for="tone-setting">Tone</label>
+                        <select id="tone-setting">
+                            <option value="friendly">Friendly</option>
+                            <option value="professional">Professional</option>
+                            <option value="relaxed">Relaxed</option>
+                            <option value="luxury">Luxury</option>
+                        </select>
+                    </div>
+
+                    <div class="settings-field">
+                        <label for="reply-length-setting">Reply length</label>
+                        <select id="reply-length-setting">
+                            <option value="short">Short</option>
+                            <option value="normal">Normal</option>
+                        </select>
+                    </div>
+
+                    <div class="settings-field">
+                        <label for="emoji-style-setting">Emoji use</label>
+                        <select id="emoji-style-setting">
+                            <option value="none">None</option>
+                            <option value="light">Light</option>
+                            <option value="friendly">Friendly</option>
+                        </select>
+                    </div>
+
+                    <div class="settings-field settings-notes">
+                        <label for="personality-notes-setting">Extra personality note</label>
+                        <textarea id="personality-notes-setting" placeholder="Example: Sound warm and reassuring. Avoid sounding robotic."></textarea>
+                    </div>
+                </div>
+
+                <div class="settings-actions">
+                    <button id="save-settings-button" class="primary-button settings-save-button" type="button">
+                        Save personality
+                    </button>
+                    <span id="settings-message" class="settings-message"></span>
                 </div>
             </div>
 
@@ -467,6 +582,12 @@
         const logoutButton = document.getElementById("logout-button");
         const tableBody = document.getElementById("lead-table-body");
         const tableMessage = document.getElementById("table-message");
+        const toneSetting = document.getElementById("tone-setting");
+        const replyLengthSetting = document.getElementById("reply-length-setting");
+        const emojiStyleSetting = document.getElementById("emoji-style-setting");
+        const personalityNotesSetting = document.getElementById("personality-notes-setting");
+        const saveSettingsButton = document.getElementById("save-settings-button");
+        const settingsMessage = document.getElementById("settings-message");
         const aiStatusFilter = document.getElementById("ai-status-filter");
         const ownerStatusFilter = document.getElementById("owner-status-filter");
         const clearFiltersButton = document.getElementById("clear-filters-button");
@@ -514,6 +635,52 @@
                 leads.filter((lead) => lead.status === "details_incomplete").length;
             document.getElementById("interested-count").textContent =
                 leads.filter((lead) => lead.status === "interested").length;
+        }
+
+        async function loadChatbotSettings() {
+            settingsMessage.textContent = "Loading settings...";
+
+            const { data, error } = await supabaseClient
+                .from("chatbot_settings")
+                .select("tone, reply_length, emoji_style, personality_notes")
+                .eq("business_slug", "veronika")
+                .single();
+
+            if (error) {
+                settingsMessage.textContent = `Could not load settings: ${error.message}`;
+                return;
+            }
+
+            toneSetting.value = data.tone || "friendly";
+            replyLengthSetting.value = data.reply_length || "short";
+            emojiStyleSetting.value = data.emoji_style || "light";
+            personalityNotesSetting.value = data.personality_notes || "";
+            settingsMessage.textContent = "";
+        }
+
+        async function saveChatbotSettings() {
+            settingsMessage.textContent = "Saving...";
+
+            const { error } = await supabaseClient
+                .from("chatbot_settings")
+                .update({
+                    tone: toneSetting.value,
+                    reply_length: replyLengthSetting.value,
+                    emoji_style: emojiStyleSetting.value,
+                    personality_notes: personalityNotesSetting.value.trim(),
+                    updated_at: new Date().toISOString()
+                })
+                .eq("business_slug", "veronika");
+
+            if (error) {
+                settingsMessage.textContent = `Could not save: ${error.message}`;
+                return;
+            }
+
+            settingsMessage.textContent = "Saved";
+            setTimeout(() => {
+                settingsMessage.textContent = "";
+            }, 1400);
         }
 
         async function updateOwnerStatus(sessionId, newStatus, noteElement) {
@@ -690,10 +857,18 @@
             }
 
             showDashboard();
-            await loadLeads();
+            await Promise.all([
+                loadLeads(),
+                loadChatbotSettings()
+            ]);
         });
 
-        refreshButton.addEventListener("click", loadLeads);
+        refreshButton.addEventListener("click", async () => {
+            await loadLeads();
+            await loadChatbotSettings();
+        });
+
+        saveSettingsButton.addEventListener("click", saveChatbotSettings);
 
         aiStatusFilter.addEventListener("change", applyFilters);
         ownerStatusFilter.addEventListener("change", applyFilters);
@@ -725,7 +900,10 @@
 
         if (session) {
             showDashboard();
-            await loadLeads();
+            await Promise.all([
+                loadLeads(),
+                loadChatbotSettings()
+            ]);
         } else {
             showLogin();
         }
