@@ -6,6 +6,9 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 from datetime import datetime, timezone
+from html import escape
+from urllib import request as urllib_request
+from urllib import error as urllib_error
 import json
 import os
 
@@ -27,6 +30,11 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL")
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+DASHBOARD_URL = "https://veronika-wellness.onrender.com/admin.html"
 
 
 class ChatMessage(BaseModel):
@@ -155,6 +163,118 @@ Conversation:
         return {}
 
 
+def send_booking_notification(session_id: str):
+    if not RESEND_API_KEY or not NOTIFICATION_EMAIL:
+        print("Email notification skipped: missing Resend environment variables.")
+        return
+
+    try:
+        lead_response = (
+            supabase.table("conversations")
+            .select(
+                "session_id, name, phone, treatment, duration, "
+                "preferred_date, preferred_time, notes, summary, "
+                "status, notification_sent_at"
+            )
+            .eq("session_id", session_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not lead_response.data:
+            return
+
+        lead = lead_response.data[0]
+
+        if lead.get("status") != "booking_request_complete":
+            return
+
+        if lead.get("notification_sent_at"):
+            return
+
+        sent_at = datetime.now(timezone.utc).isoformat()
+
+        claim_response = (
+            supabase.table("conversations")
+            .update({"notification_sent_at": sent_at})
+            .eq("session_id", session_id)
+            .is_("notification_sent_at", "null")
+            .execute()
+        )
+
+        if not claim_response.data:
+            return
+
+        name = escape(str(lead.get("name") or "Not provided"))
+        phone = escape(str(lead.get("phone") or "Not provided"))
+        treatment = escape(str(lead.get("treatment") or "Not provided"))
+        duration = escape(str(lead.get("duration") or "Not provided"))
+        preferred_date = escape(str(lead.get("preferred_date") or "Not provided"))
+        preferred_time = escape(str(lead.get("preferred_time") or "Not provided"))
+        notes = escape(str(lead.get("notes") or "None"))
+        summary = escape(str(lead.get("summary") or "No summary available"))
+
+        email_payload = {
+            "from": RESEND_FROM_EMAIL,
+            "to": [NOTIFICATION_EMAIL],
+            "subject": f"New booking request: {name}",
+            "html": f"""
+                <h2>New booking request</h2>
+                <p><strong>Name:</strong> {name}</p>
+                <p><strong>Phone:</strong> {phone}</p>
+                <p><strong>Treatment:</strong> {treatment}</p>
+                <p><strong>Duration:</strong> {duration}</p>
+                <p><strong>Preferred date:</strong> {preferred_date}</p>
+                <p><strong>Preferred time:</strong> {preferred_time}</p>
+                <p><strong>Notes:</strong> {notes}</p>
+                <p><strong>Summary:</strong> {summary}</p>
+                <p><a href="{DASHBOARD_URL}">Open the lead dashboard</a></p>
+            """
+        }
+
+        api_request = urllib_request.Request(
+            "https://api.resend.com/emails",
+            data=json.dumps(email_payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+
+        with urllib_request.urlopen(api_request, timeout=15) as response:
+            response.read()
+
+        print(f"Booking notification sent for session {session_id}")
+
+    except urllib_error.HTTPError as error:
+        error_body = error.read().decode("utf-8", errors="replace")
+        print(f"Could not send booking notification: HTTP {error.code} {error_body}")
+
+        try:
+            (
+                supabase.table("conversations")
+                .update({"notification_sent_at": None})
+                .eq("session_id", session_id)
+                .execute()
+            )
+        except Exception as reset_error:
+            print(f"Could not reset notification marker: {reset_error}")
+
+    except Exception as error:
+        print(f"Could not send booking notification: {error}")
+
+        try:
+            (
+                supabase.table("conversations")
+                .update({"notification_sent_at": None})
+                .eq("session_id", session_id)
+                .execute()
+            )
+        except Exception as reset_error:
+            print(f"Could not reset notification marker: {reset_error}")
+
+
 def update_conversation_overview(
     session_id: str,
     conversation_history: str
@@ -166,6 +286,8 @@ def update_conversation_overview(
             session_id=session_id,
             lead_data=lead_data
         )
+
+        send_booking_notification(session_id)
 
 
 def load_chatbot_settings() -> dict:
