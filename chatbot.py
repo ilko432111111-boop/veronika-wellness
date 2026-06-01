@@ -54,6 +54,21 @@ GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
+# Working hours currently shown on the public website.
+# Monday=0 ... Sunday=6
+BUSINESS_HOURS = {
+    0: (9, 20),
+    1: (9, 20),
+    2: (9, 20),
+    3: (9, 20),
+    4: (9, 20),
+    5: (10, 18),
+    6: None,
+}
+SLOT_STEP_MINUTES = 30
+NEXT_SLOT_LIMIT = 3
+NEXT_SLOT_SEARCH_DAYS = 7
+
 REQUIRED_BOOKING_FIELDS = [
     "treatment",
     "duration",
@@ -106,6 +121,40 @@ def get_existing_conversation(session_id: str) -> dict:
     return {}
 
 
+def calculate_lead_status(lead_data: dict, extracted_status: str | None) -> str:
+    complete = all(
+        lead_data.get(field) not in [None, ""]
+        for field in REQUIRED_BOOKING_FIELDS
+    )
+
+    if complete:
+        return "booking_request_complete"
+
+    booking_progress_fields = [
+        "duration",
+        "preferred_date",
+        "preferred_time",
+        "name",
+        "phone",
+    ]
+
+    has_booking_progress = any(
+        lead_data.get(field) not in [None, ""]
+        for field in booking_progress_fields
+    )
+
+    if extracted_status in ["details_incomplete", "booking_request_complete"]:
+        return "details_incomplete"
+
+    if lead_data.get("treatment") and has_booking_progress:
+        return "details_incomplete"
+
+    if extracted_status == "interested" or lead_data.get("treatment"):
+        return "interested"
+
+    return "new_chat"
+
+
 def merge_lead_data(existing: dict, extracted: dict) -> dict:
     fields = [
         "name",
@@ -115,7 +164,6 @@ def merge_lead_data(existing: dict, extracted: dict) -> dict:
         "preferred_date",
         "preferred_time",
         "notes",
-        "status",
         "summary",
     ]
 
@@ -130,12 +178,15 @@ def merge_lead_data(existing: dict, extracted: dict) -> dict:
         else:
             merged[field] = old_value
 
-    complete = all(merged.get(field) not in [None, ""] for field in REQUIRED_BOOKING_FIELDS)
+    merged["status"] = calculate_lead_status(
+        merged,
+        extracted.get("status"),
+    )
 
-    if complete:
-        merged["status"] = "booking_request_complete"
-    elif not merged.get("status"):
-        merged["status"] = "new_chat"
+    # If a previous buggy version sent an alert too early, clear the marker
+    # while the lead is incomplete so a correct alert can be sent later.
+    if merged["status"] != "booking_request_complete":
+        merged["notification_sent_at"] = None
 
     return merged
 
@@ -157,58 +208,164 @@ def normalise_preferred_date(value: str | None) -> str | None:
     return cleaned
 
 
-def apply_simple_date_time_fallback(
+def next_weekday_date(target_weekday: int):
+    today = datetime.now(BUSINESS_TIMEZONE).date()
+    days_ahead = (target_weekday - today.weekday()) % 7
+    return today + timedelta(days=days_ahead)
+
+
+def parse_relative_date_from_text(message: str) -> str | None:
+    lower_message = message.lower()
+    today = datetime.now(BUSINESS_TIMEZONE).date()
+
+    if re.search(r"\btoday\b", lower_message):
+        return today.isoformat()
+
+    if re.search(r"\btomorrow\b", lower_message):
+        return (today + timedelta(days=1)).isoformat()
+
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+
+    for weekday_name, weekday_number in weekdays.items():
+        if re.search(rf"\b{weekday_name}\b", lower_message):
+            return next_weekday_date(weekday_number).isoformat()
+
+    iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", message)
+
+    if iso_match:
+        return iso_match.group(1)
+
+    return None
+
+
+def parse_time_from_text(message: str) -> str | None:
+    lower_message = message.lower()
+
+    twenty_four_hour_match = re.search(
+        r"\b(?:at\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b",
+        lower_message,
+    )
+
+    if twenty_four_hour_match:
+        return (
+            f"{int(twenty_four_hour_match.group(1)):02d}:"
+            f"{twenty_four_hour_match.group(2)}"
+        )
+
+    am_pm_match = re.search(
+        r"\b(?:at\s*)?(1[0-2]|0?[1-9])(?:[:.]([0-5]\d))?\s*(am|pm)\b",
+        lower_message,
+    )
+
+    if am_pm_match:
+        hour = int(am_pm_match.group(1))
+        minute = am_pm_match.group(2) or "00"
+        suffix = am_pm_match.group(3)
+
+        if suffix == "pm" and hour != 12:
+            hour += 12
+        elif suffix == "am" and hour == 12:
+            hour = 0
+
+        return f"{hour:02d}:{minute}"
+
+    return None
+
+
+def parse_phone_from_text(message: str) -> str | None:
+    digit_groups = re.findall(r"\+?\d[\d\s()-]{6,}\d", message)
+
+    for candidate in digit_groups:
+        digits = re.sub(r"\D", "", candidate)
+
+        if 7 <= len(digits) <= 15:
+            return candidate.strip()
+
+    return None
+
+
+def looks_like_customer_name(message: str) -> bool:
+    cleaned = message.strip()
+    lower_message = cleaned.lower()
+
+    rejected = {
+        "yes",
+        "no",
+        "sure",
+        "okay",
+        "ok",
+        "today",
+        "tomorrow",
+        "massage",
+        "swedish massage",
+        "relaxing massage",
+        "deep tissue massage",
+    }
+
+    if lower_message in rejected:
+        return False
+
+    if any(char.isdigit() for char in cleaned):
+        return False
+
+    words = cleaned.split()
+
+    return (
+        1 <= len(words) <= 4
+        and all(re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'-]+", word) for word in words)
+    )
+
+
+def apply_latest_message_fallbacks(
     lead_data: dict,
-    conversation_history: str
+    latest_message: str,
+    previous_assistant_message: str,
 ) -> dict:
     """
-    Preserve obvious customer date/time preferences even if the AI extractor
-    misses them. Relative dates such as today and tomorrow are converted into
-    real calendar dates so the dashboard remains clear later.
+    Use the latest customer message as the strongest source for obvious details.
+    This avoids reusing stale dates or times from earlier messages.
     """
     result = dict(lead_data)
-    lower_history = conversation_history.lower()
-    today = datetime.now(BUSINESS_TIMEZONE).date()
 
     result["preferred_date"] = normalise_preferred_date(
         result.get("preferred_date")
     )
 
-    if result.get("preferred_date") in [None, ""]:
-        if re.search(r"\btoday\b", lower_history):
-            result["preferred_date"] = today.isoformat()
-        elif re.search(r"\btomorrow\b", lower_history):
-            result["preferred_date"] = (
-                today + timedelta(days=1)
-            ).isoformat()
+    latest_date = parse_relative_date_from_text(latest_message)
+    latest_time = parse_time_from_text(latest_message)
+    latest_phone = parse_phone_from_text(latest_message)
 
-    if result.get("preferred_time") in [None, ""]:
-        time_match = re.search(
-            r"\b(?:at\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b",
-            lower_history
-        )
+    if latest_date:
+        result["preferred_date"] = latest_date
 
-        if time_match:
-            result["preferred_time"] = (
-                f"{int(time_match.group(1)):02d}:{time_match.group(2)}"
-            )
-        else:
-            am_pm_match = re.search(
-                r"\b(?:at\s*)?(1[0-2]|0?[1-9])(?:[:.]([0-5]\d))?\s*(am|pm)\b",
-                lower_history
-            )
+    if latest_time:
+        result["preferred_time"] = latest_time
 
-            if am_pm_match:
-                hour = int(am_pm_match.group(1))
-                minute = am_pm_match.group(2) or "00"
-                suffix = am_pm_match.group(3)
+    if latest_phone:
+        result["phone"] = latest_phone
 
-                if suffix == "pm" and hour != 12:
-                    hour += 12
-                elif suffix == "am" and hour == 12:
-                    hour = 0
+    if (
+        result.get("name") in [None, ""]
+        and "name" in previous_assistant_message.lower()
+        and looks_like_customer_name(latest_message)
+    ):
+        result["name"] = latest_message.strip()
 
-                result["preferred_time"] = f"{hour:02d}:{minute}"
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
 
     return result
 
@@ -324,6 +481,19 @@ def send_booking_notification(session_id: str):
         lead = lead_response.data[0]
 
         if lead.get("status") != "booking_request_complete":
+            return
+
+        missing_email_fields = [
+            field
+            for field in REQUIRED_BOOKING_FIELDS
+            if lead.get(field) in [None, ""]
+        ]
+
+        if missing_email_fields:
+            print(
+                "Email notification skipped because required fields are missing: "
+                + ", ".join(missing_email_fields)
+            )
             return
 
         if lead.get("notification_sent_at"):
@@ -676,7 +846,7 @@ def build_requested_slot(lead_data: dict):
     preferred_time = lead_data.get("preferred_time")
     duration_minutes = parse_duration_minutes(lead_data.get("duration"))
 
-    if not preferred_date or not preferred_time or not duration_minutes:
+    if not preferred_date or not preferred_time:
         return None
 
     try:
@@ -684,9 +854,12 @@ def build_requested_slot(lead_data: dict):
             f"{preferred_date}T{preferred_time}"
         ).replace(tzinfo=BUSINESS_TIMEZONE)
 
-        end_time = start_time + timedelta(minutes=duration_minutes)
+        # If duration is not known yet, check whether the requested start
+        # itself already clashes with a busy period.
+        check_minutes = duration_minutes or 1
+        end_time = start_time + timedelta(minutes=check_minutes)
 
-        return start_time, end_time
+        return start_time, end_time, duration_minutes
 
     except ValueError:
         return None
@@ -717,7 +890,7 @@ def query_google_freebusy(
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                "User-Agent": "veronika-chatbot/1.0",
+                "User-Agent": "receptionist-chatbot/1.0",
             },
             method="POST",
         )
@@ -747,23 +920,177 @@ def query_google_freebusy(
     return None
 
 
-def check_requested_calendar_slot(lead_data: dict) -> dict:
+def parse_google_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    ).astimezone(BUSINESS_TIMEZONE)
+
+
+def slot_overlaps_busy_period(
+    start_time: datetime,
+    end_time: datetime,
+    busy_periods: list[dict],
+) -> bool:
+    for busy_period in busy_periods:
+        busy_start = parse_google_datetime(busy_period["start"])
+        busy_end = parse_google_datetime(busy_period["end"])
+
+        if start_time < busy_end and end_time > busy_start:
+            return True
+
+    return False
+
+
+def round_up_to_slot_step(value: datetime) -> datetime:
+    value = value.replace(second=0, microsecond=0)
+    remainder = value.minute % SLOT_STEP_MINUTES
+
+    if remainder:
+        value += timedelta(minutes=SLOT_STEP_MINUTES - remainder)
+
+    return value
+
+
+def find_next_available_slots(
+    duration_minutes: int,
+    search_start: datetime | None = None,
+) -> list[str] | None:
+    now = datetime.now(BUSINESS_TIMEZONE)
+    search_start = max(search_start or now, now)
+    search_end = search_start + timedelta(days=NEXT_SLOT_SEARCH_DAYS)
+
+    busy_periods = query_google_freebusy(search_start, search_end)
+
+    if busy_periods is None:
+        return None
+
+    suggestions = []
+
+    for day_offset in range(NEXT_SLOT_SEARCH_DAYS + 1):
+        candidate_date = (search_start + timedelta(days=day_offset)).date()
+        hours = BUSINESS_HOURS.get(candidate_date.weekday())
+
+        if not hours:
+            continue
+
+        open_hour, close_hour = hours
+
+        open_time = datetime.combine(
+            candidate_date,
+            datetime.min.time(),
+            tzinfo=BUSINESS_TIMEZONE,
+        ).replace(hour=open_hour)
+
+        close_time = datetime.combine(
+            candidate_date,
+            datetime.min.time(),
+            tzinfo=BUSINESS_TIMEZONE,
+        ).replace(hour=close_hour)
+
+        candidate = round_up_to_slot_step(max(open_time, search_start))
+
+        while candidate + timedelta(minutes=duration_minutes) <= close_time:
+            candidate_end = candidate + timedelta(minutes=duration_minutes)
+
+            if not slot_overlaps_busy_period(
+                candidate,
+                candidate_end,
+                busy_periods,
+            ):
+                suggestions.append(
+                    candidate.strftime("%Y-%m-%d at %H:%M")
+                )
+
+                if len(suggestions) >= NEXT_SLOT_LIMIT:
+                    return suggestions
+
+            candidate += timedelta(minutes=SLOT_STEP_MINUTES)
+
+    return suggestions
+
+
+def asks_for_next_available_time(message: str) -> bool:
+    lower_message = message.lower()
+
+    phrases = [
+        "when is she free",
+        "when are you free",
+        "next free",
+        "next available",
+        "when is the therapist free",
+        "what time is free",
+        "what times are free",
+        "alternative time",
+        "another time",
+    ]
+
+    return any(phrase in lower_message for phrase in phrases)
+
+
+def asks_about_booking_or_availability(message: str) -> bool:
+    lower_message = message.lower()
+
+    keywords = [
+        "available",
+        "availability",
+        "free",
+        "book",
+        "booked",
+        "appointment",
+        "slot",
+        "come in",
+        "confirm",
+    ]
+
+    return any(keyword in lower_message for keyword in keywords)
+
+
+def should_surface_calendar_result(
+    latest_message: str,
+    existing_lead: dict,
+    merged_lead: dict,
+) -> bool:
+    date_changed = (
+        existing_lead.get("preferred_date")
+        != merged_lead.get("preferred_date")
+    )
+
+    time_changed = (
+        existing_lead.get("preferred_time")
+        != merged_lead.get("preferred_time")
+    )
+
+    return (
+        date_changed
+        or time_changed
+        or asks_about_booking_or_availability(latest_message)
+        or asks_for_next_available_time(latest_message)
+    )
+
+
+def check_requested_calendar_slot(
+    lead_data: dict,
+    latest_message: str,
+) -> dict:
     slot = build_requested_slot(lead_data)
 
     if not slot:
         return {
             "status": "not_checked",
-            "message": "A complete date, time, and duration are not available yet.",
+            "message": (
+                "A date and time are not both available yet. "
+                "Ask only for whichever one is missing."
+            ),
         }
 
-    start_time, end_time = slot
+    start_time, end_time, duration_minutes = slot
 
     if end_time <= datetime.now(BUSINESS_TIMEZONE):
         return {
             "status": "past",
             "message": (
-                f"The requested time {start_time.strftime('%Y-%m-%d %H:%M')} "
-                "is in the past. Ask the customer for a future preferred time."
+                "The requested time is in the past. "
+                "Ask for a future preferred time."
             ),
         }
 
@@ -774,34 +1101,93 @@ def check_requested_calendar_slot(lead_data: dict) -> dict:
             "status": "unknown",
             "message": (
                 "Calendar availability could not be checked. "
-                "Do not claim that the time is free or busy. "
-                "Say Veronika will check and confirm."
+                "Do not guess. Say the therapist will check and confirm."
             ),
         }
 
-    if busy_periods:
+    is_busy = slot_overlaps_busy_period(
+        start_time,
+        end_time,
+        busy_periods,
+    )
+
+    if is_busy:
+        suggestions = None
+
+        if duration_minutes:
+            suggestions = find_next_available_slots(
+                duration_minutes,
+                search_start=end_time,
+            )
+
+        suggestion_text = ""
+
+        if suggestions:
+            suggestion_text = (
+                " Suggested alternatives: "
+                + "; ".join(suggestions)
+                + "."
+            )
+
         return {
             "status": "busy",
             "message": (
-                f"The requested slot from {start_time.strftime('%Y-%m-%d %H:%M')} "
-                f"to {end_time.strftime('%H:%M')} clashes with a busy calendar period. "
-                "Tell the customer that this requested time is unavailable and ask for another preferred time. "
-                "Do not reveal any appointment details."
+                "The requested time is unavailable. "
+                "Say this once, briefly, and ask whether another preferred "
+                "time would suit the customer."
+                + suggestion_text
             ),
         }
+
+    if not duration_minutes:
+        return {
+            "status": "provisional_free",
+            "message": (
+                "The requested start time currently appears free, but the "
+                "duration is still missing. Ask for the duration so the full "
+                "slot can be checked. Do not overexplain."
+            ),
+        }
+
+    if asks_for_next_available_time(latest_message):
+        suggestions = find_next_available_slots(
+            duration_minutes,
+            search_start=datetime.now(BUSINESS_TIMEZONE),
+        )
+
+        if suggestions:
+            return {
+                "status": "suggestions",
+                "message": (
+                    "Offer these currently free options briefly: "
+                    + "; ".join(suggestions)
+                    + ". State that the therapist still needs to confirm."
+                ),
+            }
 
     return {
         "status": "free",
         "message": (
-            f"The requested slot from {start_time.strftime('%Y-%m-%d %H:%M')} "
-            f"to {end_time.strftime('%H:%M')} currently appears free in Google Calendar. "
-            "Tell the customer it currently looks available, but make clear that Veronika still needs to confirm the booking."
+            "The requested time currently appears free. "
+            "Say this once briefly and state that the therapist still needs "
+            "to confirm the booking."
         ),
     }
 
 
-def format_calendar_result(calendar_result: dict) -> str:
+def format_calendar_result(
+    calendar_result: dict,
+    should_surface: bool,
+) -> str:
+    if not should_surface:
+        return (
+            "Visibility: silent\n"
+            "Instruction: Do not mention calendar availability in this reply "
+            "unless the customer directly asks about it."
+        )
+
     return (
+        "Visibility: mention briefly\n"
         f"Status: {calendar_result.get('status', 'unknown')}\n"
         f"Instruction: {calendar_result.get('message', 'No calendar result available.')}"
     )
@@ -953,9 +1339,20 @@ async def chat(
     extracted_lead = extract_lead_data(conversation_history)
     existing_lead = get_existing_conversation(request.session_id)
     merged_lead = merge_lead_data(existing_lead, extracted_lead)
-    merged_lead = apply_simple_date_time_fallback(
+
+    previous_assistant_message = next(
+        (
+            msg.content
+            for msg in reversed(request.history[:-1])
+            if msg.role == "assistant"
+        ),
+        "",
+    )
+
+    merged_lead = apply_latest_message_fallbacks(
         merged_lead,
-        conversation_history
+        request.message,
+        previous_assistant_message,
     )
 
     save_conversation_overview(
@@ -963,8 +1360,21 @@ async def chat(
         lead_data=merged_lead
     )
 
-    calendar_result = check_requested_calendar_slot(merged_lead)
-    calendar_context = format_calendar_result(calendar_result)
+    calendar_result = check_requested_calendar_slot(
+        merged_lead,
+        request.message,
+    )
+
+    calendar_should_be_visible = should_surface_calendar_result(
+        request.message,
+        existing_lead,
+        merged_lead,
+    )
+
+    calendar_context = format_calendar_result(
+        calendar_result,
+        calendar_should_be_visible,
+    )
 
     missing_fields = [
         field
@@ -983,26 +1393,31 @@ async def chat(
     style_instructions = build_style_instructions(settings)
 
     prompt = f"""
-You are Veronika's receptionist for Veronika Wellness & Aesthetics in Leeds.
+You are Receptionist, the virtual receptionist for Veronika Wellness & Aesthetics in Leeds.
 
 Your job is to answer like a real human receptionist, not like a database.
+Never present yourself as Veronika. If you need to refer to the person providing the treatment, say "the therapist".
 
 {style_instructions}
 
 Locked rules:
+- Keep replies concise and natural. Usually use no more than two short sentences.
+- Answer the customer's question first, then ask only for the next missing detail or two.
 - Do not repeat hello twice.
-- Make everything easy to read.
+- Do not repeatedly recap the treatment, date, time, or availability unless the customer asks.
+- Avoid repetitive phrases such as "I've noted that down", "just to confirm", and "the requested time currently looks available" in consecutive replies.
 - Use the conversation history to understand short replies.
 - Do not ask the customer to repeat information they already gave.
 - Never ask again for any detail listed under CONFIRMED CUSTOMER DETAILS.
 - Ask naturally for only the missing details. Ask for no more than two missing details in one reply.
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
-- If the calendar status is "busy", say the requested time is unavailable and ask for another preferred time.
-- If the calendar status is "free", say the requested time currently looks available, but clearly state that Veronika still needs to confirm the booking.
-- If the calendar status is "unknown" or "not_checked", do not claim the requested time is free or busy. Say Veronika will check availability and confirm.
-- If the calendar status is "past", ask for a future preferred time.
+- If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
+- If a requested slot is busy, say it once briefly and offer the listed alternatives when available.
+- If a requested slot appears free, say it once briefly and clearly state that the therapist still needs to confirm.
+- If the calendar cannot be checked, do not guess. Say the therapist will check and confirm.
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
+- If asked "am I booked?", answer clearly: "Not yet. The therapist still needs to confirm the appointment."
 - Never list every service at once unless the customer asks for a full price list.
 - If asked what services are offered, give the main categories first.
 - Then ask what they are interested in.
@@ -1034,7 +1449,7 @@ Business information:
 Conversation history:
 {conversation_history}
 
-Reply as Veronika's assistant:
+Reply as Receptionist:
 """
 
     completion = groq_client.chat.completions.create(

@@ -575,26 +575,26 @@
         <div class="container">
             <p>© 2026 Veronika Wellness & Aesthetics • Leeds</p>
             <p style="margin-top: 8px; font-size: 0.85rem;">Professional treatments • Real results • Genuine care</p>
-            <p style="margin-top: 8px; font-size: 0.8rem;">Website and AI assistant built by Ilko</p>
+            <p style="margin-top: 8px; font-size: 0.8rem;">Website and AI receptionist built by Ilko</p>
         </div>
     </footer>
 
     <!-- Chat Widget -->
     <div id="chat-widget">
         <div id="chat-button" onclick="toggleChat()">
-            💬 Chat with Veronika
+            💬 Chat with Receptionist
         </div>
         
         <div id="chat-window" style="display: none;">
             <div id="chat-header">
-                <span>Veronika's Assistant</span>
+                <span>Receptionist</span>
                 <span onclick="toggleChat()" style="cursor: pointer;">✕</span>
             </div>
             
             <div id="chat-messages"></div>
 
 <div style="padding: 10px 14px; font-size: 12px; color: #666; background: #fff; border-top: 1px solid #eee;">
-    By using this chat, you agree that your messages and contact details may be stored so Veronika can respond to your enquiry.
+    By using this chat, you agree that your messages and contact details may be stored so the receptionist can respond to your enquiry.
 </div>
             
             <div id="chat-input-area">
@@ -644,7 +644,7 @@ if (!sessionId) {
 // Show typing message while waiting for the AI reply
 const typingMsg = document.createElement("div");
 typingMsg.className = "message bot-message";
-typingMsg.textContent = "Veronika's assistant is typing...";
+typingMsg.textContent = "Receptionist is typing...";
 messages.appendChild(typingMsg);
 messages.scrollTop = messages.scrollHeight;
 
