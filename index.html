@@ -657,7 +657,8 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 body: JSON.stringify({
     session_id: sessionId,
     message: userInput,
-    history: chatHistory
+    history: chatHistory,
+    source: "website"
 })
             })
             .then(response => {

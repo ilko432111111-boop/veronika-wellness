@@ -313,7 +313,7 @@
 
         table {
             width: 100%;
-            min-width: 1320px;
+            min-width: 1400px;
             border-collapse: collapse;
         }
 
@@ -602,6 +602,7 @@
                         <thead>
                             <tr>
                                 <th>Updated</th>
+                                <th>Source</th>
                                 <th>AI status</th>
                                 <th>Owner status</th>
                                 <th>Name</th>
@@ -912,6 +913,7 @@
 
                 row.innerHTML = `
                     <td>${formatDate(lead.updated_at)}</td>
+                    <td>${safeText(lead.source, "website")}</td>
                     <td>
                         <span class="status status-${safeText(lead.status, "new_chat")}">
                             ${statusLabel(lead.status)}

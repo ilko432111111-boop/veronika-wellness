@@ -54,9 +54,11 @@ GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
-# Working hours currently shown on the public website.
-# Monday=0 ... Sunday=6
-BUSINESS_HOURS = {
+SLOT_STEP_MINUTES = 30
+NEXT_SLOT_LIMIT = 3
+NEXT_SLOT_SEARCH_DAYS = 7
+
+DEFAULT_BUSINESS_HOURS = {
     0: (9, 20),
     1: (9, 20),
     2: (9, 20),
@@ -65,9 +67,6 @@ BUSINESS_HOURS = {
     5: (10, 18),
     6: None,
 }
-SLOT_STEP_MINUTES = 30
-NEXT_SLOT_LIMIT = 3
-NEXT_SLOT_SEARCH_DAYS = 7
 
 REQUIRED_BOOKING_FIELDS = [
     "treatment",
@@ -88,14 +87,29 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     history: List[ChatMessage] = Field(default_factory=list)
+    source: str = "website"
 
 
-def save_message(session_id: str, role: str, content: str):
+def normalise_source(source: str | None) -> str:
+    allowed_sources = {"website", "instagram", "whatsapp"}
+
+    cleaned = (source or "website").strip().lower()
+
+    return cleaned if cleaned in allowed_sources else "website"
+
+
+def save_message(
+    session_id: str,
+    role: str,
+    content: str,
+    source: str = "website",
+):
     try:
         supabase.table("messages").insert({
             "session_id": session_id,
             "role": role,
-            "content": content
+            "content": content,
+            "source": normalise_source(source),
         }).execute()
 
     except Exception as error:
@@ -370,10 +384,15 @@ def apply_latest_message_fallbacks(
     return result
 
 
-def save_conversation_overview(session_id: str, lead_data: dict):
+def save_conversation_overview(
+    session_id: str,
+    lead_data: dict,
+    source: str = "website",
+):
     try:
         payload = {
             "session_id": session_id,
+            "source": normalise_source(source),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             **lead_data,
         }
@@ -906,6 +925,66 @@ def refresh_google_access_token() -> str | None:
     return None
 
 
+def load_business_hours() -> dict:
+    """
+    Read editable working hours from Supabase.
+    Fall back to safe defaults if the table cannot be read.
+    """
+    hours = dict(DEFAULT_BUSINESS_HOURS)
+
+    try:
+        response = (
+            supabase.table("business_hours")
+            .select("day_of_week, open_time, close_time, is_closed")
+            .eq("business_slug", BUSINESS_SLUG)
+            .order("day_of_week")
+            .execute()
+        )
+
+        if not response.data:
+            return hours
+
+        for row in response.data:
+            day = row.get("day_of_week")
+
+            if day not in range(7):
+                continue
+
+            if row.get("is_closed"):
+                hours[day] = None
+                continue
+
+            open_time = row.get("open_time")
+            close_time = row.get("close_time")
+
+            if not open_time or not close_time:
+                continue
+
+            try:
+                open_hour, open_minute, *_ = [
+                    int(part)
+                    for part in open_time.split(":")
+                ]
+
+                close_hour, close_minute, *_ = [
+                    int(part)
+                    for part in close_time.split(":")
+                ]
+
+                hours[day] = (
+                    (open_hour, open_minute),
+                    (close_hour, close_minute),
+                )
+
+            except Exception:
+                continue
+
+    except Exception as error:
+        print(f"Could not load business hours: {error}")
+
+    return hours
+
+
 def parse_duration_minutes(value: str | None) -> int | None:
     if value in [None, ""]:
         return None
@@ -1062,27 +1141,44 @@ def find_next_available_slots(
         return None
 
     suggestions = []
+    business_hours = load_business_hours()
 
     for day_offset in range(NEXT_SLOT_SEARCH_DAYS + 1):
         candidate_date = (search_start + timedelta(days=day_offset)).date()
-        hours = BUSINESS_HOURS.get(candidate_date.weekday())
+        hours = business_hours.get(candidate_date.weekday())
 
         if not hours:
             continue
 
-        open_hour, close_hour = hours
+        open_value, close_value = hours
+
+        if isinstance(open_value, tuple):
+            open_hour, open_minute = open_value
+        else:
+            open_hour, open_minute = open_value, 0
+
+        if isinstance(close_value, tuple):
+            close_hour, close_minute = close_value
+        else:
+            close_hour, close_minute = close_value, 0
 
         open_time = datetime.combine(
             candidate_date,
             datetime.min.time(),
             tzinfo=BUSINESS_TIMEZONE,
-        ).replace(hour=open_hour)
+        ).replace(
+            hour=open_hour,
+            minute=open_minute,
+        )
 
         close_time = datetime.combine(
             candidate_date,
             datetime.min.time(),
             tzinfo=BUSINESS_TIMEZONE,
-        ).replace(hour=close_hour)
+        ).replace(
+            hour=close_hour,
+            minute=close_minute,
+        )
 
         candidate = round_up_to_slot_step(max(open_time, search_start))
 
@@ -1413,10 +1509,13 @@ async def chat(
     request: ChatRequest,
     background_tasks: BackgroundTasks
 ):
+    request_source = normalise_source(request.source)
+
     save_message(
         session_id=request.session_id,
         role="user",
-        content=request.message
+        content=request.message,
+        source=request_source,
     )
 
     response = supabase.table("documents").select("content").execute()
@@ -1461,7 +1560,8 @@ async def chat(
 
     save_conversation_overview(
         session_id=request.session_id,
-        lead_data=merged_lead
+        lead_data=merged_lead,
+        source=request_source,
     )
 
     calendar_result = check_requested_calendar_slot(
@@ -1504,7 +1604,8 @@ async def chat(
         save_message(
             session_id=request.session_id,
             role="assistant",
-            content=reply
+            content=reply,
+            source=request_source,
         )
 
         background_tasks.add_task(
@@ -1602,7 +1703,8 @@ Reply as Receptionist:
     save_message(
         session_id=request.session_id,
         role="assistant",
-        content=reply
+        content=reply,
+        source=request_source,
     )
 
     background_tasks.add_task(
