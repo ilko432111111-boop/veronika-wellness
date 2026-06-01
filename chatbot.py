@@ -444,11 +444,80 @@ Conversation:
         return {}
 
 
+def format_customer_date(value: str | None) -> str:
+    """
+    Keep ISO dates in the database, but speak naturally to customers.
+    """
+    if value in [None, ""]:
+        return "the requested date"
+
+    try:
+        parsed_date = datetime.fromisoformat(str(value)).date()
+        today = datetime.now(BUSINESS_TIMEZONE).date()
+
+        if parsed_date == today:
+            return "today"
+
+        if parsed_date == today + timedelta(days=1):
+            return "tomorrow"
+
+        return (
+            f"{parsed_date.strftime('%A')} "
+            f"{parsed_date.day} "
+            f"{parsed_date.strftime('%B')}"
+        )
+
+    except ValueError:
+        return str(value)
+
+
+def format_customer_time(value: str | None) -> str:
+    if value in [None, ""]:
+        return "the requested time"
+
+    try:
+        parsed_time = datetime.strptime(str(value), "%H:%M")
+        return parsed_time.strftime("%H:%M")
+
+    except ValueError:
+        return str(value)
+
+
+def format_customer_slot(
+    preferred_date: str | None,
+    preferred_time: str | None,
+) -> str:
+    return (
+        f"{format_customer_date(preferred_date)} "
+        f"at {format_customer_time(preferred_time)}"
+    )
+
+
+def is_simple_acknowledgement(message: str) -> bool:
+    cleaned = re.sub(r"[^a-z]+", " ", message.lower()).strip()
+
+    acknowledgements = {
+        "ok",
+        "okay",
+        "thanks",
+        "thank you",
+        "great",
+        "perfect",
+        "fine",
+        "sounds good",
+        "sure",
+        "alright",
+    }
+
+    return cleaned in acknowledgements
+
+
 def build_next_question_hint(missing_fields: list[str]) -> str:
     if not missing_fields:
         return (
-            "No booking details are missing. Keep the reply brief. "
-            "Say that the therapist still needs to confirm the appointment."
+            "No booking details are missing. Do not ask another question. "
+            "If the customer is only acknowledging the previous message, "
+            "reply briefly: Thanks. The therapist will confirm the appointment shortly."
         )
 
     next_field = missing_fields[0]
@@ -476,6 +545,10 @@ def format_confirmed_details(lead_data: dict) -> str:
 
         if value not in [None, ""]:
             label = field.replace("_", " ").title()
+
+            if field == "preferred_date":
+                value = format_customer_date(value)
+
             lines.append(f"- {label}: {value}")
 
     return "\n".join(lines) if lines else "- No confirmed booking details yet."
@@ -1022,7 +1095,10 @@ def find_next_available_slots(
                 busy_periods,
             ):
                 suggestions.append(
-                    candidate.strftime("%Y-%m-%d at %H:%M")
+                    format_customer_slot(
+                        candidate.date().isoformat(),
+                        candidate.strftime("%H:%M"),
+                    )
                 )
 
                 if len(suggestions) >= NEXT_SLOT_LIMIT:
@@ -1108,6 +1184,10 @@ def check_requested_calendar_slot(
         }
 
     start_time, end_time, duration_minutes = slot
+    customer_slot = format_customer_slot(
+        start_time.date().isoformat(),
+        start_time.strftime("%H:%M"),
+    )
 
     if end_time <= datetime.now(BUSINESS_TIMEZONE):
         return {
@@ -1156,7 +1236,7 @@ def check_requested_calendar_slot(
         return {
             "status": "busy",
             "message": (
-                "The requested time is unavailable. "
+                f"{customer_slot} is unavailable. "
                 "Say this once, briefly, and ask whether another preferred "
                 "time would suit the customer."
                 + suggestion_text
@@ -1167,7 +1247,7 @@ def check_requested_calendar_slot(
         return {
             "status": "provisional_free",
             "message": (
-                "The requested start time currently appears free, but the "
+                f"{customer_slot} currently appears free, but the "
                 "duration is still missing. Ask for the duration so the full "
                 "slot can be checked. Do not overexplain."
             ),
@@ -1192,7 +1272,7 @@ def check_requested_calendar_slot(
     return {
         "status": "free",
         "message": (
-            "The requested time currently appears free. "
+            f"{customer_slot} currently appears free. "
             "Say this once briefly and state that the therapist still needs "
             "to confirm the booking."
         ),
@@ -1414,6 +1494,25 @@ async def chat(
     )
 
     next_question_hint = build_next_question_hint(missing_fields)
+    customer_date_label = format_customer_date(
+        merged_lead.get("preferred_date")
+    )
+
+    if is_simple_acknowledgement(request.message) and not missing_fields:
+        reply = "Thanks. The therapist will confirm the appointment shortly."
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply
+        )
+
+        background_tasks.add_task(
+            send_booking_notification,
+            request.session_id
+        )
+
+        return {"reply": reply}
 
     settings = load_chatbot_settings()
     style_instructions = build_style_instructions(settings)
@@ -1442,12 +1541,14 @@ Locked rules:
 - Ask naturally for only the missing details. Ask for no more than two missing details in one reply.
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
 - If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
+- When speaking to the customer, use CUSTOMER-FACING DATE LABEL. Say "today" or "tomorrow" where appropriate. Never show an ISO date such as 2026-06-01 to the customer unless they explicitly ask for the exact date.
 - If a requested slot is busy, say it once briefly and offer the listed alternatives when available.
 - If a requested slot appears free, say it once briefly and clearly state that the therapist still needs to confirm.
 - If the calendar cannot be checked, do not guess. Say the therapist will check and confirm.
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
 - If asked "am I booked?", answer clearly: "Not yet. The therapist still needs to confirm the appointment."
+- If the customer only says "ok", "thanks", or a similar acknowledgement after giving all details, do not repeat that they are not booked. Reply briefly: "Thanks. The therapist will confirm the appointment shortly."
 - Never list every service at once unless the customer asks for a full price list.
 - If asked what services are offered, give the main categories first.
 - Then ask what they are interested in.
@@ -1472,6 +1573,9 @@ MISSING REQUIRED DETAILS:
 
 NEXT QUESTION TARGET:
 {next_question_hint}
+
+CUSTOMER-FACING DATE LABEL:
+{customer_date_label}
 
 CALENDAR AVAILABILITY RESULT:
 {calendar_context}
