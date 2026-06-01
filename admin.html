@@ -214,6 +214,52 @@
             font-size: 0.86rem;
         }
 
+        .hours-list {
+            display: grid;
+            gap: 10px;
+        }
+
+        .hours-row {
+            display: grid;
+            grid-template-columns: 140px 1fr 1fr 110px;
+            gap: 10px;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .hours-row:last-child {
+            border-bottom: 0;
+        }
+
+        .hours-day {
+            font-weight: 700;
+        }
+
+        .hours-field label {
+            display: block;
+            margin: 0 0 5px;
+            font-size: 0.78rem;
+            color: var(--muted);
+        }
+
+        .closed-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 700;
+            margin-top: 20px;
+        }
+
+        .closed-toggle input {
+            width: auto;
+        }
+
+        .hours-time:disabled {
+            background: #eef2f5;
+            color: var(--muted);
+        }
+
         .table-card {
             background: white;
             border-radius: 14px;
@@ -394,6 +440,16 @@
                 grid-template-columns: 1fr;
             }
 
+            .hours-row {
+                grid-template-columns: 1fr;
+                gap: 8px;
+                padding: 12px 0;
+            }
+
+            .closed-toggle {
+                margin-top: 0;
+            }
+
             main { padding: 12px; }
         }
     </style>
@@ -493,6 +549,20 @@
                 </div>
             </div>
 
+            <div class="settings-card">
+                <h2>Working hours</h2>
+                <p>Set the times Receptionist should use when suggesting available appointments.</p>
+
+                <div id="hours-list" class="hours-list"></div>
+
+                <div class="settings-actions">
+                    <button id="save-hours-button" class="primary-button settings-save-button" type="button">
+                        Save working hours
+                    </button>
+                    <span id="hours-message" class="settings-message"></span>
+                </div>
+            </div>
+
             <div class="table-card">
                 <div class="table-toolbar">
                     <h2>Customer leads</h2>
@@ -588,6 +658,9 @@
         const personalityNotesSetting = document.getElementById("personality-notes-setting");
         const saveSettingsButton = document.getElementById("save-settings-button");
         const settingsMessage = document.getElementById("settings-message");
+        const hoursList = document.getElementById("hours-list");
+        const saveHoursButton = document.getElementById("save-hours-button");
+        const hoursMessage = document.getElementById("hours-message");
         const aiStatusFilter = document.getElementById("ai-status-filter");
         const ownerStatusFilter = document.getElementById("owner-status-filter");
         const clearFiltersButton = document.getElementById("clear-filters-button");
@@ -595,7 +668,18 @@
         const closeModalButton = document.getElementById("close-modal-button");
         const transcript = document.getElementById("transcript");
 
+        const WEEKDAY_NAMES = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday"
+        ];
+
         let allLeads = [];
+        let businessHours = [];
 
         function showLogin() {
             loginPage.classList.remove("hidden");
@@ -681,6 +765,116 @@
             setTimeout(() => {
                 settingsMessage.textContent = "";
             }, 1400);
+        }
+
+        function renderBusinessHours() {
+            hoursList.innerHTML = "";
+
+            for (const row of businessHours) {
+                const wrapper = document.createElement("div");
+                wrapper.className = "hours-row";
+                wrapper.dataset.day = row.day_of_week;
+
+                wrapper.innerHTML = `
+                    <div class="hours-day">${WEEKDAY_NAMES[row.day_of_week]}</div>
+
+                    <div class="hours-field">
+                        <label>Open</label>
+                        <input class="hours-time hours-open" type="time" value="${row.open_time || ""}">
+                    </div>
+
+                    <div class="hours-field">
+                        <label>Close</label>
+                        <input class="hours-time hours-close" type="time" value="${row.close_time || ""}">
+                    </div>
+
+                    <label class="closed-toggle">
+                        <input class="hours-closed" type="checkbox" ${row.is_closed ? "checked" : ""}>
+                        Closed
+                    </label>
+                `;
+
+                const openInput = wrapper.querySelector(".hours-open");
+                const closeInput = wrapper.querySelector(".hours-close");
+                const closedInput = wrapper.querySelector(".hours-closed");
+
+                function syncClosedState() {
+                    openInput.disabled = closedInput.checked;
+                    closeInput.disabled = closedInput.checked;
+                }
+
+                closedInput.addEventListener("change", syncClosedState);
+                syncClosedState();
+
+                hoursList.appendChild(wrapper);
+            }
+        }
+
+        async function loadBusinessHours() {
+            hoursMessage.textContent = "Loading hours...";
+
+            const { data, error } = await supabaseClient
+                .from("business_hours")
+                .select("day_of_week, open_time, close_time, is_closed")
+                .eq("business_slug", "veronika")
+                .order("day_of_week", { ascending: true });
+
+            if (error) {
+                hoursMessage.textContent = `Could not load hours: ${error.message}`;
+                return;
+            }
+
+            businessHours = data || [];
+            renderBusinessHours();
+            hoursMessage.textContent = "";
+        }
+
+        async function saveBusinessHours() {
+            hoursMessage.textContent = "Saving...";
+
+            const rows = Array.from(hoursList.querySelectorAll(".hours-row"));
+
+            for (const row of rows) {
+                const dayOfWeek = Number(row.dataset.day);
+                const isClosed = row.querySelector(".hours-closed").checked;
+                const openTime = row.querySelector(".hours-open").value;
+                const closeTime = row.querySelector(".hours-close").value;
+
+                if (!isClosed && (!openTime || !closeTime)) {
+                    hoursMessage.textContent =
+                        `${WEEKDAY_NAMES[dayOfWeek]} needs an opening and closing time.`;
+                    return;
+                }
+
+                if (!isClosed && openTime >= closeTime) {
+                    hoursMessage.textContent =
+                        `${WEEKDAY_NAMES[dayOfWeek]} closing time must be later than opening time.`;
+                    return;
+                }
+
+                const { error } = await supabaseClient
+                    .from("business_hours")
+                    .update({
+                        open_time: isClosed ? null : openTime,
+                        close_time: isClosed ? null : closeTime,
+                        is_closed: isClosed,
+                        updated_at: new Date().toISOString()
+                    })
+                    .eq("business_slug", "veronika")
+                    .eq("day_of_week", dayOfWeek);
+
+                if (error) {
+                    hoursMessage.textContent = `Could not save: ${error.message}`;
+                    return;
+                }
+            }
+
+            hoursMessage.textContent = "Saved";
+            setTimeout(() => {
+                hoursMessage.textContent = "";
+            }, 1400);
+
+            await loadBusinessHours();
         }
 
         async function updateOwnerStatus(sessionId, newStatus, noteElement) {
@@ -859,16 +1053,21 @@
             showDashboard();
             await Promise.all([
                 loadLeads(),
-                loadChatbotSettings()
+                loadChatbotSettings(),
+                loadBusinessHours()
             ]);
         });
 
         refreshButton.addEventListener("click", async () => {
-            await loadLeads();
-            await loadChatbotSettings();
+            await Promise.all([
+                loadLeads(),
+                loadChatbotSettings(),
+                loadBusinessHours()
+            ]);
         });
 
         saveSettingsButton.addEventListener("click", saveChatbotSettings);
+        saveHoursButton.addEventListener("click", saveBusinessHours);
 
         aiStatusFilter.addEventListener("change", applyFilters);
         ownerStatusFilter.addEventListener("change", applyFilters);
@@ -902,7 +1101,8 @@
             showDashboard();
             await Promise.all([
                 loadLeads(),
-                loadChatbotSettings()
+                loadChatbotSettings(),
+                loadBusinessHours()
             ]);
         } else {
             showLogin();
