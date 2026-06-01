@@ -444,6 +444,30 @@ Conversation:
         return {}
 
 
+def build_next_question_hint(missing_fields: list[str]) -> str:
+    if not missing_fields:
+        return (
+            "No booking details are missing. Keep the reply brief. "
+            "Say that the therapist still needs to confirm the appointment."
+        )
+
+    next_field = missing_fields[0]
+
+    questions = {
+        "treatment": "Ask only which treatment they would like.",
+        "duration": "Ask only how long they would like the session for.",
+        "name": "Ask only for their name.",
+        "phone": "Ask only for their phone number.",
+        "preferred_date": "Ask only which date they would prefer.",
+        "preferred_time": "Ask only which time they would prefer.",
+    }
+
+    return questions.get(
+        next_field,
+        "Ask only for the next missing booking detail."
+    )
+
+
 def format_confirmed_details(lead_data: dict) -> str:
     lines = []
 
@@ -1389,6 +1413,8 @@ async def chat(
         else "None"
     )
 
+    next_question_hint = build_next_question_hint(missing_fields)
+
     settings = load_chatbot_settings()
     style_instructions = build_style_instructions(settings)
 
@@ -1401,11 +1427,15 @@ Never present yourself as Veronika. If you need to refer to the person providing
 {style_instructions}
 
 Locked rules:
-- Keep replies concise and natural. Usually use no more than two short sentences.
-- Answer the customer's question first, then ask only for the next missing detail or two.
+- Keep replies extremely concise and natural. Usually use one short sentence. Use two only when necessary.
+- Answer the customer's question first, then ask only for the single next missing detail.
+- Follow NEXT QUESTION TARGET closely.
+- Do not repeat a treatment name immediately after the customer has just chosen it unless clarification is genuinely needed.
+- Do not repeat prices, dates, times, durations, or availability unless the customer asks or the information has changed.
+- Do not list duration options unless duration is the next missing detail.
+- If duration is the next missing detail, prefer a reply like: "How long would you like the session for: 30, 60, 90, or 120 minutes?"
 - Do not repeat hello twice.
-- Do not repeatedly recap the treatment, date, time, or availability unless the customer asks.
-- Avoid repetitive phrases such as "I've noted that down", "just to confirm", and "the requested time currently looks available" in consecutive replies.
+- Avoid filler such as "I've noted that down", "just to confirm", "we offer", "to proceed", and "the requested time currently looks available" unless genuinely needed.
 - Use the conversation history to understand short replies.
 - Do not ask the customer to repeat information they already gave.
 - Never ask again for any detail listed under CONFIRMED CUSTOMER DETAILS.
@@ -1439,6 +1469,9 @@ CONFIRMED CUSTOMER DETAILS:
 
 MISSING REQUIRED DETAILS:
 {missing_details}
+
+NEXT QUESTION TARGET:
+{next_question_hint}
 
 CALENDAR AVAILABILITY RESULT:
 {calendar_context}
