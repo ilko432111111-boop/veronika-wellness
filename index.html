@@ -552,10 +552,10 @@
                 <div>
                     <h2>Visit Veronika in Leeds</h2>
                     <div class="contact-info">
-                        <p><strong>📍</strong> 182 Harrogate Road, Leeds, LS7 4NZ</p>
+                        <p><strong>📍</strong> 25 Albion Place, Leeds, LS1 6JS</p>
                         <p><strong>🕐</strong> Mon–Fri: 9am – 8pm<br>Saturday: 10am – 6pm</p>
                         <p><strong>🚗</strong> Free parking available</p>
-                        <p><strong>📞</strong> 07386 396139</p>
+                        <p><strong>📞</strong> 07943319617</p>
                     </div>
                     
                     <a href="#" class="btn" style="margin-top: 25px; background: white; color: #2C3E50;">Book Your Appointment</a>
@@ -575,27 +575,25 @@
         <div class="container">
             <p>© 2026 Veronika Wellness & Aesthetics • Leeds</p>
             <p style="margin-top: 8px; font-size: 0.85rem;">Professional treatments • Real results • Genuine care</p>
-            <p style="margin-top: 8px; font-size: 0.8rem;">Website and AI receptionist built by Ilko</p>
-            <p style="margin-top: 8px; font-size: 0.8rem;"><a href="/privacy-policy.html" style="color: #cfd8dc;">Privacy Policy</a></p>
         </div>
     </footer>
 
     <!-- Chat Widget -->
     <div id="chat-widget">
         <div id="chat-button" onclick="toggleChat()">
-            💬 Chat with Receptionist
+            💬 Chat with Veronika
         </div>
         
         <div id="chat-window" style="display: none;">
             <div id="chat-header">
-                <span>Receptionist</span>
+                <span>Veronika's Assistant</span>
                 <span onclick="toggleChat()" style="cursor: pointer;">✕</span>
             </div>
             
             <div id="chat-messages"></div>
 
 <div style="padding: 10px 14px; font-size: 12px; color: #666; background: #fff; border-top: 1px solid #eee;">
-    By using this chat, you agree that your messages and contact details may be stored so the receptionist can respond to your enquiry.
+    By using this chat, you agree that your messages and contact details may be stored so Veronika can respond to your enquiry.
 </div>
             
             <div id="chat-input-area">
@@ -645,7 +643,7 @@ if (!sessionId) {
 // Show typing message while waiting for the AI reply
 const typingMsg = document.createElement("div");
 typingMsg.className = "message bot-message";
-typingMsg.textContent = "Receptionist is typing...";
+typingMsg.textContent = "Veronika's assistant is typing...";
 messages.appendChild(typingMsg);
 messages.scrollTop = messages.scrollHeight;
 
@@ -658,20 +656,11 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 body: JSON.stringify({
     session_id: sessionId,
     message: userInput,
-    history: chatHistory,
-    source: "website"
+    history: chatHistory
 })
             })
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error("Backend request failed");
-                }
-
-                return response.json();
-            })
+            .then(response => response.json())
             .then(data => {
-                typingMsg.remove();
-
                 const botMsg = document.createElement('div');
                 botMsg.className = 'message bot-message';
                 botMsg.textContent = data.reply;
@@ -683,17 +672,15 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
                     content: data.reply
                 });
 
-                // Keep only the latest 20 messages so it does not get too long
-                chatHistory = chatHistory.slice(-20);
+                // Keep only the latest 12 messages so it does not get too long
+                chatHistory = chatHistory.slice(-12);
 
                 messages.scrollTop = messages.scrollHeight;
             })
             .catch(() => {
-                typingMsg.remove();
-
                 const errorMsg = document.createElement('div');
                 errorMsg.className = 'message bot-message';
-                errorMsg.textContent = "Sorry, I'm having trouble connecting right now. Please call 07386 396139.";
+                errorMsg.textContent = "Sorry, I'm having trouble connecting right now. Please call 07943319617.";
                 messages.appendChild(errorMsg);
                 messages.scrollTop = messages.scrollHeight;
             });

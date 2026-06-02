@@ -47,6 +47,8 @@ RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 DASHBOARD_URL = "https://veronika-wellness.onrender.com/admin.html"
 BUSINESS_TIMEZONE = ZoneInfo("Europe/London")
 BUSINESS_SLUG = "veronika"
+BUSINESS_PHONE = "07943319617"
+BUSINESS_ADDRESS = "25 Albion Place, Leeds, LS1 6JS"
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -307,7 +309,7 @@ def parse_phone_from_text(message: str) -> str | None:
     for candidate in digit_groups:
         digits = re.sub(r"\D", "", candidate)
 
-        if 7 <= len(digits) <= 15:
+        if 10 <= len(digits) <= 15:
             return candidate.strip()
 
     return None
@@ -389,6 +391,221 @@ def apply_latest_message_fallbacks(
         result["notification_sent_at"] = None
 
     return result
+
+
+SUPPORTED_MASSAGE_DURATIONS = {
+    "relaxing massage": {30, 60, 90, 120},
+    "swedish massage": {30, 60, 90, 120},
+    "deep tissue massage": {30, 60, 90, 120},
+    "hot stone massage": {60, 90, 120},
+}
+
+
+def normalise_treatment_name(value: str | None) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def allowed_durations_for_treatment(
+    treatment: str | None,
+) -> set[int] | None:
+    cleaned = normalise_treatment_name(treatment)
+
+    for treatment_name, durations in SUPPORTED_MASSAGE_DURATIONS.items():
+        if treatment_name in cleaned or cleaned in treatment_name:
+            return durations
+
+    return None
+
+
+def format_duration_options(durations: set[int]) -> str:
+    ordered = sorted(durations)
+
+    if len(ordered) == 1:
+        return f"{ordered[0]} minutes"
+
+    return ", ".join(str(value) for value in ordered[:-1]) + f", or {ordered[-1]} minutes"
+
+
+def is_valid_customer_name(value: str | None) -> bool:
+    if value in [None, ""]:
+        return False
+
+    cleaned = str(value).strip()
+    lower_value = cleaned.lower()
+
+    rejected_phrases = {
+        "i don't know",
+        "i dont know",
+        "dont know",
+        "don't know",
+        "unknown",
+        "not sure",
+        "no name",
+        "none",
+        "n/a",
+        "na",
+        "test",
+    }
+
+    if lower_value in rejected_phrases:
+        return False
+
+    if any(char.isdigit() for char in cleaned):
+        return False
+
+    words = cleaned.split()
+
+    return (
+        1 <= len(words) <= 5
+        and all(
+            re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'-]+", word)
+            for word in words
+        )
+    )
+
+
+def is_valid_phone_number(value: str | None) -> bool:
+    if value in [None, ""]:
+        return False
+
+    digits = re.sub(r"\D", "", str(value))
+
+    return 10 <= len(digits) <= 15
+
+
+def validate_latest_customer_details(
+    lead_data: dict,
+    latest_message: str,
+    previous_assistant_message: str,
+) -> tuple[dict, str | None]:
+    """
+    Reject obviously invalid booking details before they complete a lead.
+    """
+    result = dict(lead_data)
+    lower_previous = previous_assistant_message.lower()
+    latest_duration = parse_duration_minutes(latest_message)
+    allowed_durations = allowed_durations_for_treatment(
+        result.get("treatment")
+    )
+
+    if latest_duration is not None and "long" in lower_previous:
+        if allowed_durations and latest_duration not in allowed_durations:
+            result["duration"] = None
+            result["status"] = "details_incomplete"
+            result["notification_sent_at"] = None
+
+            return (
+                result,
+                "invalid_duration:"
+                + format_duration_options(allowed_durations),
+            )
+
+    if "name" in lower_previous:
+        if not is_valid_customer_name(result.get("name")):
+            result["name"] = None
+            result["status"] = "details_incomplete"
+            result["notification_sent_at"] = None
+            return result, "invalid_name"
+
+    if "phone" in lower_previous or "number" in lower_previous:
+        if not is_valid_phone_number(result.get("phone")):
+            result["phone"] = None
+            result["status"] = "details_incomplete"
+            result["notification_sent_at"] = None
+            return result, "invalid_phone"
+
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result, None
+
+
+def working_hours_for_date(
+    requested_date,
+) -> tuple[datetime, datetime] | None:
+    hours = load_business_hours().get(requested_date.weekday())
+
+    if not hours:
+        return None
+
+    open_value, close_value = hours
+
+    if isinstance(open_value, tuple):
+        open_hour, open_minute = open_value
+    else:
+        open_hour, open_minute = open_value, 0
+
+    if isinstance(close_value, tuple):
+        close_hour, close_minute = close_value
+    else:
+        close_hour, close_minute = close_value, 0
+
+    open_time = datetime.combine(
+        requested_date,
+        datetime.min.time(),
+        tzinfo=BUSINESS_TIMEZONE,
+    ).replace(
+        hour=open_hour,
+        minute=open_minute,
+    )
+
+    close_time = datetime.combine(
+        requested_date,
+        datetime.min.time(),
+        tzinfo=BUSINESS_TIMEZONE,
+    ).replace(
+        hour=close_hour,
+        minute=close_minute,
+    )
+
+    return open_time, close_time
+
+
+def validate_slot_against_working_hours(
+    start_time: datetime,
+    end_time: datetime,
+    duration_minutes: int | None,
+) -> dict | None:
+    opening_window = working_hours_for_date(start_time.date())
+
+    if not opening_window:
+        return {
+            "status": "outside_hours",
+            "message": (
+                f"{format_customer_date(start_time.date().isoformat())} is outside working hours. "
+                "Ask the customer for another preferred time."
+            ),
+        }
+
+    open_time, close_time = opening_window
+
+    if start_time < open_time or start_time >= close_time:
+        return {
+            "status": "outside_hours",
+            "message": (
+                f"{format_customer_slot(start_time.date().isoformat(), start_time.strftime('%H:%M'))} "
+                f"is outside working hours. Opening hours that day are "
+                f"{open_time.strftime('%H:%M')}–{close_time.strftime('%H:%M')}. "
+                "Ask the customer for another preferred time."
+            ),
+        }
+
+    if duration_minutes and end_time > close_time:
+        return {
+            "status": "outside_hours",
+            "message": (
+                f"That session would finish after closing time. Opening hours that day are "
+                f"{open_time.strftime('%H:%M')}–{close_time.strftime('%H:%M')}. "
+                "Ask the customer for another preferred time."
+            ),
+        }
+
+    return None
 
 
 def save_conversation_overview(
@@ -1301,6 +1518,15 @@ def check_requested_calendar_slot(
             ),
         }
 
+    working_hours_error = validate_slot_against_working_hours(
+        start_time,
+        end_time,
+        duration_minutes,
+    )
+
+    if working_hours_error:
+        return working_hours_error
+
     busy_periods = query_google_freebusy(start_time, end_time)
 
     if busy_periods is None:
@@ -1815,11 +2041,35 @@ async def chat(
         previous_assistant_message,
     )
 
+    merged_lead, validation_issue = validate_latest_customer_details(
+        merged_lead,
+        request.message,
+        previous_assistant_message,
+    )
+
     save_conversation_overview(
         session_id=request.session_id,
         lead_data=merged_lead,
         source=request_source,
     )
+
+    if validation_issue:
+        if validation_issue.startswith("invalid_duration:"):
+            options = validation_issue.split(":", 1)[1]
+            reply = f"Please choose one of the available durations: {options}."
+        elif validation_issue == "invalid_name":
+            reply = "Please enter your name."
+        else:
+            reply = "Please enter a valid phone number, including the area code."
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
 
     calendar_result = check_requested_calendar_slot(
         merged_lead,
@@ -1836,6 +2086,21 @@ async def chat(
         calendar_result,
         calendar_should_be_visible,
     )
+
+    if calendar_result.get("status") in {
+        "outside_hours",
+        "past",
+        "busy",
+    }:
+        merged_lead["preferred_time"] = None
+        merged_lead["status"] = "details_incomplete"
+        merged_lead["notification_sent_at"] = None
+
+        save_conversation_overview(
+            session_id=request.session_id,
+            lead_data=merged_lead,
+            source=request_source,
+        )
 
     missing_fields = [
         field
@@ -1900,8 +2165,10 @@ Locked rules:
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
 - If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
 - When speaking to the customer, use CUSTOMER-FACING DATE LABEL. Say "today" or "tomorrow" where appropriate. Never show an ISO date such as 2026-06-01 to the customer unless they explicitly ask for the exact date.
-- If a requested slot is busy, say it once briefly and offer the listed alternatives when available.
+- If a requested slot is busy, outside working hours, or in the past, say it once briefly and ask for another preferred time. Never treat that time as accepted.
 - If a requested slot appears free, say it once briefly and clearly state that the therapist still needs to confirm.
+- Never accept an unsupported session duration. Massage durations must match the allowed options.
+- Never suggest or invent a specific date or time unless it comes from the customer's message or from calendar alternatives.
 - If the calendar cannot be checked, do not guess. Say the therapist will check and confirm.
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
@@ -1921,7 +2188,9 @@ Locked rules:
 - Never take payment.
 - Never confirm that an appointment is booked.
 - Put the handover confirmation on a new line so the message is easy to read.
-- If unsure, suggest calling 07386 396139.
+- If unsure, suggest calling 07943319617.
+- Authoritative contact details: phone 07943319617; address 25 Albion Place, Leeds, LS1 6JS.
+- If the business information below contains a conflicting phone number or address, ignore the older conflicting value and use the authoritative contact details above.
 
 CONFIRMED CUSTOMER DETAILS:
 {confirmed_details}
