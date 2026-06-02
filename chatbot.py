@@ -1,5 +1,5 @@
-from fastapi import FastAPI, BackgroundTasks
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from groq import Groq
 from supabase import create_client, Client
@@ -11,6 +11,7 @@ from html import escape
 from urllib import request as urllib_request
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -53,6 +54,12 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+
+INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
+INSTAGRAM_ACCOUNT_ID = os.getenv("INSTAGRAM_ACCOUNT_ID")
+INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET")
+INSTAGRAM_VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN")
+INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v25.0")
 
 SLOT_STEP_MINUTES = 30
 NEXT_SLOT_LIMIT = 3
@@ -1391,6 +1398,256 @@ def format_calendar_result(
         f"Status: {calendar_result.get('status', 'unknown')}\n"
         f"Instruction: {calendar_result.get('message', 'No calendar result available.')}"
     )
+
+
+def instagram_is_configured() -> bool:
+    return all([
+        INSTAGRAM_ACCESS_TOKEN,
+        INSTAGRAM_ACCOUNT_ID,
+        INSTAGRAM_APP_SECRET,
+        INSTAGRAM_VERIFY_TOKEN,
+    ])
+
+
+def verify_instagram_signature(
+    raw_body: bytes,
+    signature_header: str | None,
+) -> bool:
+    """Verify Meta's signed webhook payload before processing it."""
+    if not INSTAGRAM_APP_SECRET or not signature_header:
+        return False
+
+    if not signature_header.startswith("sha256="):
+        return False
+
+    received_signature = signature_header.split("=", 1)[1]
+
+    expected_signature = hmac.new(
+        INSTAGRAM_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(received_signature, expected_signature)
+
+
+def load_recent_messages(
+    session_id: str,
+    limit: int = 20,
+) -> list[ChatMessage]:
+    try:
+        response = (
+            supabase.table("messages")
+            .select("role, content, created_at")
+            .eq("session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+
+        rows = list(reversed(response.data or []))
+
+        return [
+            ChatMessage(
+                role=row.get("role", "user"),
+                content=row.get("content", ""),
+            )
+            for row in rows
+            if row.get("content")
+        ]
+
+    except Exception as error:
+        print(f"Could not load recent messages: {error}")
+        return []
+
+
+def send_instagram_text_message(
+    recipient_id: str,
+    text: str,
+) -> bool:
+    if not INSTAGRAM_ACCESS_TOKEN:
+        print("Instagram reply skipped: missing access token.")
+        return False
+
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": text[:1000]},
+    }
+
+    endpoint = (
+        f"https://graph.instagram.com/"
+        f"{INSTAGRAM_GRAPH_VERSION}/me/messages?"
+        + urllib_parse.urlencode({
+            "access_token": INSTAGRAM_ACCESS_TOKEN,
+        })
+    )
+
+    api_request = urllib_request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "receptionist-chatbot/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(api_request, timeout=15) as response:
+            response.read()
+
+        print(f"Instagram reply sent to {recipient_id}")
+        return True
+
+    except urllib_error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        print(f"Instagram reply failed: HTTP {error.code} {body}")
+
+    except Exception as error:
+        print(f"Instagram reply failed: {error}")
+
+    return False
+
+
+_processed_instagram_message_ids: set[str] = set()
+
+
+def mark_instagram_message_seen(message_id: str) -> bool:
+    """Small duplicate guard for Meta webhook retries during MVP testing."""
+    if not message_id:
+        return True
+
+    if message_id in _processed_instagram_message_ids:
+        return False
+
+    _processed_instagram_message_ids.add(message_id)
+
+    if len(_processed_instagram_message_ids) > 2000:
+        _processed_instagram_message_ids.clear()
+        _processed_instagram_message_ids.add(message_id)
+
+    return True
+
+
+def process_instagram_webhook_payload(payload: dict):
+    """Process incoming Instagram text DMs after Meta already received HTTP 200."""
+    if payload.get("object") != "instagram":
+        return
+
+    for entry in payload.get("entry", []):
+        for event in entry.get("messaging", []):
+            sender_id = str(event.get("sender", {}).get("id", ""))
+            recipient_id = str(event.get("recipient", {}).get("id", ""))
+            message_data = event.get("message") or {}
+            message_id = str(message_data.get("mid", ""))
+            message_text = message_data.get("text")
+
+            if not sender_id or not message_text:
+                continue
+
+            if sender_id == str(INSTAGRAM_ACCOUNT_ID):
+                continue
+
+            if recipient_id and recipient_id != str(INSTAGRAM_ACCOUNT_ID):
+                continue
+
+            if message_data.get("is_echo"):
+                continue
+
+            if not mark_instagram_message_seen(message_id):
+                continue
+
+            session_id = f"instagram:{sender_id}"
+            history = load_recent_messages(session_id)
+
+            request = ChatRequest(
+                session_id=session_id,
+                message=message_text,
+                history=history,
+                source="instagram",
+            )
+
+            try:
+                response = asyncio.run(
+                    chat(request, BackgroundTasks())
+                )
+
+                reply = response.get("reply")
+
+                if reply:
+                    send_instagram_text_message(
+                        recipient_id=sender_id,
+                        text=reply,
+                    )
+
+                # The BackgroundTasks object above is not executed by FastAPI,
+                # because this call is internal. Trigger the alert directly.
+                send_booking_notification(session_id)
+
+            except Exception as error:
+                print(f"Could not process Instagram message: {error}")
+
+
+@app.get("/instagram/status")
+async def instagram_status():
+    return {
+        "configured": instagram_is_configured(),
+        "account_id_present": bool(INSTAGRAM_ACCOUNT_ID),
+        "access_token_present": bool(INSTAGRAM_ACCESS_TOKEN),
+        "app_secret_present": bool(INSTAGRAM_APP_SECRET),
+        "verify_token_present": bool(INSTAGRAM_VERIFY_TOKEN),
+    }
+
+
+@app.get("/instagram/webhook")
+async def verify_instagram_webhook(request: Request):
+    mode = request.query_params.get("hub.mode")
+    verify_token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if (
+        mode == "subscribe"
+        and verify_token
+        and verify_token == INSTAGRAM_VERIFY_TOKEN
+        and challenge
+    ):
+        return PlainTextResponse(challenge)
+
+    return PlainTextResponse(
+        "Instagram webhook verification failed.",
+        status_code=403,
+    )
+
+
+@app.post("/instagram/webhook")
+async def receive_instagram_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+
+    if not verify_instagram_signature(raw_body, signature):
+        return PlainTextResponse(
+            "Invalid Instagram webhook signature.",
+            status_code=403,
+        )
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+
+    except json.JSONDecodeError:
+        return PlainTextResponse(
+            "Invalid JSON payload.",
+            status_code=400,
+        )
+
+    background_tasks.add_task(
+        process_instagram_webhook_payload,
+        payload,
+    )
+
+    return {"status": "received"}
 
 
 @app.get("/")
