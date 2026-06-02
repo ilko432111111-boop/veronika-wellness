@@ -258,6 +258,11 @@ def parse_relative_date_from_text(message: str) -> str | None:
     }
 
     for weekday_name, weekday_number in weekdays.items():
+        if re.search(rf"\bnext\s+week\s+{weekday_name}\b", lower_message):
+            start_of_next_week = today + timedelta(days=(7 - today.weekday()))
+            return (start_of_next_week + timedelta(days=weekday_number)).isoformat()
+
+    for weekday_name, weekday_number in weekdays.items():
         if re.search(rf"\b{weekday_name}\b", lower_message):
             return next_weekday_date(weekday_number).isoformat()
 
@@ -608,6 +613,153 @@ def validate_slot_against_working_hours(
     return None
 
 
+def preserve_existing_booking_details(
+    existing: dict,
+    merged: dict,
+    latest_message: str,
+    previous_assistant_message: str,
+) -> dict:
+    """
+    Keep previously confirmed lead values stable unless the latest customer
+    message explicitly changes them. This prevents casual follow-up messages
+    such as "Fantastic" from accidentally changing the requested date or time.
+    """
+    result = dict(merged)
+    lower_latest = latest_message.lower()
+    lower_previous = previous_assistant_message.lower()
+
+    explicit_date = parse_relative_date_from_text(latest_message)
+    explicit_time = parse_time_from_text(latest_message)
+    explicit_phone = parse_phone_from_text(latest_message)
+    explicit_duration = parse_duration_minutes(latest_message)
+
+    if existing.get("preferred_date") not in [None, ""] and not explicit_date:
+        result["preferred_date"] = existing.get("preferred_date")
+
+    if existing.get("preferred_time") not in [None, ""] and not explicit_time:
+        result["preferred_time"] = existing.get("preferred_time")
+
+    duration_is_explicit_reply = (
+        explicit_duration is not None
+        and (
+            "long" in lower_previous
+            or "duration" in lower_previous
+            or re.search(r"\\b(?:minute|minutes|min|mins|hour|hours|hr|hrs)\\b", lower_latest)
+        )
+    )
+
+    if existing.get("duration") not in [None, ""] and not duration_is_explicit_reply:
+        result["duration"] = existing.get("duration")
+
+    if existing.get("phone") not in [None, ""] and not explicit_phone:
+        result["phone"] = existing.get("phone")
+
+    if existing.get("name") not in [None, ""]:
+        name_is_explicit_reply = (
+            "name" in lower_previous
+            and looks_like_customer_name(latest_message)
+        )
+
+        if not name_is_explicit_reply:
+            result["name"] = existing.get("name")
+
+    existing_treatment = existing.get("treatment")
+
+    if existing_treatment not in [None, ""]:
+        treatment_keywords = [
+            "massage",
+            "facial",
+            "b12",
+            "vitamin",
+            "filler",
+            "microneedling",
+            "hydrafacial",
+            "sculpting",
+            "ultrasound",
+            "ems",
+            "injection",
+        ]
+
+        if not any(keyword in lower_latest for keyword in treatment_keywords):
+            result["treatment"] = existing_treatment
+
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
+
+
+def sanitise_booking_claims(reply: str) -> str:
+    """Stop the AI from accidentally claiming that a request is confirmed."""
+    cleaned = reply
+
+    replacements = [
+        (r"(?i)\\bi have you booked in for\\b", "I've noted your request for"),
+        (r"(?i)\\bi have you booked for\\b", "I've noted your request for"),
+        (r"(?i)\\byou(?:'re| are) booked in for\\b", "I've noted your request for"),
+        (r"(?i)\\byou(?:'re| are) booked for\\b", "I've noted your request for"),
+        (r"(?i)\\byour booking is confirmed\\b", "Your request has been noted. The therapist still needs to confirm the appointment"),
+        (r"(?i)\\byour appointment is confirmed\\b", "Your request has been noted. The therapist still needs to confirm the appointment"),
+    ]
+
+    for pattern, replacement in replacements:
+        cleaned = re.sub(pattern, replacement, cleaned)
+
+    return cleaned
+
+
+def canonical_missing_question(field: str) -> str:
+    questions = {
+        "treatment": "Which treatment would you like?",
+        "duration": "How long would you like the session for?",
+        "name": "What's your name?",
+        "phone": "What's your phone number?",
+        "preferred_date": "Which day would you prefer?",
+        "preferred_time": "What time would you prefer?",
+    }
+
+    return questions.get(field, "Could you provide the next booking detail?")
+
+
+def reply_already_asks_for_field(reply: str, field: str) -> bool:
+    lower_reply = reply.lower()
+
+    markers = {
+        "treatment": ["which treatment", "what treatment", "which service"],
+        "duration": ["how long", "duration", "how many minutes"],
+        "name": ["your name", "what's your name", "what is your name"],
+        "phone": ["phone number", "contact number", "mobile number"],
+        "preferred_date": ["which day", "what day", "which date", "what date"],
+        "preferred_time": ["what time", "which time", "preferred time"],
+    }
+
+    return any(marker in lower_reply for marker in markers.get(field, []))
+
+
+def ensure_next_booking_question(
+    reply: str,
+    missing_fields: list[str],
+) -> str:
+    """
+    When a customer asks a side question while booking, answer it and still
+    continue the lead flow. Example: "10:30, is there parking?"
+    """
+    if not missing_fields:
+        return reply
+
+    next_field = missing_fields[0]
+
+    if reply_already_asks_for_field(reply, next_field):
+        return reply
+
+    return reply.rstrip() + "\\n\\n" + canonical_missing_question(next_field)
+
+
 def save_conversation_overview(
     session_id: str,
     lead_data: dict,
@@ -746,10 +898,15 @@ def is_simple_acknowledgement(message: str) -> bool:
         "thank you",
         "great",
         "perfect",
+        "fantastic",
+        "brilliant",
+        "lovely",
         "fine",
         "sounds good",
         "sure",
         "alright",
+        "yes",
+        "yes please",
     }
 
     return cleaned in acknowledgements
@@ -2001,6 +2158,25 @@ async def chat(
         source=request_source,
     )
 
+    existing_before_processing = get_existing_conversation(
+        request.session_id
+    )
+
+    if (
+        existing_before_processing.get("status") == "booking_request_complete"
+        and is_simple_acknowledgement(request.message)
+    ):
+        reply = "Thanks. The therapist will confirm the appointment shortly."
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
+
     response = supabase.table("documents").select("content").execute()
 
     context = "\n".join([
@@ -2029,13 +2205,20 @@ async def chat(
     previous_assistant_message = next(
         (
             msg.content
-            for msg in reversed(request.history[:-1])
+            for msg in reversed(request.history)
             if msg.role == "assistant"
         ),
         "",
     )
 
     merged_lead = apply_latest_message_fallbacks(
+        merged_lead,
+        request.message,
+        previous_assistant_message,
+    )
+
+    merged_lead = preserve_existing_booking_details(
+        existing_lead,
         merged_lead,
         request.message,
         previous_assistant_message,
@@ -2173,7 +2356,8 @@ Locked rules:
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
 - If asked "am I booked?", answer clearly: "Not yet. The therapist still needs to confirm the appointment."
-- If the customer only says "ok", "thanks", or a similar acknowledgement after giving all details, do not repeat that they are not booked. Reply briefly: "Thanks. The therapist will confirm the appointment shortly."
+- If the customer only says "ok", "thanks", "fantastic", or a similar acknowledgement after giving all details, do not reinterpret it as booking information and do not alter the date or time. Reply briefly: "Thanks. The therapist will confirm the appointment shortly."
+- When the customer asks a side question while also providing a booking detail, answer the side question briefly and then ask for the next missing booking detail.
 - Never list every service at once unless the customer asks for a full price list.
 - If asked what services are offered, give the main categories first.
 - Then ask what they are interested in.
@@ -2225,6 +2409,11 @@ Reply as Receptionist:
     )
 
     reply = completion.choices[0].message.content
+    reply = sanitise_booking_claims(reply)
+    reply = ensure_next_booking_question(
+        reply,
+        missing_fields,
+    )
 
     save_message(
         session_id=request.session_id,

@@ -309,11 +309,47 @@
             padding: 9px 12px;
         }
 
+        .danger-button {
+            border: 0;
+            border-radius: 10px;
+            padding: 8px 10px;
+            background: var(--danger);
+            color: white;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .row-actions {
+            display: flex;
+            gap: 7px;
+            flex-wrap: wrap;
+        }
+
+        .pagination-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 14px;
+            border-top: 1px solid var(--border);
+            background: #f8fafb;
+        }
+
+        .pagination-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .search-input {
+            padding: 8px 10px;
+        }
+
         .table-wrapper { overflow-x: auto; }
 
         table {
             width: 100%;
-            min-width: 1400px;
+            min-width: 1480px;
             border-collapse: collapse;
         }
 
@@ -592,6 +628,30 @@
                         </select>
                     </div>
 
+                    <div class="filter-group">
+                        <label for="source-filter">Source</label>
+                        <select id="source-filter">
+                            <option value="all">All sources</option>
+                            <option value="website">Website</option>
+                            <option value="instagram">Instagram</option>
+                            <option value="whatsapp">WhatsApp</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-group">
+                        <label for="lead-search">Search</label>
+                        <input id="lead-search" class="search-input" type="search" placeholder="Name, phone or treatment">
+                    </div>
+
+                    <div class="filter-group">
+                        <label for="page-size-select">Rows per page</label>
+                        <select id="page-size-select">
+                            <option value="10">10</option>
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                        </select>
+                    </div>
+
                     <button id="clear-filters-button" class="secondary-button clear-filter-button" type="button">
                         Clear filters
                     </button>
@@ -612,11 +672,19 @@
                                 <th>Preferred date</th>
                                 <th>Preferred time</th>
                                 <th>Summary</th>
-                                <th>Transcript</th>
+                                <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="lead-table-body"></tbody>
                     </table>
+                </div>
+
+                <div class="pagination-bar">
+                    <span id="page-message" class="muted"></span>
+                    <div class="pagination-actions">
+                        <button id="previous-page-button" class="secondary-button" type="button">Previous</button>
+                        <button id="next-page-button" class="secondary-button" type="button">Next</button>
+                    </div>
                 </div>
             </div>
         </main>
@@ -664,7 +732,13 @@
         const hoursMessage = document.getElementById("hours-message");
         const aiStatusFilter = document.getElementById("ai-status-filter");
         const ownerStatusFilter = document.getElementById("owner-status-filter");
+        const sourceFilter = document.getElementById("source-filter");
+        const leadSearch = document.getElementById("lead-search");
+        const pageSizeSelect = document.getElementById("page-size-select");
         const clearFiltersButton = document.getElementById("clear-filters-button");
+        const previousPageButton = document.getElementById("previous-page-button");
+        const nextPageButton = document.getElementById("next-page-button");
+        const pageMessage = document.getElementById("page-message");
         const modalBackdrop = document.getElementById("modal-backdrop");
         const closeModalButton = document.getElementById("close-modal-button");
         const transcript = document.getElementById("transcript");
@@ -680,7 +754,9 @@
         ];
 
         let allLeads = [];
+        let filteredLeads = [];
         let businessHours = [];
+        let currentPage = 1;
 
         function showLogin() {
             loginPage.classList.remove("hidden");
@@ -897,18 +973,65 @@
             }, 1200);
         }
 
+        async function deleteLead(sessionId) {
+            const confirmed = window.confirm(
+                "Delete this lead and its full transcript? This cannot be undone."
+            );
+
+            if (!confirmed) return;
+
+            tableMessage.textContent = "Deleting lead...";
+
+            const { error: messageError } = await supabaseClient
+                .from("messages")
+                .delete()
+                .eq("session_id", sessionId);
+
+            if (messageError) {
+                tableMessage.textContent = `Could not delete transcript: ${messageError.message}`;
+                return;
+            }
+
+            const { error: leadError } = await supabaseClient
+                .from("conversations")
+                .delete()
+                .eq("session_id", sessionId);
+
+            if (leadError) {
+                tableMessage.textContent = `Could not delete lead: ${leadError.message}`;
+                return;
+            }
+
+            allLeads = allLeads.filter((lead) => lead.session_id !== sessionId);
+            applyFilters();
+        }
+
         function renderLeads(leads) {
             tableBody.innerHTML = "";
             updateCounters(allLeads);
+
+            const pageSize = Number(pageSizeSelect.value || 10);
+            const totalPages = Math.max(1, Math.ceil(leads.length / pageSize));
+
+            if (currentPage > totalPages) currentPage = totalPages;
+            if (currentPage < 1) currentPage = 1;
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const pageLeads = leads.slice(startIndex, startIndex + pageSize);
+
+            previousPageButton.disabled = currentPage <= 1;
+            nextPageButton.disabled = currentPage >= totalPages;
+            pageMessage.textContent = `Page ${currentPage} of ${totalPages}`;
 
             if (!leads.length) {
                 tableMessage.textContent = "No leads match the selected filters.";
                 return;
             }
 
-            tableMessage.textContent = `Showing ${leads.length} of ${allLeads.length} lead(s)`;
+            tableMessage.textContent =
+                `Showing ${startIndex + 1}–${startIndex + pageLeads.length} of ${leads.length} matching lead(s) • ${allLeads.length} total`;
 
-            for (const lead of leads) {
+            for (const lead of pageLeads) {
                 const row = document.createElement("tr");
 
                 row.innerHTML = `
@@ -936,7 +1059,10 @@
                     <td>${safeText(lead.preferred_time)}</td>
                     <td>${safeText(lead.summary)}</td>
                     <td>
-                        <button class="small-button" type="button">View</button>
+                        <div class="row-actions">
+                            <button class="small-button view-button" type="button">View</button>
+                            <button class="danger-button delete-button" type="button">Delete</button>
+                        </div>
                     </td>
                 `;
 
@@ -958,19 +1084,27 @@
                     }
                 });
 
-                row.querySelector(".small-button").addEventListener("click", () => {
+                row.querySelector(".view-button").addEventListener("click", () => {
                     openTranscript(lead.session_id);
+                });
+
+                row.querySelector(".delete-button").addEventListener("click", () => {
+                    deleteLead(lead.session_id);
                 });
 
                 tableBody.appendChild(row);
             }
         }
 
-        function applyFilters() {
+        function applyFilters(resetPage = true) {
             const selectedAiStatus = aiStatusFilter.value;
             const selectedOwnerStatus = ownerStatusFilter.value;
+            const selectedSource = sourceFilter.value;
+            const searchTerm = leadSearch.value.trim().toLowerCase();
 
-            const filteredLeads = allLeads.filter((lead) => {
+            if (resetPage) currentPage = 1;
+
+            filteredLeads = allLeads.filter((lead) => {
                 const aiMatches =
                     selectedAiStatus === "all" || lead.status === selectedAiStatus;
 
@@ -978,7 +1112,25 @@
                     selectedOwnerStatus === "all" ||
                     (lead.owner_status || "unreviewed") === selectedOwnerStatus;
 
-                return aiMatches && ownerMatches;
+                const sourceMatches =
+                    selectedSource === "all" ||
+                    (lead.source || "website") === selectedSource;
+
+                const searchableText = [
+                    lead.name,
+                    lead.phone,
+                    lead.treatment,
+                    lead.summary,
+                    lead.source,
+                ]
+                    .filter(Boolean)
+                    .join(" ")
+                    .toLowerCase();
+
+                const searchMatches =
+                    !searchTerm || searchableText.includes(searchTerm);
+
+                return aiMatches && ownerMatches && sourceMatches && searchMatches;
             });
 
             renderLeads(filteredLeads);
@@ -1071,12 +1223,35 @@
         saveSettingsButton.addEventListener("click", saveChatbotSettings);
         saveHoursButton.addEventListener("click", saveBusinessHours);
 
-        aiStatusFilter.addEventListener("change", applyFilters);
-        ownerStatusFilter.addEventListener("change", applyFilters);
+        aiStatusFilter.addEventListener("change", () => applyFilters());
+        ownerStatusFilter.addEventListener("change", () => applyFilters());
+        sourceFilter.addEventListener("change", () => applyFilters());
+        leadSearch.addEventListener("input", () => applyFilters());
+        pageSizeSelect.addEventListener("change", () => applyFilters());
+
+        previousPageButton.addEventListener("click", () => {
+            if (currentPage > 1) {
+                currentPage -= 1;
+                renderLeads(filteredLeads);
+            }
+        });
+
+        nextPageButton.addEventListener("click", () => {
+            const pageSize = Number(pageSizeSelect.value || 10);
+            const totalPages = Math.max(1, Math.ceil(filteredLeads.length / pageSize));
+
+            if (currentPage < totalPages) {
+                currentPage += 1;
+                renderLeads(filteredLeads);
+            }
+        });
 
         clearFiltersButton.addEventListener("click", () => {
             aiStatusFilter.value = "all";
             ownerStatusFilter.value = "all";
+            sourceFilter.value = "all";
+            leadSearch.value = "";
+            pageSizeSelect.value = "10";
             applyFilters();
         });
 
