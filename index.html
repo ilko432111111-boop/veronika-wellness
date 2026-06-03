@@ -296,6 +296,7 @@
             padding: 10px 14px;
             border-radius: 18px;
             max-width: 80%;
+            white-space: pre-wrap;
         }
         
         .user-message {
@@ -661,15 +662,24 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
             })
             .then(response => response.json())
             .then(data => {
+                // Remove the temporary typing message
+                typingMsg.remove();
+
+                // Convert visible escaped newline characters into real line breaks
+                const cleanedReply = String(data.reply || '')
+                    .replace(/\\n/g, '\n')
+                    .replace(/\n{3,}/g, '\n\n')
+                    .trim();
+
                 const botMsg = document.createElement('div');
                 botMsg.className = 'message bot-message';
-                botMsg.textContent = data.reply;
+                botMsg.textContent = cleanedReply;
                 messages.appendChild(botMsg);
 
                 // Save assistant reply to short-term chat memory
                 chatHistory.push({
                     role: "assistant",
-                    content: data.reply
+                    content: cleanedReply
                 });
 
                 // Keep only the latest 12 messages so it does not get too long
@@ -678,6 +688,9 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 messages.scrollTop = messages.scrollHeight;
             })
             .catch(() => {
+                // Remove the temporary typing message if the request fails
+                typingMsg.remove();
+
                 const errorMsg = document.createElement('div');
                 errorMsg.className = 'message bot-message';
                 errorMsg.textContent = "Sorry, I'm having trouble connecting right now. Please call 07943319617.";
