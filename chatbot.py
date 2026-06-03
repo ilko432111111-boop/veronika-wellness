@@ -474,6 +474,222 @@ def format_duration_options(durations: set[int]) -> str:
     return ", ".join(str(value) for value in ordered[:-1]) + f", or {ordered[-1]} minutes"
 
 
+# Services with one fixed duration. These are resolved deterministically
+# before the AI decides which booking detail to ask for next.
+FIXED_TREATMENT_DETAILS = [
+    {
+        "name": "Body Sculpting Treatment",
+        "duration": "30 minutes",
+        "aliases": ["body sculpting", "body sculpting treatment"],
+    },
+    {
+        "name": "Electronic Muscle Stimulation (EMS)",
+        "duration": "1 hour",
+        "aliases": ["electronic muscle stimulation", "ems"],
+    },
+    {
+        "name": "Microneedling for 1 Area (Stretch Marks)",
+        "duration": "1 hour 15 minutes",
+        "aliases": ["microneedling stretch marks", "microneedling for stretch marks"],
+    },
+    {
+        "name": "Microneedling for 1 Area (Face and Neck)",
+        "duration": "1 hour 15 minutes",
+        "aliases": ["microneedling face and neck", "microneedling for face and neck"],
+    },
+    {
+        "name": "Deep Facial Cleanse",
+        "duration": "1 hour",
+        "aliases": ["deep facial cleanse"],
+    },
+    {
+        "name": "Radio Frequency Facial",
+        "duration": "1 hour",
+        "aliases": ["radio frequency facial"],
+    },
+    {
+        "name": "Facial Treatment for Young Skin",
+        "duration": "1 hour",
+        "aliases": ["facial treatment for young skin", "young skin facial"],
+    },
+    {
+        "name": "Hydraface Facial Treatment",
+        "duration": "1 hour",
+        "aliases": ["hydraface facial treatment", "hydraface facial", "hydraface"],
+    },
+    {
+        "name": "Hydrafacial for 90 Minutes",
+        "duration": "1 hour 30 minutes",
+        "aliases": ["90 minute hydrafacial", "hydrafacial 90 minutes", "hydrafacial for 90 minutes"],
+    },
+    {
+        "name": "B12 Vitamin Shot",
+        "duration": "15 minutes",
+        "aliases": ["b12 vitamin shot", "b12 shot"],
+    },
+    {
+        "name": "Vitamin C Shot",
+        "duration": "15 minutes",
+        "aliases": ["vitamin c shot", "c vitamin shot"],
+    },
+    {
+        "name": "Dermal Filler (Lip Filler, 0.5 ml)",
+        "duration": "45 minutes",
+        "aliases": ["0.5 ml lip filler", "lip filler 0.5 ml", "0.5ml lip filler", "lip filler 0.5ml"],
+    },
+    {
+        "name": "Dermal Filler (Marionette Lines, 0.5 ml)",
+        "duration": "45 minutes",
+        "aliases": ["0.5 ml marionette lines", "marionette lines 0.5 ml", "0.5ml marionette lines"],
+    },
+    {
+        "name": "Dermal Filler (Nasolabial Folds, 0.5 ml)",
+        "duration": "45 minutes",
+        "aliases": ["0.5 ml nasolabial folds", "nasolabial folds 0.5 ml", "0.5ml nasolabial folds"],
+    },
+    {
+        "name": "Dermal Filler (Lip Filler, 1 ml)",
+        "duration": "1 hour",
+        "aliases": ["1 ml lip filler", "lip filler 1 ml", "1ml lip filler", "lip filler 1ml"],
+    },
+    {
+        "name": "Dermal Filler (Marionette Lines, 1 ml)",
+        "duration": "1 hour",
+        "aliases": ["1 ml marionette lines", "marionette lines 1 ml", "1ml marionette lines"],
+    },
+    {
+        "name": "Dermal Filler (Nasolabial Folds, 1 ml)",
+        "duration": "1 hour",
+        "aliases": ["1 ml nasolabial folds", "nasolabial folds 1 ml", "1ml nasolabial folds"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Above Knees)",
+        "duration": "45 minutes",
+        "aliases": ["fat dissolving above knees", "above knees"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Double Chin)",
+        "duration": "45 minutes",
+        "aliases": ["fat dissolving double chin", "double chin"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Bra Area)",
+        "duration": "45 minutes",
+        "aliases": ["fat dissolving bra area", "bra area"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Arms)",
+        "duration": "45 minutes",
+        "aliases": ["fat dissolving arms", "arms"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Back Area)",
+        "duration": "1 hour 15 minutes",
+        "aliases": ["fat dissolving back area", "back area"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Love Handles)",
+        "duration": "45 minutes",
+        "aliases": ["fat dissolving love handles", "love handles"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Thighs)",
+        "duration": "1 hour 15 minutes",
+        "aliases": ["fat dissolving thighs", "thighs"],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Full Stomach and Love Handles)",
+        "duration": "1 hour 30 minutes",
+        "aliases": [
+            "full stomach and love handles",
+            "stomach and love handles",
+            "full stomach love handles",
+        ],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Full Stomach)",
+        "duration": "1 hour 45 minutes",
+        "aliases": [
+            "fat dissolving full stomach",
+            "full stomach",
+            "stomach area",
+            "stomach",
+        ],
+    },
+    {
+        "name": "Fat-Dissolving Injections (Hips, Thighs and Bum)",
+        "duration": "1 hour 30 minutes",
+        "aliases": [
+            "hips thighs and bum",
+            "hips thighs bum",
+            "hips, thighs and bum",
+        ],
+    },
+]
+
+
+def normalise_service_match_text(value: str | None) -> str:
+    cleaned = normalise_treatment_name(value)
+    cleaned = cleaned.replace("&", " and ")
+    cleaned = re.sub(r"[^a-z0-9.]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def find_fixed_treatment_details(value: str | None) -> dict | None:
+    cleaned = normalise_service_match_text(value)
+
+    if not cleaned:
+        return None
+
+    padded_cleaned = f" {cleaned} "
+    candidates = []
+
+    for details in FIXED_TREATMENT_DETAILS:
+        aliases = [details["name"], *details["aliases"]]
+
+        for alias in aliases:
+            cleaned_alias = normalise_service_match_text(alias)
+
+            if cleaned_alias and f" {cleaned_alias} " in padded_cleaned:
+                candidates.append((len(cleaned_alias), details))
+
+    if not candidates:
+        return None
+
+    # Prefer the most specific match. For example, "stomach and love handles"
+    # must win over the shorter alias "stomach".
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def apply_fixed_treatment_details(
+    lead_data: dict,
+    latest_message: str,
+) -> dict:
+    result = dict(lead_data)
+
+    # The latest customer message wins when it clearly names a fixed service.
+    # Otherwise, use the extracted or previously saved treatment.
+    details = (
+        find_fixed_treatment_details(latest_message)
+        or find_fixed_treatment_details(result.get("treatment"))
+    )
+
+    if not details:
+        return result
+
+    result["treatment"] = details["name"]
+    result["duration"] = details["duration"]
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
+
+
 def is_valid_customer_name(value: str | None) -> bool:
     if value in [None, ""]:
         return False
@@ -687,7 +903,7 @@ def preserve_existing_booking_details(
         and (
             "long" in lower_previous
             or "duration" in lower_previous
-            or re.search(r"\\b(?:minute|minutes|min|mins|hour|hours|hr|hrs)\\b", lower_latest)
+            or re.search(r"\b(?:minute|minutes|min|mins|hour|hours|hr|hrs)\b", lower_latest)
         )
     )
 
@@ -737,17 +953,22 @@ def preserve_existing_booking_details(
     return result
 
 
+def normalise_reply_line_breaks(reply: str) -> str:
+    """Store and send real line breaks instead of visible backslash-n text."""
+    return str(reply or "").replace("\\r\\n", "\n").replace("\\n", "\n")
+
+
 def sanitise_booking_claims(reply: str) -> str:
     """Stop the AI from accidentally claiming that a request is confirmed."""
     cleaned = reply
 
     replacements = [
-        (r"(?i)\\bi have you booked in for\\b", "I've noted your request for"),
-        (r"(?i)\\bi have you booked for\\b", "I've noted your request for"),
+        (r"(?i)\bi have you booked in for\b", "I've noted your request for"),
+        (r"(?i)\bi have you booked for\b", "I've noted your request for"),
         (r"(?i)\\byou(?:'re| are) booked in for\\b", "I've noted your request for"),
         (r"(?i)\\byou(?:'re| are) booked for\\b", "I've noted your request for"),
-        (r"(?i)\\byour booking is confirmed\\b", "Your request has been noted. The therapist still needs to confirm the appointment"),
-        (r"(?i)\\byour appointment is confirmed\\b", "Your request has been noted. The therapist still needs to confirm the appointment"),
+        (r"(?i)\byour booking is confirmed\b", "Your request has been noted. The therapist still needs to confirm the appointment"),
+        (r"(?i)\byour appointment is confirmed\b", "Your request has been noted. The therapist still needs to confirm the appointment"),
     ]
 
     for pattern, replacement in replacements:
@@ -756,10 +977,23 @@ def sanitise_booking_claims(reply: str) -> str:
     return cleaned
 
 
-def canonical_missing_question(field: str) -> str:
+def canonical_missing_question(
+    field: str,
+    lead_data: dict | None = None,
+) -> str:
+    if field == "duration":
+        allowed_durations = allowed_durations_for_treatment(
+            (lead_data or {}).get("treatment")
+        )
+
+        if allowed_durations:
+            options = format_duration_options(allowed_durations)
+            return f"How long would you like the session for: {options}?"
+
+        return "Which treatment option would you like?"
+
     questions = {
         "treatment": "Which treatment would you like?",
-        "duration": "How long would you like the session for?",
         "name": "What's your name?",
         "phone": "What's your phone number?",
         "preferred_date": "Which day would you prefer?",
@@ -787,6 +1021,7 @@ def reply_already_asks_for_field(reply: str, field: str) -> bool:
 def ensure_next_booking_question(
     reply: str,
     missing_fields: list[str],
+    lead_data: dict,
 ) -> str:
     """
     When a customer asks a side question while booking, answer it and still
@@ -800,7 +1035,10 @@ def ensure_next_booking_question(
     if reply_already_asks_for_field(reply, next_field):
         return reply
 
-    return reply.rstrip() + "\\n\\n" + canonical_missing_question(next_field)
+    return reply.rstrip() + "\n\n" + canonical_missing_question(
+        next_field,
+        lead_data,
+    )
 
 
 def save_conversation_overview(
@@ -955,7 +1193,10 @@ def is_simple_acknowledgement(message: str) -> bool:
     return cleaned in acknowledgements
 
 
-def build_next_question_hint(missing_fields: list[str]) -> str:
+def build_next_question_hint(
+    missing_fields: list[str],
+    lead_data: dict,
+) -> str:
     if not missing_fields:
         return (
             "No booking details are missing. Do not ask another question. "
@@ -967,7 +1208,11 @@ def build_next_question_hint(missing_fields: list[str]) -> str:
 
     questions = {
         "treatment": "Ask only which treatment they would like.",
-        "duration": "Ask only how long they would like the session for.",
+        "duration": (
+            "Ask only about the valid treatment option or duration. "
+            "Never suggest massage durations for a non-massage treatment. "
+            + canonical_missing_question("duration", lead_data)
+        ),
         "name": "Ask only for their name.",
         "phone": "Ask only for their phone number.",
         "preferred_date": "Ask only which date they would prefer.",
@@ -2277,6 +2522,11 @@ async def chat(
         previous_assistant_message,
     )
 
+    merged_lead = apply_fixed_treatment_details(
+        merged_lead,
+        request.message,
+    )
+
     merged_lead, validation_issue = validate_latest_customer_details(
         merged_lead,
         request.message,
@@ -2351,7 +2601,10 @@ async def chat(
         else "None"
     )
 
-    next_question_hint = build_next_question_hint(missing_fields)
+    next_question_hint = build_next_question_hint(
+        missing_fields,
+        merged_lead,
+    )
     customer_date_label = format_customer_date(
         merged_lead.get("preferred_date")
     )
@@ -2391,7 +2644,8 @@ Locked rules:
 - Do not repeat a treatment name immediately after the customer has just chosen it unless clarification is genuinely needed.
 - Do not repeat prices, dates, times, durations, or availability unless the customer asks or the information has changed.
 - Do not list duration options unless duration is the next missing detail.
-- If duration is the next missing detail, prefer a reply like: "How long would you like the session for: 30, 60, 90, or 120 minutes?"
+- If duration is the next missing detail, use NEXT QUESTION TARGET. Never offer massage durations for a non-massage treatment.
+- If a treatment has one fixed duration listed under CONFIRMED CUSTOMER DETAILS, do not ask the customer to choose a session length.
 - Do not repeat hello twice.
 - Avoid filler such as "I've noted that down", "just to confirm", "we offer", "to proceed", and "the requested time currently looks available" unless genuinely needed.
 - Use the conversation history to understand short replies.
@@ -2465,10 +2719,12 @@ Reply as Receptionist:
     )
 
     reply = completion.choices[0].message.content
+    reply = normalise_reply_line_breaks(reply)
     reply = sanitise_booking_claims(reply)
     reply = ensure_next_booking_question(
         reply,
         missing_fields,
+        merged_lead,
     )
 
     save_message(
