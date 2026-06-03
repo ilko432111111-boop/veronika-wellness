@@ -363,6 +363,171 @@ def parse_phone_from_text(message: str) -> str | None:
     return None
 
 
+BOOKING_INTENT_PATTERNS = [
+    r"\bbook(?:ing|ed)?\b",
+    r"\bappointment\b",
+    r"\bschedule\b",
+    r"\bslot\b",
+    r"\bavailability\b",
+    r"\bavailable\b",
+    r"\bcan i come(?: in)?\b",
+    r"\bi(?:'d| would) like to come(?: in)?\b",
+    r"\bi want to come(?: in)?\b",
+    r"\bmake (?:an|a) appointment\b",
+]
+
+
+def customer_history_text(conversation_history: str) -> str:
+    lines = []
+
+    for line in str(conversation_history or "").splitlines():
+        lower_line = line.lower().lstrip()
+
+        if lower_line.startswith(("customer:", "user:")):
+            lines.append(line.split(":", 1)[1])
+
+    return "\n".join(lines)
+
+
+def is_affirmative_reply(message: str) -> bool:
+    cleaned = re.sub(r"[^a-z]+", " ", str(message or "").lower()).strip()
+
+    return cleaned in {
+        "yes",
+        "yes please",
+        "yeah",
+        "yep",
+        "sure",
+        "okay",
+        "ok",
+        "please",
+        "sounds good",
+        "that works",
+    }
+
+
+def conversation_has_booking_intent(
+    conversation_history: str,
+    latest_message: str,
+    previous_assistant_message: str,
+    existing_lead: dict,
+) -> bool:
+    """
+    Start the booking-detail flow only when the customer actually indicates
+    that they want an appointment. Asking for information about a treatment is
+    not enough.
+    """
+    if existing_lead.get("status") in {
+        "details_incomplete",
+        "booking_request_complete",
+    }:
+        return True
+
+    customer_text = customer_history_text(conversation_history)
+    searchable_text = f"{customer_text}\n{latest_message}".lower()
+
+    if any(
+        re.search(pattern, searchable_text)
+        for pattern in BOOKING_INTENT_PATTERNS
+    ):
+        return True
+
+    previous_lower = str(previous_assistant_message or "").lower()
+
+    if (
+        is_affirmative_reply(latest_message)
+        and any(
+            phrase in previous_lower
+            for phrase in [
+                "would you like to book",
+                "would you like me to take your booking request",
+                "would you like to request an appointment",
+                "shall i take your booking details",
+            ]
+        )
+    ):
+        return True
+
+    # Voluntarily providing a date or time while a treatment is already known
+    # is also a clear sign that the customer wants to arrange an appointment.
+    if existing_lead.get("treatment") and (
+        parse_relative_date_from_text(latest_message)
+        or parse_time_from_text(latest_message)
+    ):
+        return True
+
+    return False
+
+
+def normalise_misplaced_preferred_fields(
+    lead_data: dict,
+    latest_message: str,
+) -> dict:
+    """
+    Correct extraction mistakes such as preferred_time='today'. Relative date
+    words are always stored in preferred_date as ISO dates, never as a time.
+    """
+    result = dict(lead_data)
+
+    raw_date = result.get("preferred_date")
+    raw_time = result.get("preferred_time")
+
+    misplaced_date = parse_relative_date_from_text(str(raw_time or ""))
+
+    if misplaced_date and not parse_time_from_text(str(raw_time or "")):
+        result["preferred_date"] = misplaced_date
+        result["preferred_time"] = None
+
+    misplaced_time = parse_time_from_text(str(raw_date or ""))
+
+    if misplaced_time and not parse_relative_date_from_text(str(raw_date or "")):
+        result["preferred_time"] = misplaced_time
+        result["preferred_date"] = None
+
+    latest_date = parse_relative_date_from_text(latest_message)
+    latest_time = parse_time_from_text(latest_message)
+
+    if latest_date:
+        result["preferred_date"] = latest_date
+
+        if not latest_time:
+            current_time_value = str(result.get("preferred_time") or "").strip().lower()
+
+            if parse_relative_date_from_text(current_time_value):
+                result["preferred_time"] = None
+
+    if latest_time:
+        result["preferred_time"] = latest_time
+
+    result["preferred_date"] = normalise_preferred_date(
+        result.get("preferred_date")
+    )
+
+    return result
+
+
+def align_status_with_booking_intent(
+    lead_data: dict,
+    booking_flow_active: bool,
+) -> dict:
+    result = dict(lead_data)
+
+    if booking_flow_active:
+        result["status"] = calculate_lead_status(
+            result,
+            result.get("status"),
+        )
+    else:
+        result["status"] = (
+            "interested"
+            if result.get("treatment")
+            else "new_chat"
+        )
+        result["notification_sent_at"] = None
+
+    return result
+
+
 def looks_like_customer_name(message: str) -> bool:
     cleaned = message.strip()
     lower_message = cleaned.lower()
@@ -830,6 +995,50 @@ def working_hours_for_date(
     return open_time, close_time
 
 
+def business_can_accept_more_bookings_today(
+    duration_minutes: int | None = None,
+) -> bool:
+    now = datetime.now(BUSINESS_TIMEZONE)
+    opening_window = working_hours_for_date(now.date())
+
+    if not opening_window:
+        return False
+
+    _, close_time = opening_window
+    required_minutes = duration_minutes or SLOT_STEP_MINUTES
+
+    return now + timedelta(minutes=required_minutes) <= close_time
+
+
+def clear_expired_same_day_preference(
+    lead_data: dict,
+) -> tuple[dict, bool]:
+    """
+    If the customer selects today after the business has effectively closed,
+    remove the unusable date and ask for another day instead of asking for a
+    time that cannot be fulfilled.
+    """
+    result = dict(lead_data)
+    today = datetime.now(BUSINESS_TIMEZONE).date().isoformat()
+
+    if result.get("preferred_date") != today:
+        return result, False
+
+    duration_minutes = parse_duration_minutes(
+        result.get("duration")
+    )
+
+    if business_can_accept_more_bookings_today(duration_minutes):
+        return result, False
+
+    result["preferred_date"] = None
+    result["preferred_time"] = None
+    result["notification_sent_at"] = None
+    result["status"] = "details_incomplete"
+
+    return result, True
+
+
 def validate_slot_against_working_hours(
     start_time: datetime,
     end_time: datetime,
@@ -1005,6 +1214,61 @@ def remove_invalid_fixed_duration_questions(
     return cleaned.strip()
 
 
+def remove_premature_booking_questions(
+    reply: str,
+    booking_flow_active: bool,
+) -> str:
+    """
+    Informational enquiries must not immediately turn into a booking form.
+    Remove requests for personal details until the customer actually indicates
+    that they want to arrange an appointment.
+    """
+    if booking_flow_active:
+        return reply
+
+    cleaned = str(reply or "")
+
+    patterns = [
+        r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i have your name[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide) your (?:phone|contact|mobile) number[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date) would you prefer[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:which|what) time(?: today)? would you prefer[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?how long would you like the session for[^?]*\?",
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
+def remove_invalid_today_time_questions(
+    reply: str,
+    today_is_unavailable: bool,
+) -> str:
+    if not today_is_unavailable:
+        return reply
+
+    cleaned = str(reply or "")
+
+    patterns = [
+        r"(?is)(?:\s*\n\s*)?(?:which|what) time[^?]*\btoday\b[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?what time would you like today[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?what time today would you prefer[^?]*\?",
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
 def sanitise_booking_claims(reply: str) -> str:
     """Stop the AI from accidentally claiming that a request is confirmed."""
     cleaned = reply
@@ -1039,12 +1303,32 @@ def canonical_missing_question(
 
         return "Which treatment option would you like?"
 
+    if field == "preferred_date":
+        if not business_can_accept_more_bookings_today(
+            parse_duration_minutes((lead_data or {}).get("duration"))
+        ):
+            return "Which day would you prefer? We're closed for today."
+
+        return "Which day would you prefer?"
+
+    if field == "preferred_time":
+        preferred_date = (lead_data or {}).get("preferred_date")
+        today = datetime.now(BUSINESS_TIMEZONE).date().isoformat()
+
+        if (
+            preferred_date == today
+            and not business_can_accept_more_bookings_today(
+                parse_duration_minutes((lead_data or {}).get("duration"))
+            )
+        ):
+            return "We're closed for today. Which other day would you prefer?"
+
+        return "What time would you prefer?"
+
     questions = {
         "treatment": "Which treatment would you like?",
         "name": "What's your name?",
         "phone": "What's your phone number?",
-        "preferred_date": "Which day would you prefer?",
-        "preferred_time": "What time would you prefer?",
     }
 
     return questions.get(field, "Could you provide the next booking detail?")
@@ -2574,6 +2858,27 @@ async def chat(
         request.message,
     )
 
+    merged_lead = normalise_misplaced_preferred_fields(
+        merged_lead,
+        request.message,
+    )
+
+    booking_flow_active = conversation_has_booking_intent(
+        conversation_history,
+        request.message,
+        previous_assistant_message,
+        existing_lead,
+    )
+
+    merged_lead, today_is_unavailable = clear_expired_same_day_preference(
+        merged_lead,
+    )
+
+    merged_lead = align_status_with_booking_intent(
+        merged_lead,
+        booking_flow_active,
+    )
+
     merged_lead, validation_issue = validate_latest_customer_details(
         merged_lead,
         request.message,
@@ -2604,16 +2909,26 @@ async def chat(
 
         return {"reply": reply}
 
-    calendar_result = check_requested_calendar_slot(
-        merged_lead,
-        request.message,
-    )
+    if booking_flow_active:
+        calendar_result = check_requested_calendar_slot(
+            merged_lead,
+            request.message,
+        )
 
-    calendar_should_be_visible = should_surface_calendar_result(
-        request.message,
-        existing_lead,
-        merged_lead,
-    )
+        calendar_should_be_visible = should_surface_calendar_result(
+            request.message,
+            existing_lead,
+            merged_lead,
+        )
+    else:
+        calendar_result = {
+            "status": "not_requested",
+            "message": (
+                "The customer is asking for information only. "
+                "Do not start collecting booking details yet."
+            ),
+        }
+        calendar_should_be_visible = False
 
     calendar_context = format_calendar_result(
         calendar_result,
@@ -2635,11 +2950,15 @@ async def chat(
             source=request_source,
         )
 
-    missing_fields = [
-        field
-        for field in REQUIRED_BOOKING_FIELDS
-        if merged_lead.get(field) in [None, ""]
-    ]
+    missing_fields = (
+        [
+            field
+            for field in REQUIRED_BOOKING_FIELDS
+            if merged_lead.get(field) in [None, ""]
+        ]
+        if booking_flow_active
+        else []
+    )
 
     confirmed_details = format_confirmed_details(merged_lead)
     missing_details = (
@@ -2686,7 +3005,9 @@ Never present yourself as Veronika. If you need to refer to the person providing
 
 Locked rules:
 - Keep replies extremely concise and natural. Usually use one short sentence. Use two only when necessary.
-- Answer the customer's question first, then ask only for the single next missing detail.
+- Answer the customer's question first.
+- If BOOKING FLOW ACTIVE says No, treat the message as an informational enquiry. Do not ask for the customer's name, phone number, preferred date, preferred time, or duration. You may briefly ask whether they would like to book only when it feels natural.
+- If BOOKING FLOW ACTIVE says Yes, ask only for the single next missing booking detail.
 - Follow NEXT QUESTION TARGET closely.
 - Do not repeat a treatment name immediately after the customer has just chosen it unless clarification is genuinely needed.
 - Do not repeat prices, dates, times, durations, or availability unless the customer asks or the information has changed.
@@ -2739,6 +3060,12 @@ MISSING REQUIRED DETAILS:
 NEXT QUESTION TARGET:
 {next_question_hint}
 
+BOOKING FLOW ACTIVE:
+{"Yes" if booking_flow_active else "No"}
+
+TODAY BOOKING CONTEXT:
+{"The business cannot accept any more appointments today. Never suggest today and never ask what time today." if today_is_unavailable or not business_can_accept_more_bookings_today(parse_duration_minutes(merged_lead.get("duration"))) else "The business may still have time remaining today, but never assume the customer wants today unless they explicitly say so."}
+
 CUSTOMER-FACING DATE LABEL:
 {customer_date_label}
 
@@ -2772,11 +3099,21 @@ Reply as Receptionist:
         reply,
         merged_lead,
     )
-    reply = ensure_next_booking_question(
+    reply = remove_premature_booking_questions(
         reply,
-        missing_fields,
-        merged_lead,
+        booking_flow_active,
     )
+    reply = remove_invalid_today_time_questions(
+        reply,
+        today_is_unavailable,
+    )
+
+    if booking_flow_active:
+        reply = ensure_next_booking_question(
+            reply,
+            missing_fields,
+            merged_lead,
+        )
 
     save_message(
         session_id=request.session_id,
