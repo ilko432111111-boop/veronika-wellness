@@ -297,6 +297,7 @@
             border-radius: 18px;
             max-width: 80%;
             white-space: pre-wrap;
+            overflow-wrap: anywhere;
         }
         
         .user-message {
@@ -648,6 +649,14 @@ typingMsg.textContent = "Veronika's assistant is typing...";
 messages.appendChild(typingMsg);
 messages.scrollTop = messages.scrollHeight;
 
+// Convert escaped line-break text returned by the backend into real line breaks
+function cleanBotReply(reply) {
+    return String(reply ?? "")
+        .replace(/\\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+
 // Send latest message + conversation history to backend
 fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 method: "POST",
@@ -660,23 +669,24 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
     history: chatHistory
 })
             })
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return response.json();
+            })
             .then(data => {
-                // Remove the temporary typing message
+                // Remove the temporary typing message before showing the real reply
                 typingMsg.remove();
 
-                // Convert visible escaped newline characters into real line breaks
-                const cleanedReply = String(data.reply || '')
-                    .replace(/\\n/g, '\n')
-                    .replace(/\n{3,}/g, '\n\n')
-                    .trim();
+                const cleanedReply = cleanBotReply(data.reply);
 
                 const botMsg = document.createElement('div');
                 botMsg.className = 'message bot-message';
-                botMsg.textContent = cleanedReply;
+                botMsg.textContent = cleanedReply || "Sorry, I couldn't generate a reply. Please try again.";
                 messages.appendChild(botMsg);
 
-                // Save assistant reply to short-term chat memory
+                // Save cleaned assistant reply to short-term chat memory
                 chatHistory.push({
                     role: "assistant",
                     content: cleanedReply
