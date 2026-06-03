@@ -36,6 +36,49 @@ app.add_middleware(
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
+# AI model configuration
+# The live receptionist uses the stronger reasoning model.
+# Lead extraction remains separate so it can be upgraded independently later.
+LIVE_CHAT_MODEL = os.getenv(
+    "LIVE_CHAT_MODEL",
+    "openai/gpt-oss-120b",
+).strip()
+
+LIVE_CHAT_REASONING_EFFORT = os.getenv(
+    "LIVE_CHAT_REASONING_EFFORT",
+    "low",
+).strip().lower()
+
+if LIVE_CHAT_REASONING_EFFORT not in {"low", "medium", "high"}:
+    LIVE_CHAT_REASONING_EFFORT = "low"
+
+
+def read_positive_int_environment_variable(
+    name: str,
+    default: int,
+) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+
+        if value > 0:
+            return value
+
+    except (TypeError, ValueError):
+        pass
+
+    return default
+
+
+LIVE_CHAT_MAX_COMPLETION_TOKENS = read_positive_int_environment_variable(
+    "LIVE_CHAT_MAX_COMPLETION_TOKENS",
+    1200,
+)
+
+LEAD_EXTRACTION_MODEL = os.getenv(
+    "LEAD_EXTRACTION_MODEL",
+    "llama-3.1-8b-instant",
+).strip()
+
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
@@ -824,7 +867,7 @@ Conversation:
 """
 
         completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model=LEAD_EXTRACTION_MODEL,
             messages=[
                 {"role": "user", "content": extraction_prompt}
             ],
@@ -2033,6 +2076,16 @@ async def receive_instagram_webhook(
     return {"status": "received"}
 
 
+@app.get("/ai/status")
+async def ai_status():
+    return {
+        "live_chat_model": LIVE_CHAT_MODEL,
+        "live_chat_reasoning_effort": LIVE_CHAT_REASONING_EFFORT,
+        "live_chat_max_completion_tokens": LIVE_CHAT_MAX_COMPLETION_TOKENS,
+        "lead_extraction_model": LEAD_EXTRACTION_MODEL,
+    }
+
+
 @app.get("/")
 async def root():
     return {"message": "Backend is working!"}
@@ -2401,11 +2454,14 @@ Reply as Receptionist:
 """
 
     completion = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=LIVE_CHAT_MODEL,
         messages=[
             {"role": "user", "content": prompt}
         ],
-        temperature=0.3
+        reasoning_effort=LIVE_CHAT_REASONING_EFFORT,
+        include_reasoning=False,
+        temperature=0.5,
+        max_completion_tokens=LIVE_CHAT_MAX_COMPLETION_TOKENS,
     )
 
     reply = completion.choices[0].message.content
