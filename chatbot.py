@@ -130,10 +130,10 @@ DEFAULT_BUSINESS_HOURS = {
 REQUIRED_BOOKING_FIELDS = [
     "treatment",
     "duration",
-    "name",
-    "phone",
     "preferred_date",
     "preferred_time",
+    "name",
+    "phone",
 ]
 
 
@@ -1496,6 +1496,14 @@ def canonical_missing_question(
         return "Which treatment option would you like?"
 
     if field == "preferred_date":
+        known_time = (lead_data or {}).get("preferred_time")
+
+        if known_time not in [None, ""]:
+            return (
+                f"Which day did you have in mind for "
+                f"{format_customer_time(known_time)}?"
+            )
+
         if not business_can_accept_more_bookings_today(
             parse_duration_minutes((lead_data or {}).get("duration"))
         ):
@@ -1897,6 +1905,58 @@ def format_customer_slot(
     return (
         f"{format_customer_date(preferred_date)} "
         f"at {format_customer_time(preferred_time)}"
+    )
+
+
+def previous_reply_offered_calendar_alternatives(
+    previous_assistant_message: str,
+) -> bool:
+    lower_message = str(previous_assistant_message or "").lower()
+
+    return (
+        "the next available options are" in lower_message
+        or "would any of those times work" in lower_message
+        or "would one of those times work" in lower_message
+    )
+
+
+def is_negative_reply(message: str) -> bool:
+    cleaned = re.sub(
+        r"[^a-z]+",
+        " ",
+        str(message or "").lower(),
+    ).strip()
+
+    return cleaned in {
+        "no",
+        "nope",
+        "nah",
+        "no thanks",
+        "none",
+        "none of those",
+        "not really",
+        "they dont work",
+        "they do not work",
+        "those dont work",
+        "those do not work",
+    }
+
+
+def customer_rejected_calendar_alternatives(
+    latest_message: str,
+    previous_assistant_message: str,
+) -> bool:
+    """
+    A plain rejection of proposed slots means no schedule has been agreed.
+    Clear the old date and time before collecting any personal details.
+    """
+    return (
+        previous_reply_offered_calendar_alternatives(
+            previous_assistant_message
+        )
+        and is_negative_reply(latest_message)
+        and not parse_relative_date_from_text(latest_message)
+        and not parse_time_from_text(latest_message)
     )
 
 
@@ -3637,6 +3697,35 @@ async def chat(
         "",
     )
 
+    if customer_rejected_calendar_alternatives(
+        request.message,
+        previous_assistant_message,
+    ):
+        merged_lead["preferred_date"] = None
+        merged_lead["preferred_time"] = None
+        merged_lead["status"] = "details_incomplete"
+        merged_lead["notification_sent_at"] = None
+
+        save_conversation_overview(
+            session_id=request.session_id,
+            lead_data=merged_lead,
+            source=request_source,
+        )
+
+        reply = (
+            "No problem. Which day and time would suit you instead? "
+            "I can check the available slots."
+        )
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
+
     merged_lead = apply_latest_message_fallbacks(
         merged_lead,
         request.message,
@@ -3846,6 +3935,8 @@ Locked rules:
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
 - Never say the therapist will confirm shortly while any required booking detail is still missing.
+- Settle an acceptable preferred date and time before asking for the customer's name or phone number.
+- If the customer rejects proposed alternative slots, ask for a different preferred day and time. Do not collect contact details yet.
 - A complete booking request requires: treatment, duration, name, phone number, preferred date, and preferred time.
 - If asked "am I booked?", answer clearly: "Not yet. The therapist still needs to confirm the appointment."
 - If the customer only says "ok", "thanks", "fantastic", or a similar acknowledgement after giving all details, do not reinterpret it as booking information and do not alter the date or time. Reply briefly: "Thanks. The therapist will confirm the appointment shortly."
