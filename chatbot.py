@@ -3040,6 +3040,164 @@ def prepend_information_once(reply: str, information: str) -> str:
     return information + "\n\n" + reply
 
 
+def latest_message_selects_ultrasound_variant(
+    message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(message)
+
+    if find_ultrasound_service(message):
+        return True
+
+    return cleaned in {
+        "single",
+        "single session",
+        "one session",
+        "just one",
+        "package",
+        "the package",
+        "package deal",
+        "the package deal",
+        "course",
+    }
+
+
+def latest_message_selects_vitamin_variant(
+    message: str,
+) -> bool:
+    service = find_vitamin_shot_service(message)
+
+    return bool(
+        service
+        and service.get("booking_mode") == "fixed_duration"
+    )
+
+
+def strip_structured_service_price_sentences(
+    reply: str,
+) -> str:
+    """
+    Remove only old LLM-written price sentences for dynamic categories.
+
+    A deterministic price sentence is inserted afterwards. This avoids
+    semantically duplicated wording such as:
+      "The package is £220 for five 45-minute sessions."
+      "The ultrasound package is £220 for 5 sessions."
+    """
+    segments = re.split(
+        r"(?<=[.!?])\s+|\n+",
+        str(reply or "").strip(),
+    )
+
+    kept = []
+
+    for segment in segments:
+        cleaned = segment.strip()
+
+        if not cleaned:
+            continue
+
+        lower_segment = cleaned.lower()
+
+        is_dynamic_service_price = (
+            "£" in cleaned
+            and any(
+                marker in lower_segment
+                for marker in [
+                    "ultrasound",
+                    "package",
+                    "vitamin",
+                    "b12",
+                    "shot",
+                ]
+            )
+        )
+
+        if not is_dynamic_service_price:
+            kept.append(cleaned)
+
+    return "\n\n".join(kept).strip()
+
+
+def finalise_dynamic_service_reply(
+    reply: str,
+    latest_message: str,
+    lead_data: dict,
+    missing_fields: list[str],
+    calendar_result: dict,
+) -> str:
+    """
+    Use one deterministic answer for migrated fixed-price categories.
+
+    This prevents the LLM and backend from both listing the same information
+    in slightly different wording.
+    """
+    if needs_ultrasound_variant(lead_data):
+        return build_schedule_first_question(
+            lead_data
+        )
+
+    if needs_vitamin_shot_variant(lead_data):
+        return build_schedule_first_question(
+            lead_data
+        )
+
+    ultrasound_service = find_ultrasound_service(
+        lead_data.get("treatment")
+    )
+    vitamin_service = find_vitamin_shot_service(
+        lead_data.get("treatment")
+    )
+
+    service = ultrasound_service or vitamin_service
+
+    if not service:
+        return reply
+
+    announce_price = (
+        customer_asks_about_price(latest_message)
+        or latest_message_selects_ultrasound_variant(
+            latest_message
+        )
+        or latest_message_selects_vitamin_variant(
+            latest_message
+        )
+    )
+
+    if not announce_price:
+        return reply
+
+    information = format_service_price_sentence(
+        service
+    )
+
+    if not information:
+        return reply
+
+    cleaned_reply = strip_structured_service_price_sentences(
+        reply
+    )
+
+    if calendar_result.get("status") in {
+        "not_checked",
+        "not_requested",
+        "provisional_free",
+    }:
+        question = build_deterministic_next_question(
+            lead_data,
+            missing_fields,
+        )
+
+        if question:
+            return information + "\n\n" + question
+
+        return information
+
+    if not cleaned_reply:
+        return information
+
+    return information + "\n\n" + cleaned_reply
+
+
 def build_deterministic_next_question(
     lead_data: dict,
     missing_fields: list[str],
@@ -5460,13 +5618,12 @@ Reply as Receptionist:
                 missing_fields,
             )
 
-    structured_price_information = build_structured_price_information(
-        request.message,
-        merged_lead,
-    )
-    reply = prepend_information_once(
-        reply,
-        structured_price_information,
+    reply = finalise_dynamic_service_reply(
+        reply=reply,
+        latest_message=request.message,
+        lead_data=merged_lead,
+        missing_fields=missing_fields,
+        calendar_result=calendar_result,
     )
 
     save_message(
