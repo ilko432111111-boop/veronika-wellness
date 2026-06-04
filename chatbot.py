@@ -1110,6 +1110,328 @@ def format_live_massage_services_context() -> tuple[str, bool]:
     return "\n".join(lines), from_supabase
 
 
+FALLBACK_VITAMIN_SHOT_SERVICES = [
+    {
+        "service_name": "Vitamin Shot",
+        "booking_mode": "choose_variant",
+        "fixed_duration_minutes": None,
+        "price_pence": None,
+        "aliases": [
+            "vitamin shot",
+            "vitamin shots",
+            "vitamin injection",
+            "vitamin injections",
+        ],
+        "description": (
+            "Ask whether the customer would like a B12 Vitamin Shot "
+            "or a Vitamin C Shot."
+        ),
+    },
+    {
+        "service_name": "B12 Vitamin Shot",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 15,
+        "price_pence": 2000,
+        "aliases": [
+            "b12 vitamin shot",
+            "b12 shot",
+            "b12",
+            "vitamin b12",
+        ],
+        "description": "One B12 Vitamin Shot session.",
+    },
+    {
+        "service_name": "Vitamin C Shot",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 15,
+        "price_pence": 2000,
+        "aliases": [
+            "vitamin c shot",
+            "c vitamin shot",
+            "vitamin c",
+            "c shot",
+        ],
+        "description": "One Vitamin C Shot session.",
+    },
+]
+
+_VITAMIN_SHOT_SERVICE_CACHE: dict = {
+    "loaded_at": 0.0,
+    "rows": None,
+    "from_supabase": False,
+}
+VITAMIN_SHOT_SERVICE_CACHE_SECONDS = 60
+
+
+def load_vitamin_shot_services() -> tuple[list[dict], bool]:
+    """
+    Load Veronika's live vitamin-shot catalogue from public.services.
+
+    If Supabase temporarily fails or the category is empty, use the fallback
+    catalogue so the live chatbot remains available.
+    """
+    now = time.time()
+    cached_rows = _VITAMIN_SHOT_SERVICE_CACHE.get("rows")
+
+    if (
+        cached_rows is not None
+        and now - float(_VITAMIN_SHOT_SERVICE_CACHE.get("loaded_at") or 0)
+        < VITAMIN_SHOT_SERVICE_CACHE_SECONDS
+    ):
+        return (
+            cached_rows,
+            bool(_VITAMIN_SHOT_SERVICE_CACHE.get("from_supabase")),
+        )
+
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "service_name, aliases, fixed_duration_minutes, "
+                "price_pence, booking_mode, description, is_active, "
+                "display_order"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("category", "vitamin_shots")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+
+        rows = []
+
+        for row in response.data or []:
+            service_name = str(row.get("service_name") or "").strip()
+            booking_mode = str(row.get("booking_mode") or "").strip()
+
+            if not service_name or not booking_mode:
+                continue
+
+            fixed_duration = row.get("fixed_duration_minutes")
+
+            if fixed_duration not in [None, ""]:
+                try:
+                    fixed_duration = int(fixed_duration)
+                except (TypeError, ValueError):
+                    fixed_duration = None
+
+            rows.append({
+                "service_name": service_name,
+                "aliases": list(row.get("aliases") or []),
+                "fixed_duration_minutes": fixed_duration,
+                "price_pence": row.get("price_pence"),
+                "booking_mode": booking_mode,
+                "description": str(row.get("description") or "").strip(),
+                "display_order": row.get("display_order") or 0,
+            })
+
+        if rows:
+            _VITAMIN_SHOT_SERVICE_CACHE.update({
+                "loaded_at": now,
+                "rows": rows,
+                "from_supabase": True,
+            })
+            return rows, True
+
+    except Exception as error:
+        print(f"Could not load vitamin-shot services from Supabase: {error}")
+
+    fallback_rows = [dict(row) for row in FALLBACK_VITAMIN_SHOT_SERVICES]
+
+    _VITAMIN_SHOT_SERVICE_CACHE.update({
+        "loaded_at": now,
+        "rows": fallback_rows,
+        "from_supabase": False,
+    })
+
+    return fallback_rows, False
+
+
+def vitamin_shot_service_match_score(
+    treatment: str | None,
+    service: dict,
+) -> int:
+    cleaned = normalise_service_match_text(treatment)
+
+    if not cleaned:
+        return 0
+
+    padded = f" {cleaned} "
+    candidates = [
+        service.get("service_name"),
+        *(service.get("aliases") or []),
+    ]
+
+    best_score = 0
+
+    for candidate in candidates:
+        cleaned_candidate = normalise_service_match_text(candidate)
+
+        if not cleaned_candidate:
+            continue
+
+        if f" {cleaned_candidate} " in padded:
+            best_score = max(best_score, len(cleaned_candidate))
+
+    return best_score
+
+
+def find_vitamin_shot_service(
+    treatment: str | None,
+) -> dict | None:
+    services, _ = load_vitamin_shot_services()
+    matches = []
+
+    for service in services:
+        score = vitamin_shot_service_match_score(
+            treatment,
+            service,
+        )
+
+        if score:
+            matches.append((score, service))
+
+    if not matches:
+        return None
+
+    return max(matches, key=lambda item: item[0])[1]
+
+
+def format_minutes_as_duration(minutes: int | None) -> str | None:
+    if minutes in [None, ""]:
+        return None
+
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        return None
+
+    if minutes <= 0:
+        return None
+
+    hours, remainder = divmod(minutes, 60)
+
+    if hours and remainder:
+        hour_label = "hour" if hours == 1 else "hours"
+        return f"{hours} {hour_label} {remainder} minutes"
+
+    if hours:
+        hour_label = "hour" if hours == 1 else "hours"
+        return f"{hours} {hour_label}"
+
+    return f"{minutes} minutes"
+
+
+def apply_dynamic_vitamin_shot_details(
+    lead_data: dict,
+    latest_message: str,
+) -> dict:
+    """
+    Canonicalise vitamin-shot variants from public.services.
+
+    Generic "vitamin shot" stays unresolved until the customer chooses B12 or
+    Vitamin C. Specific fixed-duration variants receive their duration
+    automatically from Supabase.
+    """
+    result = dict(lead_data)
+
+    service = (
+        find_vitamin_shot_service(latest_message)
+        or find_vitamin_shot_service(result.get("treatment"))
+    )
+
+    if not service:
+        return result
+
+    result["treatment"] = service["service_name"]
+
+    if service.get("booking_mode") == "fixed_duration":
+        duration = format_minutes_as_duration(
+            service.get("fixed_duration_minutes")
+        )
+
+        if duration:
+            result["duration"] = duration
+
+    else:
+        result["duration"] = None
+
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
+
+
+def needs_vitamin_shot_variant(lead_data: dict) -> bool:
+    """
+    Generic vitamin-shot enquiries require a B12 or Vitamin C choice before
+    the schedule flow continues.
+    """
+    service = find_vitamin_shot_service(
+        lead_data.get("treatment")
+    )
+
+    return bool(
+        service
+        and service.get("booking_mode") == "choose_variant"
+    )
+
+
+def is_dynamic_fixed_duration_treatment(
+    treatment: str | None,
+) -> bool:
+    service = find_vitamin_shot_service(treatment)
+
+    return bool(
+        service
+        and service.get("booking_mode") == "fixed_duration"
+        and service.get("fixed_duration_minutes")
+    )
+
+
+def format_live_vitamin_shot_services_context() -> tuple[str, bool]:
+    """
+    Produce the vitamin-shot catalogue block sent to the LLM.
+    """
+    services, from_supabase = load_vitamin_shot_services()
+    lines = [
+        "Vitamin-shot services (authoritative live catalogue):"
+    ]
+
+    for service in services:
+        booking_mode = service.get("booking_mode")
+        duration = format_minutes_as_duration(
+            service.get("fixed_duration_minutes")
+        )
+        price = format_price_pence(
+            service.get("price_pence")
+        )
+        details = []
+
+        if duration:
+            details.append(duration)
+
+        if price:
+            details.append(price)
+
+        if service.get("description"):
+            details.append(service["description"])
+
+        suffix = "; ".join(details) if details else booking_mode
+
+        lines.append(
+            f"- {service.get('service_name')} "
+            f"[{booking_mode}]: {suffix}"
+        )
+
+    return "\n".join(lines), from_supabase
+
+
 def format_duration_options(durations: set[int]) -> str:
     ordered = sorted(durations)
 
@@ -1166,26 +1488,6 @@ FIXED_TREATMENT_DETAILS = [
         "name": "Hydrafacial for 90 Minutes",
         "duration": "1 hour 30 minutes",
         "aliases": ["90 minute hydrafacial", "hydrafacial 90 minutes", "hydrafacial for 90 minutes"],
-    },
-    {
-        "name": "B12 Vitamin Shot",
-        "duration": "15 minutes",
-        "aliases": [
-            "b12 vitamin shot",
-            "b12 shot",
-            "b12",
-            "vitamin b12",
-        ],
-    },
-    {
-        "name": "Vitamin C Shot",
-        "duration": "15 minutes",
-        "aliases": [
-            "vitamin c shot",
-            "c vitamin shot",
-            "vitamin c",
-            "c shot",
-        ],
     },
     {
         "name": "Dermal Filler (Lip Filler, 0.5 ml)",
@@ -1675,7 +1977,12 @@ def remove_invalid_fixed_duration_questions(
         lead_data.get("treatment")
     )
 
-    if not details or lead_data.get("duration") in [None, ""]:
+    if (
+        not details
+        and not is_dynamic_fixed_duration_treatment(
+            lead_data.get("treatment")
+        )
+    ) or lead_data.get("duration") in [None, ""]:
         return reply
 
     cleaned = str(reply or "")
@@ -2111,28 +2418,6 @@ def remove_contact_detail_questions(reply: str) -> str:
     cleaned = re.sub(r" {2,}", " ", cleaned)
 
     return cleaned.strip()
-
-
-def needs_vitamin_shot_variant(lead_data: dict) -> bool:
-    """
-    A generic vitamin-shot enquiry is incomplete until the customer chooses
-    B12 or Vitamin C. Both variants have a fixed 15-minute duration.
-    """
-    treatment = normalise_treatment_name(
-        lead_data.get("treatment")
-    )
-
-    if not treatment:
-        return False
-
-    generic_phrases = {
-        "vitamin shot",
-        "vitamin shots",
-        "vitamin injection",
-        "vitamin injections",
-    }
-
-    return treatment in generic_phrases
 
 
 def build_schedule_first_question(lead_data: dict) -> str:
@@ -4200,6 +4485,9 @@ async def chat(
     live_massage_context, massage_from_supabase = (
         format_live_massage_services_context()
     )
+    live_vitamin_context, vitamin_shots_from_supabase = (
+        format_live_vitamin_shot_services_context()
+    )
 
     context_rows = []
 
@@ -4222,9 +4510,19 @@ async def chat(
         ):
             continue
 
+        if (
+            vitamin_shots_from_supabase
+            and re.match(
+                r"(?i)^\s*(?:b12\s+vitamin\s+shot|vitamin\s+c\s+shot)\s*:",
+                content,
+            )
+        ):
+            continue
+
         context_rows.append(content)
 
     context_rows.append(live_massage_context)
+    context_rows.append(live_vitamin_context)
 
     context = "\n".join(context_rows) if context_rows else "No information available."
 
@@ -4304,6 +4602,11 @@ async def chat(
     )
 
     merged_lead = apply_dynamic_massage_details(
+        merged_lead,
+        request.message,
+    )
+
+    merged_lead = apply_dynamic_vitamin_shot_details(
         merged_lead,
         request.message,
     )
@@ -4504,6 +4807,7 @@ Locked rules:
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
 - LIVE DASHBOARD WORKING HOURS are the only authoritative opening hours. Ignore any older opening-hours text elsewhere in the business information.
 - The "Massage services (authoritative live catalogue)" block is the only authoritative source for massage names, durations, and prices. Ignore older conflicting massage text elsewhere.
+- The "Vitamin-shot services (authoritative live catalogue)" block is the only authoritative source for vitamin-shot variants, durations, and prices. Ignore older conflicting vitamin-shot text elsewhere.
 - If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. If duration is missing, ask for duration first so the backend can calculate valid alternatives. If alternatives are supplied, ask the customer to choose one first.
 - If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
 - If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
