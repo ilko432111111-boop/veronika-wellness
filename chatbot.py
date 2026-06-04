@@ -1807,6 +1807,270 @@ def format_live_ultrasound_services_context() -> tuple[str, bool]:
     return "\n".join(lines), from_supabase
 
 
+FALLBACK_BODY_TREATMENT_SERVICES = [
+    {
+        "service_name": "Body Sculpting Treatment",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 30,
+        "price_pence": 4500,
+        "aliases": [
+            "body sculpting",
+            "body sculpting treatment",
+            "sculpting treatment",
+        ],
+        "description": "One body sculpting treatment lasting 30 minutes.",
+    },
+    {
+        "service_name": "Electronic Muscle Stimulation (EMS)",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 60,
+        "price_pence": 20000,
+        "aliases": [
+            "electronic muscle stimulation",
+            "ems",
+            "muscle stimulation",
+        ],
+        "description": (
+            "One Electronic Muscle Stimulation session lasting 60 minutes."
+        ),
+    },
+]
+
+_BODY_TREATMENT_SERVICE_CACHE: dict = {
+    "loaded_at": 0.0,
+    "rows": None,
+    "from_supabase": False,
+}
+BODY_TREATMENT_SERVICE_CACHE_SECONDS = 60
+
+
+def load_body_treatment_services() -> tuple[list[dict], bool]:
+    """
+    Load Veronika's body-treatment catalogue from public.services.
+
+    If Supabase temporarily fails or the category is empty, use the fallback
+    rows so the live chatbot remains available.
+    """
+    now = time.time()
+    cached_rows = _BODY_TREATMENT_SERVICE_CACHE.get("rows")
+
+    if (
+        cached_rows is not None
+        and now - float(
+            _BODY_TREATMENT_SERVICE_CACHE.get("loaded_at") or 0
+        )
+        < BODY_TREATMENT_SERVICE_CACHE_SECONDS
+    ):
+        return (
+            cached_rows,
+            bool(_BODY_TREATMENT_SERVICE_CACHE.get("from_supabase")),
+        )
+
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "service_name, aliases, fixed_duration_minutes, "
+                "price_pence, booking_mode, description, is_active, "
+                "display_order"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("category", "body_treatments")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+
+        rows = []
+
+        for row in response.data or []:
+            service_name = str(row.get("service_name") or "").strip()
+            booking_mode = str(row.get("booking_mode") or "").strip()
+
+            if not service_name or not booking_mode:
+                continue
+
+            fixed_duration = row.get("fixed_duration_minutes")
+
+            if fixed_duration not in [None, ""]:
+                try:
+                    fixed_duration = int(fixed_duration)
+                except (TypeError, ValueError):
+                    fixed_duration = None
+
+            rows.append({
+                "service_name": service_name,
+                "aliases": list(row.get("aliases") or []),
+                "fixed_duration_minutes": fixed_duration,
+                "price_pence": row.get("price_pence"),
+                "booking_mode": booking_mode,
+                "description": str(row.get("description") or "").strip(),
+                "display_order": row.get("display_order") or 0,
+            })
+
+        if rows:
+            _BODY_TREATMENT_SERVICE_CACHE.update({
+                "loaded_at": now,
+                "rows": rows,
+                "from_supabase": True,
+            })
+            return rows, True
+
+    except Exception as error:
+        print(f"Could not load body treatments from Supabase: {error}")
+
+    fallback_rows = [
+        dict(row)
+        for row in FALLBACK_BODY_TREATMENT_SERVICES
+    ]
+
+    _BODY_TREATMENT_SERVICE_CACHE.update({
+        "loaded_at": now,
+        "rows": fallback_rows,
+        "from_supabase": False,
+    })
+
+    return fallback_rows, False
+
+
+def body_treatment_match_score(
+    treatment: str | None,
+    service: dict,
+) -> int:
+    cleaned = normalise_service_match_text(treatment)
+
+    if not cleaned:
+        return 0
+
+    padded = f" {cleaned} "
+    candidates = [
+        service.get("service_name"),
+        *(service.get("aliases") or []),
+    ]
+
+    best_score = 0
+
+    for candidate in candidates:
+        cleaned_candidate = normalise_service_match_text(candidate)
+
+        if not cleaned_candidate:
+            continue
+
+        if f" {cleaned_candidate} " in padded:
+            best_score = max(best_score, len(cleaned_candidate))
+
+    return best_score
+
+
+def find_body_treatment_service(
+    treatment: str | None,
+) -> dict | None:
+    services, _ = load_body_treatment_services()
+    matches = []
+
+    for service in services:
+        score = body_treatment_match_score(
+            treatment,
+            service,
+        )
+
+        if score:
+            matches.append((score, service))
+
+    if not matches:
+        return None
+
+    return max(matches, key=lambda item: item[0])[1]
+
+
+def apply_dynamic_body_treatment_details(
+    lead_data: dict,
+    latest_message: str,
+) -> dict:
+    """
+    Canonicalise body sculpting and EMS using public.services.
+
+    Both are fixed-duration treatments, so duration is filled automatically
+    from Supabase.
+    """
+    result = dict(lead_data)
+
+    service = (
+        find_body_treatment_service(latest_message)
+        or find_body_treatment_service(result.get("treatment"))
+    )
+
+    if not service:
+        return result
+
+    result["treatment"] = service["service_name"]
+
+    duration = format_minutes_as_duration(
+        service.get("fixed_duration_minutes")
+    )
+
+    if duration:
+        result["duration"] = duration
+
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
+
+
+def is_dynamic_body_treatment_fixed_duration(
+    treatment: str | None,
+) -> bool:
+    service = find_body_treatment_service(treatment)
+
+    return bool(
+        service
+        and service.get("booking_mode") == "fixed_duration"
+        and service.get("fixed_duration_minutes")
+    )
+
+
+def format_live_body_treatment_services_context() -> tuple[str, bool]:
+    """
+    Produce the body-treatment catalogue block sent to the LLM.
+    """
+    services, from_supabase = load_body_treatment_services()
+    lines = [
+        "Body-treatment services (authoritative live catalogue):"
+    ]
+
+    for service in services:
+        duration = format_minutes_as_duration(
+            service.get("fixed_duration_minutes")
+        )
+        price = format_price_pence(
+            service.get("price_pence")
+        )
+        details = []
+
+        if duration:
+            details.append(duration)
+
+        if price:
+            details.append(price)
+
+        if service.get("description"):
+            details.append(service["description"])
+
+        lines.append(
+            f"- {service.get('service_name')} "
+            f"[{service.get('booking_mode')}]: "
+            + "; ".join(details)
+        )
+
+    return "\n".join(lines), from_supabase
+
+
 def format_duration_options(durations: set[int]) -> str:
     ordered = sorted(durations)
 
@@ -1819,16 +2083,6 @@ def format_duration_options(durations: set[int]) -> str:
 # Services with one fixed duration. These are resolved deterministically
 # before the AI decides which booking detail to ask for next.
 FIXED_TREATMENT_DETAILS = [
-    {
-        "name": "Body Sculpting Treatment",
-        "duration": "30 minutes",
-        "aliases": ["body sculpting", "body sculpting treatment"],
-    },
-    {
-        "name": "Electronic Muscle Stimulation (EMS)",
-        "duration": "1 hour",
-        "aliases": ["electronic muscle stimulation", "ems"],
-    },
     {
         "name": "Microneedling for 1 Area (Stretch Marks)",
         "duration": "1 hour 15 minutes",
@@ -2358,6 +2612,9 @@ def remove_invalid_fixed_duration_questions(
             lead_data.get("treatment")
         )
         and not is_dynamic_ultrasound_fixed_duration(
+            lead_data.get("treatment")
+        )
+        and not is_dynamic_body_treatment_fixed_duration(
             lead_data.get("treatment")
         )
     ) or lead_data.get("duration") in [None, ""]:
@@ -3061,6 +3318,14 @@ def latest_message_selects_ultrasound_variant(
     }
 
 
+def latest_message_selects_body_treatment(
+    message: str,
+) -> bool:
+    return bool(
+        find_body_treatment_service(message)
+    )
+
+
 def latest_message_selects_vitamin_variant(
     message: str,
 ) -> bool:
@@ -3108,6 +3373,9 @@ def strip_structured_service_price_sentences(
                     "vitamin",
                     "b12",
                     "shot",
+                    "body sculpting",
+                    "ems",
+                    "muscle stimulation",
                 ]
             )
         )
@@ -3147,8 +3415,15 @@ def finalise_dynamic_service_reply(
     vitamin_service = find_vitamin_shot_service(
         lead_data.get("treatment")
     )
+    body_treatment_service = find_body_treatment_service(
+        lead_data.get("treatment")
+    )
 
-    service = ultrasound_service or vitamin_service
+    service = (
+        ultrasound_service
+        or vitamin_service
+        or body_treatment_service
+    )
 
     if not service:
         return reply
@@ -3159,6 +3434,9 @@ def finalise_dynamic_service_reply(
             latest_message
         )
         or latest_message_selects_vitamin_variant(
+            latest_message
+        )
+        or latest_message_selects_body_treatment(
             latest_message
         )
     )
@@ -5155,6 +5433,9 @@ async def chat(
     live_ultrasound_context, ultrasound_from_supabase = (
         format_live_ultrasound_services_context()
     )
+    live_body_treatment_context, body_treatments_from_supabase = (
+        format_live_body_treatment_services_context()
+    )
 
     context_rows = []
 
@@ -5195,11 +5476,22 @@ async def chat(
         ):
             continue
 
+        if (
+            body_treatments_from_supabase
+            and re.match(
+                r"(?i)^\s*(?:body\s+sculpting\s+treatment|"
+                r"electronic\s+muscle\s+stimulation\s*\(ems\))\s*:",
+                content,
+            )
+        ):
+            continue
+
         context_rows.append(content)
 
     context_rows.append(live_massage_context)
     context_rows.append(live_vitamin_context)
     context_rows.append(live_ultrasound_context)
+    context_rows.append(live_body_treatment_context)
 
     context = "\n".join(context_rows) if context_rows else "No information available."
 
@@ -5289,6 +5581,11 @@ async def chat(
     )
 
     merged_lead = apply_dynamic_ultrasound_details(
+        merged_lead,
+        request.message,
+    )
+
+    merged_lead = apply_dynamic_body_treatment_details(
         merged_lead,
         request.message,
     )
@@ -5491,6 +5788,7 @@ Locked rules:
 - The "Massage services (authoritative live catalogue)" block is the only authoritative source for massage names, durations, and prices. Ignore older conflicting massage text elsewhere.
 - The "Vitamin-shot services (authoritative live catalogue)" block is the only authoritative source for vitamin-shot variants, durations, and prices. Ignore older conflicting vitamin-shot text elsewhere.
 - The "Ultrasound services (authoritative live catalogue)" block is the only authoritative source for ultrasound options, durations, and prices. For the package, check availability for the first 45-minute session only; the therapist arranges the remaining sessions manually.
+- The "Body-treatment services (authoritative live catalogue)" block is the only authoritative source for Body Sculpting and EMS durations and prices. Ignore older conflicting body-treatment text elsewhere.
 - When listing fixed-price service options or when the customer asks how much a structured fixed-price service costs, state the price clearly before continuing the booking flow.
 - If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. If duration is missing, ask for duration first so the backend can calculate valid alternatives. If alternatives are supplied, ask the customer to choose one first.
 - If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
