@@ -815,28 +815,296 @@ def apply_latest_message_fallbacks(
     return result
 
 
-SUPPORTED_MASSAGE_DURATIONS = {
-    "relaxing massage": {30, 60, 90, 120},
-    "swedish massage": {30, 60, 90, 120},
-    "deep tissue massage": {30, 60, 90, 120},
-    "hot stone massage": {60, 90, 120},
+FALLBACK_MASSAGE_SERVICES = [
+    {
+        "service_name": "Relaxing Massage",
+        "aliases": ["relaxing massage", "relaxation massage"],
+        "allowed_durations_minutes": [30, 60, 90, 120],
+        "price_by_duration": {
+            "30": 3500,
+            "60": 5000,
+            "90": 7500,
+            "120": 9500,
+        },
+    },
+    {
+        "service_name": "Swedish Massage",
+        "aliases": ["swedish massage", "swedish"],
+        "allowed_durations_minutes": [30, 60, 90, 120],
+        "price_by_duration": {
+            "30": 3500,
+            "60": 5000,
+            "90": 7500,
+            "120": 9500,
+        },
+    },
+    {
+        "service_name": "Hot Stone Massage",
+        "aliases": ["hot stone massage", "hot stones", "hot stone"],
+        "allowed_durations_minutes": [60, 90, 120],
+        "price_by_duration": {
+            "60": 5500,
+            "90": 7500,
+            "120": 9500,
+        },
+    },
+    {
+        "service_name": "Deep Tissue Massage",
+        "aliases": ["deep tissue massage", "deep tissue", "strong massage"],
+        "allowed_durations_minutes": [30, 60, 90, 120],
+        "price_by_duration": {
+            "30": 4000,
+            "60": 5500,
+            "90": 7500,
+            "120": 9500,
+        },
+    },
+]
+
+_MASSAGE_SERVICE_CACHE: dict = {
+    "loaded_at": 0.0,
+    "rows": None,
+    "from_supabase": False,
 }
+MASSAGE_SERVICE_CACHE_SECONDS = 60
 
 
 def normalise_treatment_name(value: str | None) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
+def load_massage_services() -> tuple[list[dict], bool]:
+    """
+    Load Veronika's live massage catalogue from public.services.
+
+    Returns:
+        (rows, from_supabase)
+
+    If Supabase is temporarily unavailable or the table is empty, use a safe
+    fallback so the live chatbot does not stop working.
+    """
+    now = time.time()
+    cached_rows = _MASSAGE_SERVICE_CACHE.get("rows")
+
+    if (
+        cached_rows is not None
+        and now - float(_MASSAGE_SERVICE_CACHE.get("loaded_at") or 0)
+        < MASSAGE_SERVICE_CACHE_SECONDS
+    ):
+        return (
+            cached_rows,
+            bool(_MASSAGE_SERVICE_CACHE.get("from_supabase")),
+        )
+
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "service_name, aliases, allowed_durations_minutes, "
+                "price_by_duration, booking_mode, is_active, display_order"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("category", "massage")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+
+        rows = []
+
+        for row in response.data or []:
+            service_name = str(row.get("service_name") or "").strip()
+            durations = row.get("allowed_durations_minutes") or []
+
+            if not service_name or not durations:
+                continue
+
+            cleaned_durations = sorted({
+                int(value)
+                for value in durations
+                if str(value).isdigit() and int(value) > 0
+            })
+
+            if not cleaned_durations:
+                continue
+
+            rows.append({
+                "service_name": service_name,
+                "aliases": list(row.get("aliases") or []),
+                "allowed_durations_minutes": cleaned_durations,
+                "price_by_duration": dict(row.get("price_by_duration") or {}),
+                "booking_mode": row.get("booking_mode") or "choose_duration",
+                "display_order": row.get("display_order") or 0,
+            })
+
+        if rows:
+            _MASSAGE_SERVICE_CACHE.update({
+                "loaded_at": now,
+                "rows": rows,
+                "from_supabase": True,
+            })
+            return rows, True
+
+    except Exception as error:
+        print(f"Could not load massage services from Supabase: {error}")
+
+    fallback_rows = [dict(row) for row in FALLBACK_MASSAGE_SERVICES]
+
+    _MASSAGE_SERVICE_CACHE.update({
+        "loaded_at": now,
+        "rows": fallback_rows,
+        "from_supabase": False,
+    })
+
+    return fallback_rows, False
+
+
+def massage_service_match_score(
+    treatment: str | None,
+    service: dict,
+) -> int:
+    cleaned = normalise_service_match_text(treatment)
+
+    if not cleaned:
+        return 0
+
+    padded = f" {cleaned} "
+    candidates = [
+        service.get("service_name"),
+        *(service.get("aliases") or []),
+    ]
+
+    best_score = 0
+
+    for candidate in candidates:
+        cleaned_candidate = normalise_service_match_text(candidate)
+
+        if not cleaned_candidate:
+            continue
+
+        if f" {cleaned_candidate} " in padded:
+            best_score = max(best_score, len(cleaned_candidate))
+
+    return best_score
+
+
+def find_massage_service(
+    treatment: str | None,
+) -> dict | None:
+    services, _ = load_massage_services()
+    matches = []
+
+    for service in services:
+        score = massage_service_match_score(
+            treatment,
+            service,
+        )
+
+        if score:
+            matches.append((score, service))
+
+    if not matches:
+        return None
+
+    return max(matches, key=lambda item: item[0])[1]
+
+
 def allowed_durations_for_treatment(
     treatment: str | None,
 ) -> set[int] | None:
-    cleaned = normalise_treatment_name(treatment)
+    service = find_massage_service(treatment)
 
-    for treatment_name, durations in SUPPORTED_MASSAGE_DURATIONS.items():
-        if treatment_name in cleaned or cleaned in treatment_name:
-            return durations
+    if not service:
+        return None
 
-    return None
+    return {
+        int(value)
+        for value in service.get("allowed_durations_minutes") or []
+    }
+
+
+def apply_dynamic_massage_details(
+    lead_data: dict,
+    latest_message: str,
+) -> dict:
+    """
+    Canonicalise recognised massage names using the services table.
+
+    This keeps casual phrases such as "strong massage" or "hot stones"
+    connected to the owner-editable Supabase service row.
+    """
+    result = dict(lead_data)
+
+    service = (
+        find_massage_service(latest_message)
+        or find_massage_service(result.get("treatment"))
+    )
+
+    if not service:
+        return result
+
+    result["treatment"] = service["service_name"]
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
+
+
+def format_price_pence(value) -> str:
+    try:
+        pence = int(value)
+    except (TypeError, ValueError):
+        return ""
+
+    pounds = pence / 100
+
+    if pounds.is_integer():
+        return f"£{int(pounds)}"
+
+    return f"£{pounds:.2f}"
+
+
+def format_live_massage_services_context() -> tuple[str, bool]:
+    """
+    Produce the massage catalogue block sent to the LLM.
+
+    The Supabase services table is authoritative when available.
+    """
+    services, from_supabase = load_massage_services()
+    lines = [
+        "Massage services (authoritative live catalogue):"
+    ]
+
+    for service in services:
+        durations = service.get("allowed_durations_minutes") or []
+        prices = service.get("price_by_duration") or {}
+        duration_parts = []
+
+        for duration in durations:
+            price = format_price_pence(
+                prices.get(str(duration))
+            )
+
+            if price:
+                duration_parts.append(
+                    f"{duration} minutes for {price}"
+                )
+            else:
+                duration_parts.append(
+                    f"{duration} minutes"
+                )
+
+        lines.append(
+            f"- {service.get('service_name')}: "
+            + ", ".join(duration_parts)
+        )
+
+    return "\n".join(lines), from_supabase
 
 
 def format_duration_options(durations: set[int]) -> str:
@@ -3848,6 +4116,10 @@ async def chat(
 
     response = supabase.table("documents").select("content").execute()
 
+    live_massage_context, massage_from_supabase = (
+        format_live_massage_services_context()
+    )
+
     context_rows = []
 
     for item in response.data or []:
@@ -3858,7 +4130,20 @@ async def chat(
         if re.match(r"(?i)^\s*opening\s+hours\s*:", content):
             continue
 
+        # The structured public.services table is authoritative for massage.
+        # Prevent older free-text massage rows from conflicting with live rows.
+        if (
+            massage_from_supabase
+            and re.match(
+                r"(?i)^\s*(?:relaxing|swedish|hot\s+stone|deep\s+tissue)\s+massage\s*:",
+                content,
+            )
+        ):
+            continue
+
         context_rows.append(content)
+
+    context_rows.append(live_massage_context)
 
     context = "\n".join(context_rows) if context_rows else "No information available."
 
@@ -3933,6 +4218,11 @@ async def chat(
     )
 
     merged_lead = apply_fixed_treatment_details(
+        merged_lead,
+        request.message,
+    )
+
+    merged_lead = apply_dynamic_massage_details(
         merged_lead,
         request.message,
     )
@@ -4117,6 +4407,7 @@ Locked rules:
 - Ask naturally for only the missing details. Asking for two closely related details together is encouraged when NEXT QUESTION TARGET combines them.
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
 - LIVE DASHBOARD WORKING HOURS are the only authoritative opening hours. Ignore any older opening-hours text elsewhere in the business information.
+- The "Massage services (authoritative live catalogue)" block is the only authoritative source for massage names, durations, and prices. Ignore older conflicting massage text elsewhere.
 - If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. If duration is missing, ask for duration first so the backend can calculate valid alternatives. If alternatives are supplied, ask the customer to choose one first.
 - If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
 - If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
