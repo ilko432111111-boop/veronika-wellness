@@ -1758,6 +1758,113 @@ def remove_generated_booking_detail_questions(reply: str) -> str:
     return cleaned.strip()
 
 
+def remove_contact_detail_questions(reply: str) -> str:
+    """
+    Remove any personal-detail question generated before the schedule has been
+    settled. Contact details are collected only after an acceptable date and
+    time exist.
+    """
+    cleaned = str(reply or "")
+
+    patterns = [
+        r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i (?:have|take) your name(?: and (?:phone|contact|mobile) number)?[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide|could i take) your (?:phone|contact|mobile) number[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?could i take your name and (?:phone|contact|mobile) number[^?]*\?",
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
+def build_schedule_first_question(lead_data: dict) -> str:
+    """
+    Ask only for the unsettled schedule detail. This is deliberately separate
+    from the LLM so the booking order cannot drift.
+    """
+    duration = lead_data.get("duration")
+    preferred_date = lead_data.get("preferred_date")
+    preferred_time = lead_data.get("preferred_time")
+
+    if duration in [None, ""]:
+        allowed_durations = allowed_durations_for_treatment(
+            lead_data.get("treatment")
+        )
+
+        if allowed_durations:
+            options = format_duration_options(allowed_durations)
+
+            if preferred_date in [None, ""]:
+                return (
+                    f"How long would you like the session for: {options}, "
+                    "and which day would you prefer?"
+                )
+
+            return f"How long would you like the session for: {options}?"
+
+        return "How long would you like the session for?"
+
+    if preferred_date in [None, ""] and preferred_time in [None, ""]:
+        return "Which day and time would suit you?"
+
+    if preferred_date in [None, ""]:
+        return (
+            f"Which day did you have in mind for "
+            f"{format_customer_time(preferred_time)}?"
+        )
+
+    if preferred_time in [None, ""]:
+        return (
+            f"What time would suit you on "
+            f"{format_customer_date(preferred_date)}?"
+        )
+
+    return ""
+
+
+def enforce_schedule_before_contact(
+    reply: str,
+    lead_data: dict,
+    calendar_result: dict,
+) -> str:
+    """
+    Hard booking-order guardrail:
+    - do not ask for name or phone until date and time are settled;
+    - do not override a proper alternatives reply;
+    - append exactly one schedule question when needed.
+    """
+    if calendar_result.get("suggestions"):
+        return reply
+
+    schedule_question = build_schedule_first_question(
+        lead_data
+    )
+
+    if not schedule_question:
+        return reply
+
+    cleaned = remove_contact_detail_questions(
+        reply
+    )
+
+    cleaned = re.sub(
+        r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date|time)[^?]*\?",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
+
+    if not cleaned:
+        return schedule_question
+
+    return cleaned.rstrip() + "\n\n" + schedule_question
+
+
 def ensure_next_booking_question(
     reply: str,
     missing_fields: list[str],
@@ -3935,7 +4042,7 @@ Locked rules:
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
 - Never say the therapist will confirm shortly while any required booking detail is still missing.
-- Settle an acceptable preferred date and time before asking for the customer's name or phone number.
+- Settle an acceptable preferred date and time before asking for the customer's name or phone number. This order is mandatory.
 - If the customer rejects proposed alternative slots, ask for a different preferred day and time. Do not collect contact details yet.
 - A complete booking request requires: treatment, duration, name, phone number, preferred date, and preferred time.
 - If asked "am I booked?", answer clearly: "Not yet. The therapist still needs to confirm the appointment."
@@ -4050,6 +4157,12 @@ Reply as Receptionist:
                 missing_fields,
                 merged_lead,
             )
+
+        reply = enforce_schedule_before_contact(
+            reply,
+            merged_lead,
+            calendar_result,
+        )
 
     save_message(
         session_id=request.session_id,
