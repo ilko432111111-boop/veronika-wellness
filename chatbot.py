@@ -137,6 +137,17 @@ REQUIRED_BOOKING_FIELDS = [
 ]
 
 
+def booking_request_is_complete(lead_data: dict) -> bool:
+    """
+    A booking request is complete only when every required field is present.
+    Never trust a status label on its own.
+    """
+    return all(
+        lead_data.get(field) not in [None, ""]
+        for field in REQUIRED_BOOKING_FIELDS
+    )
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -195,10 +206,7 @@ def get_existing_conversation(session_id: str) -> dict:
 
 
 def calculate_lead_status(lead_data: dict, extracted_status: str | None) -> str:
-    complete = all(
-        lead_data.get(field) not in [None, ""]
-        for field in REQUIRED_BOOKING_FIELDS
-    )
+    complete = booking_request_is_complete(lead_data)
 
     if complete:
         return "booking_request_complete"
@@ -1550,6 +1558,14 @@ def grouped_missing_question(
 
         return f"{duration_question}, and which day would you prefer?"
 
+    if "duration" in missing and "preferred_time" in missing:
+        duration_question = canonical_missing_question(
+            "duration",
+            lead_data,
+        ).rstrip("?")
+
+        return f"{duration_question}, and what time would suit you?"
+
     if (
         "preferred_date" in missing
         and "preferred_time" in missing
@@ -1564,6 +1580,69 @@ def grouped_missing_question(
         missing_fields[0],
         lead_data,
     )
+
+
+def remove_false_handover_confirmation(
+    reply: str,
+    missing_fields: list[str],
+) -> str:
+    """
+    Never tell the customer that the therapist will confirm shortly while
+    required booking details are still missing.
+    """
+    if not missing_fields:
+        return reply
+
+    cleaned = str(reply or "")
+
+    patterns = [
+        r"(?is)(?:\s*\n\s*)?thanks[.!]?\s*the therapist will confirm the appointment shortly[.!]?",
+        r"(?is)(?:\s*\n\s*)?the therapist will confirm the appointment shortly[.!]?",
+        r"(?is)(?:\s*\n\s*)?your request has been noted[.!]?",
+        r"(?is)(?:\s*\n\s*)?the therapist still needs to confirm(?: the booking| the appointment)?[.!]?",
+        r"(?is)(?:\s*\n\s*)?i(?:'ve| have) noted your request[^.!?]*[.!]?",
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
+def ensure_calendar_alternative_question(
+    reply: str,
+    calendar_result: dict,
+) -> str:
+    """
+    If the backend supplied alternative free slots, ask the customer to pick
+    one rather than ending the conversation or asking unrelated questions.
+    """
+    if not calendar_result.get("suggestions"):
+        return reply
+
+    lower_reply = str(reply or "").lower()
+
+    if any(
+        phrase in lower_reply
+        for phrase in [
+            "would one of those suit",
+            "would any of those suit",
+            "would any of these suit",
+            "which of those",
+            "which option",
+        ]
+    ):
+        return reply
+
+    question = "Would any of those times work for you?"
+
+    if not str(reply or "").strip():
+        return question
+
+    return str(reply).rstrip() + "\n\n" + question
 
 
 def remove_generated_booking_detail_questions(reply: str) -> str:
@@ -3317,7 +3396,7 @@ async def chat(
     )
 
     if (
-        existing_before_processing.get("status") == "booking_request_complete"
+        booking_request_is_complete(existing_before_processing)
         and is_simple_acknowledgement(request.message)
     ):
         reply = "Thanks. The therapist will confirm the appointment shortly."
@@ -3522,7 +3601,10 @@ async def chat(
     )
     live_business_hours = format_live_business_hours()
 
-    if is_simple_acknowledgement(request.message) and not missing_fields:
+    if (
+        is_simple_acknowledgement(request.message)
+        and booking_request_is_complete(merged_lead)
+    ):
         reply = "Thanks. The therapist will confirm the appointment shortly."
 
         save_message(
@@ -3580,6 +3662,8 @@ Locked rules:
 - If the calendar cannot be checked, do not guess. Say the therapist will check and confirm.
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
+- Never say the therapist will confirm shortly while any required booking detail is still missing.
+- A complete booking request requires: treatment, duration, name, phone number, preferred date, and preferred time.
 - If asked "am I booked?", answer clearly: "Not yet. The therapist still needs to confirm the appointment."
 - If the customer only says "ok", "thanks", "fantastic", or a similar acknowledgement after giving all details, do not reinterpret it as booking information and do not alter the date or time. Reply briefly: "Thanks. The therapist will confirm the appointment shortly."
 - When the customer asks a side question while also providing a booking detail, answer the side question briefly and then ask for the next missing booking detail.
@@ -3665,19 +3749,26 @@ Reply as Receptionist:
         merged_lead,
     )
 
-    suppress_forced_followup = bool(
-        calendar_result.get("suggestions")
-    )
-
-    if booking_flow_active and not suppress_forced_followup:
-        reply = remove_generated_booking_detail_questions(
-            reply,
-        )
-        reply = ensure_next_booking_question(
+    if booking_flow_active:
+        reply = remove_false_handover_confirmation(
             reply,
             missing_fields,
-            merged_lead,
         )
+
+        if calendar_result.get("suggestions"):
+            reply = ensure_calendar_alternative_question(
+                reply,
+                calendar_result,
+            )
+        else:
+            reply = remove_generated_booking_detail_questions(
+                reply,
+            )
+            reply = ensure_next_booking_question(
+                reply,
+                missing_fields,
+                merged_lead,
+            )
 
     save_message(
         session_id=request.session_id,
