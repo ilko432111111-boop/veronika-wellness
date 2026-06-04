@@ -1628,6 +1628,40 @@ def format_natural_list(items: list[str]) -> str:
     return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
 
 
+def build_duration_needed_for_alternatives_reply(
+    lead_data: dict,
+    calendar_result: dict,
+) -> str:
+    """
+    Ask for duration before listing availability. This prevents vague or
+    misleading statements such as "any time before closing could work".
+    """
+    allowed_durations = allowed_durations_for_treatment(
+        lead_data.get("treatment")
+    )
+
+    if allowed_durations:
+        options = format_duration_options(allowed_durations)
+        duration_question = (
+            f"How long would you like the session for: {options}?"
+        )
+    else:
+        duration_question = "How long would you like the session for?"
+
+    requested_slot = calendar_result.get("customer_slot")
+
+    if requested_slot:
+        opening = f"{requested_slot} is unavailable."
+    else:
+        opening = "I can check the available slots for you."
+
+    return (
+        f"{opening}\n\n"
+        f"{duration_question} Once you tell me, I can check the nearest "
+        "available times before and after your requested slot."
+    )
+
+
 def build_calendar_alternative_reply(
     calendar_result: dict,
 ) -> str:
@@ -2602,6 +2636,87 @@ def find_next_available_slots(
     return suggestions
 
 
+def find_nearby_available_slots(
+    duration_minutes: int,
+    requested_start: datetime,
+) -> list[str] | None:
+    """
+    Find the nearest valid slots around the customer's requested time on the
+    same day first. If fewer than NEXT_SLOT_LIMIT are available, continue
+    searching forward using the normal calendar search.
+    """
+    now = datetime.now(BUSINESS_TIMEZONE)
+    opening_window = working_hours_for_date(requested_start.date())
+
+    if not opening_window:
+        return find_next_available_slots(
+            duration_minutes,
+            search_start=max(requested_start, now),
+        )
+
+    open_time, close_time = opening_window
+    same_day_start = max(open_time, now) if requested_start.date() == now.date() else open_time
+
+    busy_periods = query_google_freebusy(
+        same_day_start,
+        close_time,
+    )
+
+    if busy_periods is None:
+        return None
+
+    candidates = []
+    candidate = round_up_to_slot_step(same_day_start)
+
+    while candidate + timedelta(minutes=duration_minutes) <= close_time:
+        candidate_end = candidate + timedelta(minutes=duration_minutes)
+
+        if not slot_overlaps_busy_period(
+            candidate,
+            candidate_end,
+            busy_periods,
+        ):
+            candidates.append(candidate)
+
+        candidate += timedelta(minutes=SLOT_STEP_MINUTES)
+
+    candidates.sort(
+        key=lambda value: (
+            abs((value - requested_start).total_seconds()),
+            value,
+        )
+    )
+
+    suggestions = [
+        format_customer_slot(
+            value.date().isoformat(),
+            value.strftime("%H:%M"),
+        )
+        for value in candidates[:NEXT_SLOT_LIMIT]
+    ]
+
+    if len(suggestions) >= NEXT_SLOT_LIMIT:
+        return suggestions
+
+    future_search_start = max(close_time, now)
+    future_suggestions = find_next_available_slots(
+        duration_minutes,
+        search_start=future_search_start,
+    )
+
+    if future_suggestions is None:
+        return suggestions or None
+
+    for option in future_suggestions:
+        if option not in suggestions:
+            suggestions.append(option)
+
+        if len(suggestions) >= NEXT_SLOT_LIMIT:
+            break
+
+    return suggestions
+
+
 def asks_for_next_available_time(message: str) -> bool:
     lower_message = message.lower()
 
@@ -2694,6 +2809,22 @@ def check_requested_calendar_slot(
     lead_data: dict,
     latest_message: str,
 ) -> dict:
+    duration_minutes = parse_duration_minutes(
+        lead_data.get("duration")
+    )
+
+    if (
+        asks_for_next_available_time(latest_message)
+        and not duration_minutes
+    ):
+        return {
+            "status": "needs_duration_for_alternatives",
+            "message": (
+                "Ask for the treatment duration before listing slots. "
+                "Do not guess availability."
+            ),
+        }
+
     slot = build_requested_slot(lead_data)
 
     if not slot:
@@ -2755,13 +2886,20 @@ def check_requested_calendar_slot(
     )
 
     if is_busy:
-        suggestions = None
+        if not duration_minutes:
+            return {
+                "status": "busy_needs_duration",
+                "customer_slot": customer_slot,
+                "message": (
+                    f"{customer_slot} is unavailable. Ask for the duration "
+                    "before listing alternative slots."
+                ),
+            }
 
-        if duration_minutes:
-            suggestions = find_next_available_slots(
-                duration_minutes,
-                search_start=end_time,
-            )
+        suggestions = find_nearby_available_slots(
+            duration_minutes,
+            requested_start=start_time,
+        )
 
         suggestion_text = ""
 
@@ -2777,8 +2915,8 @@ def check_requested_calendar_slot(
             "suggestions": suggestions or [],
             "message": (
                 f"{customer_slot} is unavailable. "
-                "Say this once, briefly, and offer the next available "
-                "alternatives when present."
+                "Say this once, briefly, and offer the nearest available "
+                "alternatives before and after the requested slot when present."
                 + suggestion_text
             ),
         }
@@ -3696,7 +3834,7 @@ Locked rules:
 - Ask naturally for only the missing details. Asking for two closely related details together is encouraged when NEXT QUESTION TARGET combines them.
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
 - LIVE DASHBOARD WORKING HOURS are the only authoritative opening hours. Ignore any older opening-hours text elsewhere in the business information.
-- If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. Offer the supplied next available alternatives and ask the customer to choose one first.
+- If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. If duration is missing, ask for duration first so the backend can calculate valid alternatives. If alternatives are supplied, ask the customer to choose one first.
 - If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
 - If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
 - When speaking to the customer, use CUSTOMER-FACING DATE LABEL. Say "today" or "tomorrow" where appropriate. Never show an ISO date such as 2026-06-01 to the customer unless they explicitly ask for the exact date.
@@ -3800,7 +3938,15 @@ Reply as Receptionist:
             missing_fields,
         )
 
-        if calendar_result.get("suggestions"):
+        if calendar_result.get("status") in {
+            "busy_needs_duration",
+            "needs_duration_for_alternatives",
+        }:
+            reply = build_duration_needed_for_alternatives_reply(
+                merged_lead,
+                calendar_result,
+            )
+        elif calendar_result.get("suggestions"):
             reply = build_calendar_alternative_reply(
                 calendar_result,
             )
