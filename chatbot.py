@@ -355,8 +355,10 @@ def parse_relative_date_from_text(
         "december": 12,
     }
 
+    # Day-first written dates:
+    # "14 June", "14th June", "14th of June", "the 14th of June 2026"
     written_date_match = re.search(
-        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"\b(\d{1,2})(?:st|nd|rd|th)?(?:\s+of)?\s+"
         r"(january|february|march|april|may|june|july|august|"
         r"september|october|november|december)"
         r"(?:\s+(20\d{2}))?\b",
@@ -372,6 +374,55 @@ def parse_relative_date_from_text(
             parsed = datetime(year, month, day).date()
 
             if not written_date_match.group(3) and parsed < today:
+                parsed = datetime(year + 1, month, day).date()
+
+            return parsed.isoformat()
+
+        except ValueError:
+            return None
+
+    # Month-first written dates:
+    # "June 14", "June 14th", "June 14th 2026"
+    month_first_match = re.search(
+        r"\b(january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+"
+        r"(\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:\s+(20\d{2}))?\b",
+        lower_message,
+    )
+
+    if month_first_match:
+        month = months[month_first_match.group(1)]
+        day = int(month_first_match.group(2))
+        year = int(month_first_match.group(3) or today.year)
+
+        try:
+            parsed = datetime(year, month, day).date()
+
+            if not month_first_match.group(3) and parsed < today:
+                parsed = datetime(year + 1, month, day).date()
+
+            return parsed.isoformat()
+
+        except ValueError:
+            return None
+
+    # Numeric UK-style dates:
+    # "14/06", "14/06/2026", "14-06-2026"
+    numeric_date_match = re.search(
+        r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b",
+        lower_message,
+    )
+
+    if numeric_date_match:
+        day = int(numeric_date_match.group(1))
+        month = int(numeric_date_match.group(2))
+        year = int(numeric_date_match.group(3) or today.year)
+
+        try:
+            parsed = datetime(year, month, day).date()
+
+            if not numeric_date_match.group(3) and parsed < today:
                 parsed = datetime(year + 1, month, day).date()
 
             return parsed.isoformat()
@@ -4074,6 +4125,7 @@ Locked rules:
 - If a requested slot appears free, say it once briefly and clearly state that the therapist still needs to confirm.
 - Never accept an unsupported session duration. Massage durations must match the allowed options.
 - Never suggest, infer, default, or invent a specific date or time unless it comes from the customer's message or from calendar alternatives. If the customer has not supplied a date, ask for it.
+- Treat explicit customer dates such as "14th of June", "14 June", "June 14th", and "14/06" as valid dates. Do not ask for the day again after one of these has been supplied.
 - If the calendar cannot be checked, do not guess. Say the therapist will check and confirm.
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
