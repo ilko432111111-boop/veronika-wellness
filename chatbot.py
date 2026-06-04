@@ -106,6 +106,13 @@ INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET")
 INSTAGRAM_VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN")
 INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v25.0")
 
+# Instagram session and moderation safeguards.
+# A completed or stale Instagram conversation starts a fresh lead session.
+INSTAGRAM_SESSION_IDLE_HOURS = 12
+INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES = 16
+INSTAGRAM_MAX_MESSAGES_PER_DAY = 80
+INSTAGRAM_RATE_LIMIT_NOTICE_COOLDOWN_MINUTES = 60
+
 SLOT_STEP_MINUTES = 30
 NEXT_SLOT_LIMIT = 3
 NEXT_SLOT_SEARCH_DAYS = 7
@@ -274,21 +281,95 @@ def normalise_preferred_date(value: str | None) -> str | None:
     return cleaned
 
 
-def next_weekday_date(target_weekday: int):
+def next_weekday_date(
+    target_weekday: int,
+    reference_date=None,
+    force_next_week: bool = False,
+):
+    """
+    Resolve weekday requests in context.
+    If the customer is already discussing a future week, keep later weekday
+    changes inside that same week where possible.
+    """
     today = datetime.now(BUSINESS_TIMEZONE).date()
-    days_ahead = (target_weekday - today.weekday()) % 7
-    return today + timedelta(days=days_ahead)
+    anchor = reference_date or today
+
+    if force_next_week:
+        start_of_next_week = today + timedelta(days=(7 - today.weekday()))
+        return start_of_next_week + timedelta(days=target_weekday)
+
+    days_ahead = (target_weekday - anchor.weekday()) % 7
+
+    # If there is no future reference and the customer names today after the
+    # day has already begun, keep the date resolver simple. Working-hours logic
+    # later decides whether the slot is still usable.
+    return anchor + timedelta(days=days_ahead)
 
 
-def parse_relative_date_from_text(message: str) -> str | None:
-    lower_message = message.lower()
+def parse_relative_date_from_text(
+    message: str,
+    reference_date: str | None = None,
+) -> str | None:
+    lower_message = str(message or "").lower()
     today = datetime.now(BUSINESS_TIMEZONE).date()
+
+    reference = None
+
+    if reference_date:
+        try:
+            reference = datetime.fromisoformat(str(reference_date)).date()
+        except ValueError:
+            reference = None
 
     if re.search(r"\btoday\b", lower_message):
         return today.isoformat()
 
     if re.search(r"\btomorrow\b", lower_message):
         return (today + timedelta(days=1)).isoformat()
+
+    iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", lower_message)
+
+    if iso_match:
+        return iso_match.group(1)
+
+    months = {
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+
+    written_date_match = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)"
+        r"(?:\s+(20\d{2}))?\b",
+        lower_message,
+    )
+
+    if written_date_match:
+        day = int(written_date_match.group(1))
+        month = months[written_date_match.group(2)]
+        year = int(written_date_match.group(3) or today.year)
+
+        try:
+            parsed = datetime(year, month, day).date()
+
+            if not written_date_match.group(3) and parsed < today:
+                parsed = datetime(year + 1, month, day).date()
+
+            return parsed.isoformat()
+
+        except ValueError:
+            return None
 
     weekdays = {
         "monday": 0,
@@ -302,35 +383,40 @@ def parse_relative_date_from_text(message: str) -> str | None:
 
     for weekday_name, weekday_number in weekdays.items():
         if re.search(rf"\bnext\s+week\s+{weekday_name}\b", lower_message):
-            start_of_next_week = today + timedelta(days=(7 - today.weekday()))
-            return (start_of_next_week + timedelta(days=weekday_number)).isoformat()
+            return next_weekday_date(
+                weekday_number,
+                force_next_week=True,
+            ).isoformat()
+
+    for weekday_name, weekday_number in weekdays.items():
+        if re.search(rf"\bnext\s+{weekday_name}\b", lower_message):
+            resolved = next_weekday_date(
+                weekday_number,
+                reference_date=today + timedelta(days=1),
+            )
+
+            if resolved <= today:
+                resolved += timedelta(days=7)
+
+            return resolved.isoformat()
 
     for weekday_name, weekday_number in weekdays.items():
         if re.search(rf"\b{weekday_name}\b", lower_message):
-            return next_weekday_date(weekday_number).isoformat()
+            anchor = reference if reference and reference >= today else today
 
-    iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", message)
-
-    if iso_match:
-        return iso_match.group(1)
+            return next_weekday_date(
+                weekday_number,
+                reference_date=anchor,
+            ).isoformat()
 
     return None
 
 
 def parse_time_from_text(message: str) -> str | None:
-    lower_message = message.lower()
+    lower_message = str(message or "").lower()
 
-    twenty_four_hour_match = re.search(
-        r"\b(?:at\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b",
-        lower_message,
-    )
-
-    if twenty_four_hour_match:
-        return (
-            f"{int(twenty_four_hour_match.group(1)):02d}:"
-            f"{twenty_four_hour_match.group(2)}"
-        )
-
+    # Parse explicit am/pm first. Previously "1.30 pm" was incorrectly caught
+    # by the 24-hour pattern and stored as 01:30.
     am_pm_match = re.search(
         r"\b(?:at\s*)?(1[0-2]|0?[1-9])(?:[:.]([0-5]\d))?\s*(am|pm)\b",
         lower_message,
@@ -345,6 +431,22 @@ def parse_time_from_text(message: str) -> str | None:
             hour += 12
         elif suffix == "am" and hour == 12:
             hour = 0
+
+        return f"{hour:02d}:{minute}"
+
+    twenty_four_hour_match = re.search(
+        r"\b(?:at\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b",
+        lower_message,
+    )
+
+    if twenty_four_hour_match:
+        hour = int(twenty_four_hour_match.group(1))
+        minute = twenty_four_hour_match.group(2)
+
+        # For daytime appointment businesses, an ambiguous "1.30" normally
+        # means 13:30 rather than 01:30. Explicit am/pm always overrides this.
+        if 1 <= hour <= 7:
+            hour += 12
 
         return f"{hour:02d}:{minute}"
 
@@ -484,7 +586,10 @@ def normalise_misplaced_preferred_fields(
         result["preferred_time"] = misplaced_time
         result["preferred_date"] = None
 
-    latest_date = parse_relative_date_from_text(latest_message)
+    latest_date = parse_relative_date_from_text(
+        latest_message,
+        reference_date=result.get("preferred_date"),
+    )
     latest_time = parse_time_from_text(latest_message)
 
     if latest_date:
@@ -575,7 +680,10 @@ def apply_latest_message_fallbacks(
         result.get("preferred_date")
     )
 
-    latest_date = parse_relative_date_from_text(latest_message)
+    latest_date = parse_relative_date_from_text(
+        latest_message,
+        reference_date=result.get("preferred_date"),
+    )
     latest_time = parse_time_from_text(latest_message)
     latest_phone = parse_phone_from_text(latest_message)
 
@@ -1048,10 +1156,11 @@ def validate_slot_against_working_hours(
 
     if not opening_window:
         return {
-            "status": "outside_hours",
+            "status": "closed_day",
+            "clear_date": True,
             "message": (
-                f"{format_customer_date(start_time.date().isoformat())} is outside working hours. "
-                "Ask the customer for another preferred time."
+                f"{format_customer_date(start_time.date().isoformat())} is closed. "
+                "Offer the next available alternatives and ask which one suits the customer."
             ),
         }
 
@@ -1096,7 +1205,10 @@ def preserve_existing_booking_details(
     lower_latest = latest_message.lower()
     lower_previous = previous_assistant_message.lower()
 
-    explicit_date = parse_relative_date_from_text(latest_message)
+    explicit_date = parse_relative_date_from_text(
+        latest_message,
+        reference_date=existing.get("preferred_date"),
+    )
     explicit_time = parse_time_from_text(latest_message)
     explicit_phone = parse_phone_from_text(latest_message)
     explicit_duration = parse_duration_minutes(latest_message)
@@ -1262,6 +1374,36 @@ def remove_invalid_today_time_questions(
 
     for pattern in patterns:
         cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
+def remove_redundant_confirmed_field_questions(
+    reply: str,
+    lead_data: dict,
+) -> str:
+    """
+    Do not ask for a date or time that the customer already supplied and the
+    backend accepted.
+    """
+    cleaned = str(reply or "")
+
+    if lead_data.get("preferred_time") not in [None, ""]:
+        cleaned = re.sub(
+            r"(?is)(?:\s*\n\s*)?(?:which|what) time[^?]*\?",
+            "",
+            cleaned,
+        )
+
+    if lead_data.get("preferred_date") not in [None, ""]:
+        cleaned = re.sub(
+            r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date)[^?]*\?",
+            "",
+            cleaned,
+        )
 
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r" {2,}", " ", cleaned)
@@ -1928,9 +2070,12 @@ def refresh_google_access_token() -> str | None:
 def load_business_hours() -> dict:
     """
     Read editable working hours from Supabase.
-    Fall back to safe defaults if the table cannot be read.
+
+    The dashboard table is authoritative. Missing rows and closed rows are
+    treated as unavailable. Do not silently fall back to hardcoded hours,
+    because that could offer a slot on a day the owner deliberately closed.
     """
-    hours = dict(DEFAULT_BUSINESS_HOURS)
+    hours = {day: None for day in range(7)}
 
     try:
         response = (
@@ -1941,10 +2086,7 @@ def load_business_hours() -> dict:
             .execute()
         )
 
-        if not response.data:
-            return hours
-
-        for row in response.data:
+        for row in response.data or []:
             day = row.get("day_of_week")
 
             if day not in range(7):
@@ -1980,9 +2122,50 @@ def load_business_hours() -> dict:
                 continue
 
     except Exception as error:
-        print(f"Could not load business hours: {error}")
+        print(f"Could not load live business hours: {error}")
 
     return hours
+
+
+def format_live_business_hours() -> str:
+    labels = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+
+    hours = load_business_hours()
+    lines = []
+
+    for day_number, label in enumerate(labels):
+        value = hours.get(day_number)
+
+        if not value:
+            lines.append(f"- {label}: Closed")
+            continue
+
+        open_value, close_value = value
+
+        if isinstance(open_value, tuple):
+            open_hour, open_minute = open_value
+        else:
+            open_hour, open_minute = open_value, 0
+
+        if isinstance(close_value, tuple):
+            close_hour, close_minute = close_value
+        else:
+            close_hour, close_minute = close_value, 0
+
+        lines.append(
+            f"- {label}: {open_hour:02d}:{open_minute:02d}–"
+            f"{close_hour:02d}:{close_minute:02d}"
+        )
+
+    return "\n".join(lines)
 
 
 def parse_duration_minutes(value: str | None) -> int | None:
@@ -2264,6 +2447,35 @@ def should_surface_calendar_result(
     )
 
 
+def add_calendar_alternatives(
+    result: dict,
+    duration_minutes: int | None,
+    search_start: datetime,
+) -> dict:
+    """
+    Attach the next genuinely available dashboard-and-calendar slots after an
+    unavailable request. These suggestions are safe to show to the customer.
+    """
+    if not duration_minutes:
+        return result
+
+    suggestions = find_next_available_slots(
+        duration_minutes,
+        search_start=max(search_start, datetime.now(BUSINESS_TIMEZONE)),
+    )
+
+    if suggestions:
+        result["suggestions"] = suggestions
+        result["message"] = (
+            result.get("message", "").rstrip()
+            + " Suggested alternatives: "
+            + "; ".join(suggestions)
+            + ". Ask whether one of these works."
+        )
+
+    return result
+
+
 def check_requested_calendar_slot(
     lead_data: dict,
     latest_message: str,
@@ -2286,13 +2498,17 @@ def check_requested_calendar_slot(
     )
 
     if end_time <= datetime.now(BUSINESS_TIMEZONE):
-        return {
-            "status": "past",
-            "message": (
-                "The requested time is in the past. "
-                "Ask for a future preferred time."
-            ),
-        }
+        return add_calendar_alternatives(
+            {
+                "status": "past",
+                "message": (
+                    "The requested time has already passed. "
+                    "Offer the next available alternatives."
+                ),
+            },
+            duration_minutes,
+            datetime.now(BUSINESS_TIMEZONE),
+        )
 
     working_hours_error = validate_slot_against_working_hours(
         start_time,
@@ -2301,7 +2517,11 @@ def check_requested_calendar_slot(
     )
 
     if working_hours_error:
-        return working_hours_error
+        return add_calendar_alternatives(
+            working_hours_error,
+            duration_minutes,
+            start_time,
+        )
 
     busy_periods = query_google_freebusy(start_time, end_time)
 
@@ -2340,10 +2560,11 @@ def check_requested_calendar_slot(
 
         return {
             "status": "busy",
+            "suggestions": suggestions or [],
             "message": (
                 f"{customer_slot} is unavailable. "
-                "Say this once, briefly, and ask whether another preferred "
-                "time would suit the customer."
+                "Say this once, briefly, and offer the next available "
+                "alternatives when present."
                 + suggestion_text
             ),
         }
@@ -2512,6 +2733,164 @@ def send_instagram_text_message(
 
 
 _processed_instagram_message_ids: set[str] = set()
+_instagram_rate_limit_notice_sent_at: dict[str, datetime] = {}
+
+
+def new_instagram_session_id(sender_id: str) -> str:
+    return f"instagram:{sender_id}:{secrets.token_urlsafe(8)}"
+
+
+def get_latest_instagram_conversation(sender_id: str) -> dict:
+    try:
+        response = (
+            supabase.table("conversations")
+            .select("*")
+            .eq("source", "instagram")
+            .like("session_id", f"instagram:{sender_id}%")
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        print(f"Could not load latest Instagram conversation: {error}")
+
+    return {}
+
+
+def instagram_session_is_stale(conversation: dict) -> bool:
+    updated_at = conversation.get("updated_at")
+
+    if not updated_at:
+        return True
+
+    try:
+        updated = datetime.fromisoformat(
+            str(updated_at).replace("Z", "+00:00")
+        )
+
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+
+        return (
+            datetime.now(timezone.utc) - updated.astimezone(timezone.utc)
+            > timedelta(hours=INSTAGRAM_SESSION_IDLE_HOURS)
+        )
+
+    except ValueError:
+        return True
+
+
+def resolve_instagram_session(
+    sender_id: str,
+    latest_message: str,
+) -> tuple[str, dict | None]:
+    """
+    Continue a recent incomplete Instagram lead. Start fresh after a completed
+    request or long inactivity so old booking details do not leak into a new
+    enquiry.
+    """
+    latest = get_latest_instagram_conversation(sender_id)
+
+    if not latest:
+        return new_instagram_session_id(sender_id), None
+
+    if (
+        latest.get("status") == "booking_request_complete"
+        and not is_simple_acknowledgement(latest_message)
+    ):
+        return new_instagram_session_id(sender_id), latest
+
+    if instagram_session_is_stale(latest):
+        return new_instagram_session_id(sender_id), latest
+
+    return str(latest.get("session_id")), None
+
+
+def format_previous_instagram_request_summary(conversation: dict) -> str:
+    treatment = conversation.get("treatment") or "your previous treatment request"
+    duration = conversation.get("duration")
+    preferred_date = format_customer_date(conversation.get("preferred_date"))
+    preferred_time = format_customer_time(conversation.get("preferred_time"))
+
+    details = [str(treatment)]
+
+    if duration:
+        details.append(str(duration))
+
+    if conversation.get("preferred_date") and conversation.get("preferred_time"):
+        details.append(f"{preferred_date} at {preferred_time}")
+
+    return (
+        "Your previous request for "
+        + ", ".join(details)
+        + " has been noted, and the therapist still needs to confirm it."
+    )
+
+
+def count_recent_instagram_customer_messages(
+    sender_id: str,
+    since: datetime,
+    limit: int,
+) -> int:
+    try:
+        response = (
+            supabase.table("messages")
+            .select("session_id")
+            .eq("source", "instagram")
+            .eq("role", "user")
+            .like("session_id", f"instagram:{sender_id}%")
+            .gte("created_at", since.astimezone(timezone.utc).isoformat())
+            .limit(limit + 1)
+            .execute()
+        )
+
+        return len(response.data or [])
+
+    except Exception as error:
+        print(f"Could not count recent Instagram messages: {error}")
+        return 0
+
+
+def instagram_rate_limit_message(sender_id: str) -> str | None:
+    now = datetime.now(timezone.utc)
+
+    ten_minute_count = count_recent_instagram_customer_messages(
+        sender_id,
+        now - timedelta(minutes=10),
+        INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES,
+    )
+
+    day_count = count_recent_instagram_customer_messages(
+        sender_id,
+        now - timedelta(days=1),
+        INSTAGRAM_MAX_MESSAGES_PER_DAY,
+    )
+
+    if (
+        ten_minute_count < INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES
+        and day_count < INSTAGRAM_MAX_MESSAGES_PER_DAY
+    ):
+        return None
+
+    last_notice = _instagram_rate_limit_notice_sent_at.get(sender_id)
+
+    if (
+        last_notice
+        and now - last_notice
+        < timedelta(minutes=INSTAGRAM_RATE_LIMIT_NOTICE_COOLDOWN_MINUTES)
+    ):
+        return ""
+
+    _instagram_rate_limit_notice_sent_at[sender_id] = now
+
+    return (
+        "You've sent quite a few messages. Please wait a little while before "
+        "sending more, or call 07943319617 if your enquiry is urgent."
+    )
 
 
 def mark_instagram_message_seen(message_id: str) -> bool:
@@ -2559,7 +2938,22 @@ def process_instagram_webhook_payload(payload: dict):
             if not mark_instagram_message_seen(message_id):
                 continue
 
-            session_id = f"instagram:{sender_id}"
+            rate_limit_reply = instagram_rate_limit_message(sender_id)
+
+            if rate_limit_reply is not None:
+                if rate_limit_reply:
+                    send_instagram_text_message(
+                        recipient_id=sender_id,
+                        text=rate_limit_reply,
+                    )
+
+                continue
+
+            session_id, previous_conversation = resolve_instagram_session(
+                sender_id,
+                message_text,
+            )
+
             history = load_recent_messages(session_id)
 
             request = ChatRequest(
@@ -2570,11 +2964,52 @@ def process_instagram_webhook_payload(payload: dict):
             )
 
             try:
-                response = asyncio.run(
-                    chat(request, BackgroundTasks())
-                )
+                # If a prior request is already complete and the returning
+                # customer only says hello, provide a concise summary and ask
+                # whether they need anything else instead of reusing old lead
+                # details or restarting an unnecessary form.
+                if (
+                    previous_conversation
+                    and re.sub(r"[^a-z]+", " ", message_text.lower()).strip()
+                    in {"hi", "hello", "hey", "hiya", "good morning", "good afternoon"}
+                ):
+                    reply = (
+                        format_previous_instagram_request_summary(
+                            previous_conversation
+                        )
+                        + " Is there anything else I can help with, such as "
+                        "booking another treatment?"
+                    )
 
-                reply = response.get("reply")
+                    save_message(
+                        session_id=session_id,
+                        role="user",
+                        content=message_text,
+                        source="instagram",
+                    )
+
+                    save_message(
+                        session_id=session_id,
+                        role="assistant",
+                        content=reply,
+                        source="instagram",
+                    )
+
+                else:
+                    response = asyncio.run(
+                        chat(request, BackgroundTasks())
+                    )
+
+                    reply = response.get("reply")
+
+                    if previous_conversation and reply:
+                        reply = (
+                            format_previous_instagram_request_summary(
+                                previous_conversation
+                            )
+                            + "\n\n"
+                            + reply
+                        )
 
                 if reply:
                     send_instagram_text_message(
@@ -2808,9 +3243,19 @@ async def chat(
 
     response = supabase.table("documents").select("content").execute()
 
-    context = "\n".join([
-        item["content"] for item in response.data
-    ]) if response.data else "No information available."
+    context_rows = []
+
+    for item in response.data or []:
+        content = str(item.get("content") or "")
+
+        # Dashboard hours are authoritative. Ignore old free-text opening-hours
+        # rows so they cannot override live owner settings.
+        if re.match(r"(?i)^\s*opening\s+hours\s*:", content):
+            continue
+
+        context_rows.append(content)
+
+    context = "\n".join(context_rows) if context_rows else "No information available."
 
     history_lines = [
         f"{msg.role}: {msg.content}"
@@ -2937,10 +3382,15 @@ async def chat(
 
     if calendar_result.get("status") in {
         "outside_hours",
+        "closed_day",
         "past",
         "busy",
     }:
         merged_lead["preferred_time"] = None
+
+        if calendar_result.get("clear_date"):
+            merged_lead["preferred_date"] = None
+
         merged_lead["status"] = "details_incomplete"
         merged_lead["notification_sent_at"] = None
 
@@ -2974,6 +3424,7 @@ async def chat(
     customer_date_label = format_customer_date(
         merged_lead.get("preferred_date")
     )
+    live_business_hours = format_live_business_hours()
 
     if is_simple_acknowledgement(request.message) and not missing_fields:
         reply = "Thanks. The therapist will confirm the appointment shortly."
@@ -3021,6 +3472,9 @@ Locked rules:
 - Never ask again for any detail listed under CONFIRMED CUSTOMER DETAILS.
 - Ask naturally for only the missing details. Ask for no more than two missing details in one reply.
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
+- LIVE DASHBOARD WORKING HOURS are the only authoritative opening hours. Ignore any older opening-hours text elsewhere in the business information.
+- If the requested day is closed, do not ask for another time on that same day. Offer the supplied next available alternatives and ask whether one suits the customer.
+- If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
 - If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
 - When speaking to the customer, use CUSTOMER-FACING DATE LABEL. Say "today" or "tomorrow" where appropriate. Never show an ISO date such as 2026-06-01 to the customer unless they explicitly ask for the exact date.
 - If a requested slot is busy, outside working hours, or in the past, say it once briefly and ask for another preferred time. Never treat that time as accepted.
@@ -3072,6 +3526,9 @@ CUSTOMER-FACING DATE LABEL:
 CALENDAR AVAILABILITY RESULT:
 {calendar_context}
 
+LIVE DASHBOARD WORKING HOURS:
+{live_business_hours}
+
 Business information:
 {context}
 
@@ -3107,8 +3564,16 @@ Reply as Receptionist:
         reply,
         today_is_unavailable,
     )
+    reply = remove_redundant_confirmed_field_questions(
+        reply,
+        merged_lead,
+    )
 
-    if booking_flow_active:
+    suppress_forced_followup = bool(
+        calendar_result.get("suggestions")
+    )
+
+    if booking_flow_active and not suppress_forced_followup:
         reply = ensure_next_booking_question(
             reply,
             missing_fields,
