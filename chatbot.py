@@ -1583,7 +1583,7 @@ def grouped_missing_question(
         return "Which day and time would you prefer?"
 
     if "name" in missing and "phone" in missing:
-        return "Could I take your name and phone number, please?"
+        return "Could I take your name and phone number, please to proceed with the handover?"
 
     return canonical_missing_question(
         missing_fields[0],
