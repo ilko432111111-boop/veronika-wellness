@@ -520,14 +520,14 @@ def conversation_has_booking_intent(
     conversation_history: str,
     latest_message: str,
     previous_assistant_message: str,
-    existing_lead: dict,
+    current_lead: dict,
 ) -> bool:
     """
     Start the booking-detail flow only when the customer actually indicates
     that they want an appointment. Asking for information about a treatment is
     not enough.
     """
-    if existing_lead.get("status") in {
+    if current_lead.get("status") in {
         "details_incomplete",
         "booking_request_complete",
     }:
@@ -559,8 +559,9 @@ def conversation_has_booking_intent(
         return True
 
     # Voluntarily providing a date or time while a treatment is already known
-    # is also a clear sign that the customer wants to arrange an appointment.
-    if existing_lead.get("treatment") and (
+    # in the current message or saved lead is also a clear sign that the
+    # customer wants to arrange an appointment.
+    if current_lead.get("treatment") and (
         parse_relative_date_from_text(latest_message)
         or parse_time_from_text(latest_message)
     ):
@@ -1610,6 +1611,50 @@ def remove_false_handover_confirmation(
     cleaned = re.sub(r" {2,}", " ", cleaned)
 
     return cleaned.strip()
+
+
+def format_natural_list(items: list[str]) -> str:
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+
+    if not cleaned:
+        return ""
+
+    if len(cleaned) == 1:
+        return cleaned[0]
+
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} or {cleaned[1]}"
+
+    return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
+
+
+def build_calendar_alternative_reply(
+    calendar_result: dict,
+) -> str:
+    """
+    Render alternative availability directly in Python.
+    Do not let the LLM continue collecting contact details until the customer
+    chooses one of the proposed replacement slots.
+    """
+    suggestions = calendar_result.get("suggestions") or []
+
+    if not suggestions:
+        return ""
+
+    options = format_natural_list(suggestions)
+    status = calendar_result.get("status")
+
+    if status == "closed_day":
+        opening = "That day is closed."
+    elif status == "past":
+        opening = "That time has already passed."
+    else:
+        opening = "That time is unavailable."
+
+    return (
+        f"{opening} The next available options are {options}.\n\n"
+        "Would any of those times work for you?"
+    )
 
 
 def ensure_calendar_alternative_question(
@@ -3487,7 +3532,7 @@ async def chat(
         conversation_history,
         request.message,
         previous_assistant_message,
-        existing_lead,
+        merged_lead,
     )
 
     merged_lead, today_is_unavailable = clear_expired_same_day_preference(
@@ -3651,7 +3696,7 @@ Locked rules:
 - Ask naturally for only the missing details. Asking for two closely related details together is encouraged when NEXT QUESTION TARGET combines them.
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
 - LIVE DASHBOARD WORKING HOURS are the only authoritative opening hours. Ignore any older opening-hours text elsewhere in the business information.
-- If the requested day is closed, do not ask for another time on that same day. Offer the supplied next available alternatives and ask whether one suits the customer.
+- If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. Offer the supplied next available alternatives and ask the customer to choose one first.
 - If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
 - If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
 - When speaking to the customer, use CUSTOMER-FACING DATE LABEL. Say "today" or "tomorrow" where appropriate. Never show an ISO date such as 2026-06-01 to the customer unless they explicitly ask for the exact date.
@@ -3756,8 +3801,7 @@ Reply as Receptionist:
         )
 
         if calendar_result.get("suggestions"):
-            reply = ensure_calendar_alternative_question(
-                reply,
+            reply = build_calendar_alternative_reply(
                 calendar_result,
             )
         else:
