@@ -109,7 +109,7 @@ INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v25.0")
 # Instagram session and moderation safeguards.
 # A completed or stale Instagram conversation starts a fresh lead session.
 INSTAGRAM_SESSION_IDLE_HOURS = 12
-INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES = 16
+INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES = 12
 INSTAGRAM_MAX_MESSAGES_PER_DAY = 80
 INSTAGRAM_RATE_LIMIT_NOTICE_COOLDOWN_MINUTES = 60
 
@@ -607,6 +607,47 @@ def normalise_misplaced_preferred_fields(
     result["preferred_date"] = normalise_preferred_date(
         result.get("preferred_date")
     )
+
+    return result
+
+
+def apply_authoritative_schedule_fields(
+    lead_data: dict,
+    existing_lead: dict,
+    latest_message: str,
+) -> dict:
+    """
+    Date and time must come from the customer, not from model inference.
+
+    Preserve a previously accepted value from the saved conversation row.
+    Replace it only when the latest customer message explicitly supplies a
+    new date or time. If no accepted value exists and the latest message does
+    not contain one, clear any value invented by extraction.
+    """
+    result = dict(lead_data)
+
+    existing_date = existing_lead.get("preferred_date")
+    existing_time = existing_lead.get("preferred_time")
+
+    latest_date = parse_relative_date_from_text(
+        latest_message,
+        reference_date=existing_date,
+    )
+    latest_time = parse_time_from_text(latest_message)
+
+    if latest_date:
+        result["preferred_date"] = latest_date
+    elif existing_date not in [None, ""]:
+        result["preferred_date"] = existing_date
+    else:
+        result["preferred_date"] = None
+
+    if latest_time:
+        result["preferred_time"] = latest_time
+    elif existing_time not in [None, ""]:
+        result["preferred_time"] = existing_time
+    else:
+        result["preferred_time"] = None
 
     return result
 
@@ -1491,27 +1532,86 @@ def reply_already_asks_for_field(reply: str, field: str) -> bool:
     return any(marker in lower_reply for marker in markers.get(field, []))
 
 
+def grouped_missing_question(
+    missing_fields: list[str],
+    lead_data: dict,
+) -> str:
+    """
+    Ask for up to two closely related details in one natural question.
+    This keeps the flow efficient without turning the chat into a long form.
+    """
+    missing = set(missing_fields)
+
+    if "duration" in missing and "preferred_date" in missing:
+        duration_question = canonical_missing_question(
+            "duration",
+            lead_data,
+        ).rstrip("?")
+
+        return f"{duration_question}, and which day would you prefer?"
+
+    if (
+        "preferred_date" in missing
+        and "preferred_time" in missing
+        and "duration" not in missing
+    ):
+        return "Which day and time would you prefer?"
+
+    if "name" in missing and "phone" in missing:
+        return "Could I take your name and phone number, please?"
+
+    return canonical_missing_question(
+        missing_fields[0],
+        lead_data,
+    )
+
+
+def remove_generated_booking_detail_questions(reply: str) -> str:
+    """
+    Strip any booking-detail question produced by the model. The backend adds
+    one clean deterministic grouped question afterwards, preventing repeated
+    or out-of-order questions.
+    """
+    cleaned = str(reply or "")
+
+    patterns = [
+        r"(?is)(?:\s*\n\s*)?(?:which|what) treatment[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:how long|what duration|which duration)[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i (?:have|take) your name[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide|could i take) your (?:phone|contact|mobile) number[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date)[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:which|what) time[^?]*\?",
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
 def ensure_next_booking_question(
     reply: str,
     missing_fields: list[str],
     lead_data: dict,
 ) -> str:
     """
-    When a customer asks a side question while booking, answer it and still
-    continue the lead flow. Example: "10:30, is there parking?"
+    Add exactly one clean follow-up question after the model answers.
     """
     if not missing_fields:
         return reply
 
-    next_field = missing_fields[0]
-
-    if reply_already_asks_for_field(reply, next_field):
-        return reply
-
-    return reply.rstrip() + "\n\n" + canonical_missing_question(
-        next_field,
+    question = grouped_missing_question(
+        missing_fields,
         lead_data,
     )
+
+    if not reply.strip():
+        return question
+
+    return reply.rstrip() + "\n\n" + question
 
 
 def save_conversation_overview(
@@ -1677,24 +1777,14 @@ def build_next_question_hint(
             "reply briefly: Thanks. The therapist will confirm the appointment shortly."
         )
 
-    next_field = missing_fields[0]
+    question = grouped_missing_question(
+        missing_fields,
+        lead_data,
+    )
 
-    questions = {
-        "treatment": "Ask only which treatment they would like.",
-        "duration": (
-            "Ask only about the valid treatment option or duration. "
-            "Never suggest massage durations for a non-massage treatment. "
-            + canonical_missing_question("duration", lead_data)
-        ),
-        "name": "Ask only for their name.",
-        "phone": "Ask only for their phone number.",
-        "preferred_date": "Ask only which date they would prefer.",
-        "preferred_time": "Ask only which time they would prefer.",
-    }
-
-    return questions.get(
-        next_field,
-        "Ask only for the next missing booking detail."
+    return (
+        "Ask this concise follow-up question after answering any customer "
+        f"question: {question}"
     )
 
 
@@ -3308,6 +3398,12 @@ async def chat(
         request.message,
     )
 
+    merged_lead = apply_authoritative_schedule_fields(
+        merged_lead,
+        existing_lead,
+        request.message,
+    )
+
     booking_flow_active = conversation_has_booking_intent(
         conversation_history,
         request.message,
@@ -3458,7 +3554,7 @@ Locked rules:
 - Keep replies extremely concise and natural. Usually use one short sentence. Use two only when necessary.
 - Answer the customer's question first.
 - If BOOKING FLOW ACTIVE says No, treat the message as an informational enquiry. Do not ask for the customer's name, phone number, preferred date, preferred time, or duration. You may briefly ask whether they would like to book only when it feels natural.
-- If BOOKING FLOW ACTIVE says Yes, ask only for the single next missing booking detail.
+- If BOOKING FLOW ACTIVE says Yes, follow NEXT QUESTION TARGET. It may combine up to two closely related missing details in one concise question when sensible.
 - Follow NEXT QUESTION TARGET closely.
 - Do not repeat a treatment name immediately after the customer has just chosen it unless clarification is genuinely needed.
 - Do not repeat prices, dates, times, durations, or availability unless the customer asks or the information has changed.
@@ -3470,7 +3566,7 @@ Locked rules:
 - Use the conversation history to understand short replies.
 - Do not ask the customer to repeat information they already gave.
 - Never ask again for any detail listed under CONFIRMED CUSTOMER DETAILS.
-- Ask naturally for only the missing details. Ask for no more than two missing details in one reply.
+- Ask naturally for only the missing details. Asking for two closely related details together is encouraged when NEXT QUESTION TARGET combines them.
 - Follow the CALENDAR AVAILABILITY RESULT exactly.
 - LIVE DASHBOARD WORKING HOURS are the only authoritative opening hours. Ignore any older opening-hours text elsewhere in the business information.
 - If the requested day is closed, do not ask for another time on that same day. Offer the supplied next available alternatives and ask whether one suits the customer.
@@ -3480,7 +3576,7 @@ Locked rules:
 - If a requested slot is busy, outside working hours, or in the past, say it once briefly and ask for another preferred time. Never treat that time as accepted.
 - If a requested slot appears free, say it once briefly and clearly state that the therapist still needs to confirm.
 - Never accept an unsupported session duration. Massage durations must match the allowed options.
-- Never suggest or invent a specific date or time unless it comes from the customer's message or from calendar alternatives.
+- Never suggest, infer, default, or invent a specific date or time unless it comes from the customer's message or from calendar alternatives. If the customer has not supplied a date, ask for it.
 - If the calendar cannot be checked, do not guess. Say the therapist will check and confirm.
 - Never reveal private calendar event details.
 - Never say a booking is confirmed, reserved, or completed.
@@ -3574,6 +3670,9 @@ Reply as Receptionist:
     )
 
     if booking_flow_active and not suppress_forced_followup:
+        reply = remove_generated_booking_detail_questions(
+            reply,
+        )
         reply = ensure_next_booking_question(
             reply,
             missing_fields,
