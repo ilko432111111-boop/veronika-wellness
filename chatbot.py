@@ -848,12 +848,22 @@ FIXED_TREATMENT_DETAILS = [
     {
         "name": "B12 Vitamin Shot",
         "duration": "15 minutes",
-        "aliases": ["b12 vitamin shot", "b12 shot"],
+        "aliases": [
+            "b12 vitamin shot",
+            "b12 shot",
+            "b12",
+            "vitamin b12",
+        ],
     },
     {
         "name": "Vitamin C Shot",
         "duration": "15 minutes",
-        "aliases": ["vitamin c shot", "c vitamin shot"],
+        "aliases": [
+            "vitamin c shot",
+            "c vitamin shot",
+            "vitamin c",
+            "c shot",
+        ],
     },
     {
         "name": "Dermal Filler (Lip Filler, 0.5 ml)",
@@ -1583,7 +1593,7 @@ def grouped_missing_question(
         return "Which day and time would you prefer?"
 
     if "name" in missing and "phone" in missing:
-        return "Could I take your name and phone number, please to proceed with the handover?"
+        return "Could I take your name and phone number, please?"
 
     return canonical_missing_question(
         missing_fields[0],
@@ -1781,6 +1791,28 @@ def remove_contact_detail_questions(reply: str) -> str:
     return cleaned.strip()
 
 
+def needs_vitamin_shot_variant(lead_data: dict) -> bool:
+    """
+    A generic vitamin-shot enquiry is incomplete until the customer chooses
+    B12 or Vitamin C. Both variants have a fixed 15-minute duration.
+    """
+    treatment = normalise_treatment_name(
+        lead_data.get("treatment")
+    )
+
+    if not treatment:
+        return False
+
+    generic_phrases = {
+        "vitamin shot",
+        "vitamin shots",
+        "vitamin injection",
+        "vitamin injections",
+    }
+
+    return treatment in generic_phrases
+
+
 def build_schedule_first_question(lead_data: dict) -> str:
     """
     Ask only for the unsettled schedule detail. This is deliberately separate
@@ -1789,6 +1821,9 @@ def build_schedule_first_question(lead_data: dict) -> str:
     duration = lead_data.get("duration")
     preferred_date = lead_data.get("preferred_date")
     preferred_time = lead_data.get("preferred_time")
+
+    if needs_vitamin_shot_variant(lead_data):
+        return "Would you like a B12 vitamin shot or a Vitamin C shot?"
 
     if duration in [None, ""]:
         allowed_durations = allowed_durations_for_treatment(
@@ -4022,6 +4057,7 @@ Locked rules:
 - Do not list duration options unless duration is the next missing detail.
 - If duration is the next missing detail, use NEXT QUESTION TARGET. Never offer massage durations for a non-massage treatment.
 - If a treatment has one fixed duration listed under CONFIRMED CUSTOMER DETAILS, do not ask the customer to choose a session length. Continue directly to the next missing booking detail.
+- For a generic vitamin-shot enquiry, ask whether the customer wants B12 or Vitamin C. Both are fixed 15-minute treatments. Do not ask the customer to choose a duration.
 - Do not repeat hello twice.
 - Avoid filler such as "I've noted that down", "just to confirm", "we offer", "to proceed", and "the requested time currently looks available" unless genuinely needed.
 - Use the conversation history to understand short replies.
