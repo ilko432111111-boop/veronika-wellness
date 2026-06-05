@@ -2296,6 +2296,13 @@ def apply_dynamic_microneedling_details(
         latest_message
     )
 
+    if not service and current_treatment == "microneedling":
+        service = find_service_from_short_variant_reply(
+            latest_message,
+            load_microneedling_services()[0],
+            category_tokens={"microneedling"},
+        )
+
     if service:
         result["treatment"] = service["service_name"]
 
@@ -2661,6 +2668,13 @@ def apply_dynamic_facial_details(
         latest_message
     )
 
+    if not service and current_treatment == "facial":
+        service = find_service_from_short_variant_reply(
+            latest_message,
+            load_facial_services()[0],
+            category_tokens={"facial"},
+        )
+
     if service:
         result["treatment"] = service["service_name"]
 
@@ -2895,8 +2909,141 @@ FIXED_TREATMENT_DETAILS = [
 def normalise_service_match_text(value: str | None) -> str:
     cleaned = normalise_treatment_name(value)
     cleaned = cleaned.replace("&", " and ")
+
+    # Common customer spellings. Keep this list conservative: only normalise
+    # words where the intended service name is unambiguous.
+    replacements = {
+        "hydrofacial": "hydrafacial",
+        "hydroface": "hydraface",
+    }
+
+    for source, target in replacements.items():
+        cleaned = cleaned.replace(source, target)
+
     cleaned = re.sub(r"[^a-z0-9.]+", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+VARIANT_REPLY_IGNORED_TOKENS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "the",
+    "to",
+    "of",
+    "treatment",
+    "treatments",
+    "session",
+    "sessions",
+    "minute",
+    "minutes",
+    "hour",
+    "hours",
+    "area",
+    "one",
+}
+
+
+def meaningful_variant_tokens(
+    value: str | None,
+    category_tokens: set[str] | None = None,
+) -> set[str]:
+    """
+    Extract words useful for resolving a short answer after the chatbot has
+    already asked the customer to choose between options.
+
+    Broad category words are removed so a reply such as "facial" does not
+    accidentally select one facial service. More specific replies such as
+    "radio frequency", "stretch marks", and "hydrafacial 90 minutes" remain
+    useful.
+    """
+    cleaned = normalise_service_match_text(value)
+
+    if not cleaned:
+        return set()
+
+    ignored = set(VARIANT_REPLY_IGNORED_TOKENS)
+
+    if category_tokens:
+        ignored.update(category_tokens)
+
+    return {
+        token
+        for token in cleaned.split()
+        if token not in ignored
+    }
+
+
+def find_service_from_short_variant_reply(
+    value: str | None,
+    services: list[dict],
+    category_tokens: set[str] | None = None,
+) -> dict | None:
+    """
+    Resolve concise customer replies only while a category choice is pending.
+
+    Example:
+      chatbot: Which facial would you like?
+      customer: Radio frequency
+
+    The relaxed matching is intentionally category-aware and is not used
+    globally. This prevents vague words such as "single" from accidentally
+    selecting an unrelated service in a different workflow.
+    """
+    reply_tokens = meaningful_variant_tokens(
+        value,
+        category_tokens,
+    )
+
+    if not reply_tokens:
+        return None
+
+    matches = []
+
+    for service in services:
+        candidates = [
+            service.get("service_name"),
+            *(service.get("aliases") or []),
+        ]
+        best_score = 0
+
+        for candidate in candidates:
+            candidate_tokens = meaningful_variant_tokens(
+                candidate,
+                category_tokens,
+            )
+
+            if not candidate_tokens:
+                continue
+
+            if reply_tokens.issubset(candidate_tokens):
+                score = (
+                    1000
+                    + len(reply_tokens) * 100
+                    - len(candidate_tokens)
+                )
+                best_score = max(best_score, score)
+
+        if best_score:
+            matches.append((best_score, service))
+
+    if not matches:
+        return None
+
+    matches.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    # Do not guess when two services are equally plausible.
+    if (
+        len(matches) > 1
+        and matches[0][0] == matches[1][0]
+    ):
+        return None
+
+    return matches[0][1]
 
 
 def find_fixed_treatment_details(value: str | None) -> dict | None:
