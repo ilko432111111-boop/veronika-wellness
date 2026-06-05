@@ -2289,6 +2289,33 @@ def apply_dynamic_microneedling_details(
         result.get("treatment")
     )
 
+    # The newest customer message takes priority. This allows short replies
+    # such as "stretch marks" or "face and neck" to resolve the variant after
+    # the chatbot has asked the customer to choose one.
+    service = find_microneedling_service(
+        latest_message
+    )
+
+    if service:
+        result["treatment"] = service["service_name"]
+
+        duration = format_minutes_as_duration(
+            service.get("fixed_duration_minutes")
+        )
+
+        if duration:
+            result["duration"] = duration
+
+        result["status"] = calculate_lead_status(
+            result,
+            result.get("status"),
+        )
+
+        if result["status"] != "booking_request_complete":
+            result["notification_sent_at"] = None
+
+        return result
+
     if current_treatment == "microneedling":
         result["duration"] = None
         result["status"] = calculate_lead_status(
@@ -2308,9 +2335,8 @@ def apply_dynamic_microneedling_details(
         result["notification_sent_at"] = None
         return result
 
-    service = (
-        find_microneedling_service(latest_message)
-        or find_microneedling_service(result.get("treatment"))
+    service = find_microneedling_service(
+        result.get("treatment")
     )
 
     if not service:
@@ -3738,6 +3764,11 @@ def finalise_dynamic_service_reply(
         )
 
     if needs_vitamin_shot_variant(lead_data):
+        return build_schedule_first_question(
+            lead_data
+        )
+
+    if needs_microneedling_variant(lead_data):
         return build_schedule_first_question(
             lead_data
         )
