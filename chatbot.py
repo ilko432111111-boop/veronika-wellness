@@ -3208,6 +3208,366 @@ def format_live_dermal_filler_services_context() -> tuple[str, bool]:
     return "\n".join(lines), from_supabase
 
 
+GENERIC_STRUCTURED_CATEGORIES = {
+    "vitamin shot": "vitamin_shots",
+    "ultrasound": "ultrasound",
+    "microneedling": "microneedling",
+    "facial": "facials",
+    "dermal filler": "dermal_fillers",
+}
+
+
+def structured_service_identity(
+    treatment: str | None,
+) -> dict | None:
+    """
+    Return one normalised service identity for any migrated category.
+
+    This gives the conversation controller one shared way to compare services
+    instead of adding another category-specific switch rule each time.
+    """
+    if treatment in [None, ""]:
+        return None
+
+    lookups = [
+        ("massage", find_massage_service),
+        ("vitamin_shots", find_vitamin_shot_service),
+        ("ultrasound", find_ultrasound_service),
+        ("body_treatments", find_body_treatment_service),
+        ("microneedling", find_microneedling_service),
+        ("facials", find_facial_service),
+        ("dermal_fillers", find_dermal_filler_service),
+    ]
+
+    for category, finder in lookups:
+        service = finder(treatment)
+
+        if service:
+            return {
+                "category": category,
+                "service_name": service.get("service_name"),
+                "booking_mode": service.get("booking_mode"),
+                "fixed_duration_minutes": service.get(
+                    "fixed_duration_minutes"
+                ),
+                "allowed_durations_minutes": service.get(
+                    "allowed_durations_minutes"
+                ),
+            }
+
+    cleaned = normalise_treatment_name(treatment)
+
+    if cleaned in GENERIC_STRUCTURED_CATEGORIES:
+        return {
+            "category": GENERIC_STRUCTURED_CATEGORIES[cleaned],
+            "service_name": cleaned.title(),
+            "booking_mode": "choose_variant",
+            "fixed_duration_minutes": None,
+            "allowed_durations_minutes": None,
+        }
+
+    return None
+
+
+def resolve_latest_structured_service(
+    latest_message: str,
+    existing_treatment: str | None = None,
+) -> dict | None:
+    """
+    Resolve a service explicitly named in the newest customer message.
+
+    The newest customer message is authoritative when a customer changes their
+    mind. Relaxed short-reply matching is used only while a known category
+    choice is pending.
+    """
+    direct_lookups = [
+        ("massage", find_massage_service),
+        ("vitamin_shots", find_vitamin_shot_service),
+        ("ultrasound", find_ultrasound_service),
+        ("body_treatments", find_body_treatment_service),
+        ("microneedling", find_microneedling_service),
+        ("facials", find_facial_service),
+        ("dermal_fillers", find_dermal_filler_service),
+    ]
+
+    for category, finder in direct_lookups:
+        service = finder(latest_message)
+
+        if service:
+            return {
+                "category": category,
+                "service_name": service.get("service_name"),
+                "booking_mode": service.get("booking_mode"),
+                "fixed_duration_minutes": service.get(
+                    "fixed_duration_minutes"
+                ),
+                "allowed_durations_minutes": service.get(
+                    "allowed_durations_minutes"
+                ),
+            }
+
+    current = normalise_treatment_name(existing_treatment)
+
+    relaxed_categories = {
+        "microneedling": (
+            "microneedling",
+            load_microneedling_services,
+            {"microneedling"},
+        ),
+        "facial": (
+            "facials",
+            load_facial_services,
+            {"facial"},
+        ),
+        "dermal filler": (
+            "dermal_fillers",
+            load_dermal_filler_services,
+            {"dermal", "filler", "fillers"},
+        ),
+    }
+
+    if current in relaxed_categories:
+        category, loader, category_tokens = relaxed_categories[current]
+        service = find_service_from_short_variant_reply(
+            latest_message,
+            loader()[0],
+            category_tokens=category_tokens,
+        )
+
+        if service:
+            return {
+                "category": category,
+                "service_name": service.get("service_name"),
+                "booking_mode": service.get("booking_mode"),
+                "fixed_duration_minutes": service.get(
+                    "fixed_duration_minutes"
+                ),
+                "allowed_durations_minutes": service.get(
+                    "allowed_durations_minutes"
+                ),
+            }
+
+    return None
+
+
+def duration_for_structured_service(
+    service_identity: dict | None,
+) -> str | None:
+    if not service_identity:
+        return None
+
+    return format_minutes_as_duration(
+        service_identity.get("fixed_duration_minutes")
+    )
+
+
+def apply_generic_service_switch_controller(
+    existing_lead: dict,
+    lead_data: dict,
+    latest_message: str,
+) -> tuple[dict, dict | None]:
+    """
+    Detect a customer changing service and clear only the details invalidated
+    by that switch.
+
+    Preserved:
+      - preferred date
+      - preferred time
+      - name
+      - phone
+      - notes
+
+    Recalculated:
+      - treatment
+      - duration
+      - calendar slot status
+      - next required detail
+    """
+    result = dict(lead_data)
+
+    previous_identity = structured_service_identity(
+        existing_lead.get("treatment")
+    )
+    selected_identity = resolve_latest_structured_service(
+        latest_message,
+        existing_treatment=existing_lead.get("treatment"),
+    )
+
+    if not selected_identity:
+        current_identity = structured_service_identity(
+            result.get("treatment")
+        )
+
+        if current_identity:
+            result["active_category"] = current_identity["category"]
+
+        return result, None
+
+    previous_name = (
+        previous_identity.get("service_name")
+        if previous_identity
+        else None
+    )
+    selected_name = selected_identity.get("service_name")
+
+    if not selected_name:
+        return result, None
+
+    result["treatment"] = selected_name
+    result["active_category"] = selected_identity.get("category")
+
+    fixed_duration = duration_for_structured_service(
+        selected_identity
+    )
+
+    if fixed_duration:
+        result["duration"] = fixed_duration
+    else:
+        # Selectable-duration services, such as massages, must not inherit a
+        # stale fixed duration from the previous treatment.
+        result["duration"] = None
+
+    switched = bool(
+        previous_name
+        and normalise_treatment_name(previous_name)
+        != normalise_treatment_name(selected_name)
+    )
+
+    if not switched:
+        result["status"] = calculate_lead_status(
+            result,
+            result.get("status"),
+        )
+
+        if result["status"] != "booking_request_complete":
+            result["notification_sent_at"] = None
+
+        return result, None
+
+    switched_at = datetime.now(timezone.utc).isoformat()
+
+    result["slot_status"] = "not_checked"
+    result["last_service_switch_at"] = switched_at
+    result["notification_sent_at"] = None
+    result["status"] = calculate_lead_status(
+        result,
+        "details_incomplete",
+    )
+
+    return result, {
+        "previous_service": previous_name,
+        "new_service": selected_name,
+        "active_category": selected_identity.get("category"),
+        "switched_at": switched_at,
+    }
+
+
+def calculate_next_required_detail(
+    lead_data: dict,
+) -> str | None:
+    """
+    Calculate one backend-controlled next step.
+
+    Variant selection always comes before duration, date, time, name, or phone.
+    """
+    if (
+        needs_vitamin_shot_variant(lead_data)
+        or needs_ultrasound_variant(lead_data)
+        or needs_microneedling_variant(lead_data)
+        or needs_facial_variant(lead_data)
+        or needs_dermal_filler_variant(lead_data)
+    ):
+        return "service_variant"
+
+    for field in REQUIRED_BOOKING_FIELDS:
+        if lead_data.get(field) in [None, ""]:
+            return field
+
+    return None
+
+
+def normalise_controller_slot_status(
+    calendar_result: dict | None,
+) -> str:
+    status = str(
+        (calendar_result or {}).get("status") or "not_checked"
+    ).strip()
+
+    if status in {
+        "not_requested",
+        "not_checked",
+        "needs_duration_for_alternatives",
+    }:
+        return "not_checked"
+
+    if status in {
+        "outside_hours",
+        "closed_day",
+        "past",
+        "busy",
+        "busy_needs_duration",
+    }:
+        return "unavailable"
+
+    if status in {
+        "free",
+        "provisional_free",
+    }:
+        return "provisional_free"
+
+    return status
+
+
+def apply_conversation_controller_state(
+    lead_data: dict,
+    booking_flow_active: bool,
+    calendar_result: dict | None = None,
+) -> dict:
+    """
+    Store the current reusable workflow state in public.conversations.
+    """
+    result = dict(lead_data)
+    identity = structured_service_identity(
+        result.get("treatment")
+    )
+
+    result["conversation_mode"] = (
+        "booking_request"
+        if booking_flow_active
+        else "browsing"
+    )
+    result["active_category"] = (
+        identity.get("category")
+        if identity
+        else result.get("active_category")
+    )
+    result["slot_status"] = normalise_controller_slot_status(
+        calendar_result
+    )
+    result["next_required_detail"] = (
+        calculate_next_required_detail(result)
+        if booking_flow_active
+        else None
+    )
+
+    return result
+
+
+def format_service_switch_context(
+    service_switch: dict | None,
+) -> str:
+    if not service_switch:
+        return "No service switch detected."
+
+    return (
+        "Customer changed treatment. "
+        f"Previous service: {service_switch.get('previous_service')}. "
+        f"New service: {service_switch.get('new_service')}. "
+        "Acknowledge the change briefly and continue from the next missing "
+        "detail. Do not ask again for details that remain valid."
+    )
+
+
 def format_duration_options(durations: set[int]) -> str:
     ordered = sorted(durations)
 
@@ -6955,6 +7315,12 @@ async def chat(
         request.message,
     )
 
+    merged_lead, service_switch = apply_generic_service_switch_controller(
+        existing_lead=existing_lead,
+        lead_data=merged_lead,
+        latest_message=request.message,
+    )
+
     merged_lead = normalise_misplaced_preferred_fields(
         merged_lead,
         request.message,
@@ -6980,6 +7346,12 @@ async def chat(
     merged_lead = align_status_with_booking_intent(
         merged_lead,
         booking_flow_active,
+    )
+
+    merged_lead = apply_conversation_controller_state(
+        merged_lead,
+        booking_flow_active=booking_flow_active,
+        calendar_result={"status": "not_checked"},
     )
 
     merged_lead, validation_issue = validate_latest_customer_details(
@@ -7058,6 +7430,18 @@ async def chat(
             source=request_source,
         )
 
+    merged_lead = apply_conversation_controller_state(
+        merged_lead,
+        booking_flow_active=booking_flow_active,
+        calendar_result=calendar_result,
+    )
+
+    save_conversation_overview(
+        session_id=request.session_id,
+        lead_data=merged_lead,
+        source=request_source,
+    )
+
     missing_fields = (
         [
             field
@@ -7083,6 +7467,9 @@ async def chat(
         merged_lead.get("preferred_date")
     )
     live_business_hours = format_live_business_hours()
+    service_switch_context = format_service_switch_context(
+        service_switch
+    )
 
     if (
         is_simple_acknowledgement(request.message)
@@ -7136,6 +7523,7 @@ Locked rules:
 - If BOOKING FLOW ACTIVE says No, treat the message as an informational enquiry. Do not ask for the customer's name, phone number, preferred date, preferred time, or duration. You may briefly ask whether they would like to book only when it feels natural.
 - If BOOKING FLOW ACTIVE says Yes, follow NEXT QUESTION TARGET. It may combine up to two closely related missing details in one concise question when sensible.
 - Follow NEXT QUESTION TARGET closely.
+- If SERVICE SWITCH CONTEXT says the customer changed treatment, acknowledge the change briefly, use the new treatment only, and do not reuse an old duration that no longer applies.
 - Do not repeat a treatment name immediately after the customer has just chosen it unless clarification is genuinely needed.
 - Do not repeat prices, dates, times, durations, or availability unless the customer asks or the information has changed.
 - Do not list duration options unless duration is the next missing detail.
@@ -7206,6 +7594,9 @@ NEXT QUESTION TARGET:
 
 BOOKING FLOW ACTIVE:
 {"Yes" if booking_flow_active else "No"}
+
+SERVICE SWITCH CONTEXT:
+{service_switch_context}
 
 TODAY BOOKING CONTEXT:
 {"The business cannot accept any more appointments today. Never suggest today and never ask what time today." if today_is_unavailable or not business_can_accept_more_bookings_today(parse_duration_minutes(merged_lead.get("duration"))) else "The business may still have time remaining today, but never assume the customer wants today unless they explicitly say so."}
