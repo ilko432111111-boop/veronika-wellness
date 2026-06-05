@@ -2419,6 +2419,371 @@ def format_live_microneedling_services_context() -> tuple[str, bool]:
     return "\n".join(lines), from_supabase
 
 
+FALLBACK_FACIAL_SERVICES = [
+    {
+        "service_name": "Deep Facial Cleanse",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 60,
+        "price_pence": 6000,
+        "aliases": [
+            "deep facial cleanse",
+            "facial cleanse",
+            "deep cleanse facial",
+        ],
+        "description": "Deep facial cleanse treatment lasting 60 minutes.",
+    },
+    {
+        "service_name": "Radio Frequency Facial",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 60,
+        "price_pence": 6000,
+        "aliases": [
+            "radio frequency facial",
+            "rf facial",
+            "radio frequency treatment",
+        ],
+        "description": "Radio Frequency Facial treatment lasting 60 minutes.",
+    },
+    {
+        "service_name": "Facial Treatment for Young Skin",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 60,
+        "price_pence": 4500,
+        "aliases": [
+            "facial treatment for young skin",
+            "young skin facial",
+            "facial for young skin",
+        ],
+        "description": "Facial treatment for young skin lasting 60 minutes.",
+    },
+    {
+        "service_name": "Hydraface Facial Treatment",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 60,
+        "price_pence": 6000,
+        "aliases": [
+            "hydraface facial treatment",
+            "hydraface facial",
+            "hydraface",
+        ],
+        "description": "Hydraface Facial Treatment lasting 60 minutes.",
+    },
+    {
+        "service_name": "Hydrafacial",
+        "booking_mode": "fixed_duration",
+        "fixed_duration_minutes": 90,
+        "price_pence": 8000,
+        "aliases": [
+            "hydrafacial",
+            "hydrafacial 90 minutes",
+            "90 minute hydrafacial",
+        ],
+        "description": "Hydrafacial treatment lasting 90 minutes.",
+    },
+]
+
+_FACIAL_SERVICE_CACHE: dict = {
+    "loaded_at": 0.0,
+    "rows": None,
+    "from_supabase": False,
+}
+FACIAL_SERVICE_CACHE_SECONDS = 60
+
+
+def load_facial_services() -> tuple[list[dict], bool]:
+    """
+    Load Veronika's facial catalogue from public.services.
+
+    If Supabase temporarily fails or the category is empty, use the fallback
+    rows so the live chatbot remains available.
+    """
+    now = time.time()
+    cached_rows = _FACIAL_SERVICE_CACHE.get("rows")
+
+    if (
+        cached_rows is not None
+        and now - float(
+            _FACIAL_SERVICE_CACHE.get("loaded_at") or 0
+        )
+        < FACIAL_SERVICE_CACHE_SECONDS
+    ):
+        return (
+            cached_rows,
+            bool(_FACIAL_SERVICE_CACHE.get("from_supabase")),
+        )
+
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "service_name, aliases, fixed_duration_minutes, "
+                "price_pence, booking_mode, description, is_active, "
+                "display_order"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("category", "facials")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+
+        rows = []
+
+        for row in response.data or []:
+            service_name = str(row.get("service_name") or "").strip()
+            booking_mode = str(row.get("booking_mode") or "").strip()
+
+            if not service_name or not booking_mode:
+                continue
+
+            fixed_duration = row.get("fixed_duration_minutes")
+
+            if fixed_duration not in [None, ""]:
+                try:
+                    fixed_duration = int(fixed_duration)
+                except (TypeError, ValueError):
+                    fixed_duration = None
+
+            rows.append({
+                "service_name": service_name,
+                "aliases": list(row.get("aliases") or []),
+                "fixed_duration_minutes": fixed_duration,
+                "price_pence": row.get("price_pence"),
+                "booking_mode": booking_mode,
+                "description": str(row.get("description") or "").strip(),
+                "display_order": row.get("display_order") or 0,
+            })
+
+        if rows:
+            _FACIAL_SERVICE_CACHE.update({
+                "loaded_at": now,
+                "rows": rows,
+                "from_supabase": True,
+            })
+            return rows, True
+
+    except Exception as error:
+        print(f"Could not load facial services from Supabase: {error}")
+
+    fallback_rows = [
+        dict(row)
+        for row in FALLBACK_FACIAL_SERVICES
+    ]
+
+    _FACIAL_SERVICE_CACHE.update({
+        "loaded_at": now,
+        "rows": fallback_rows,
+        "from_supabase": False,
+    })
+
+    return fallback_rows, False
+
+
+def facial_match_score(
+    treatment: str | None,
+    service: dict,
+) -> int:
+    cleaned = normalise_service_match_text(treatment)
+
+    if not cleaned:
+        return 0
+
+    padded = f" {cleaned} "
+    candidates = [
+        service.get("service_name"),
+        *(service.get("aliases") or []),
+    ]
+
+    best_score = 0
+
+    for candidate in candidates:
+        cleaned_candidate = normalise_service_match_text(candidate)
+
+        if not cleaned_candidate:
+            continue
+
+        if f" {cleaned_candidate} " in padded:
+            best_score = max(best_score, len(cleaned_candidate))
+
+    return best_score
+
+
+def find_facial_service(
+    treatment: str | None,
+) -> dict | None:
+    services, _ = load_facial_services()
+    matches = []
+
+    for service in services:
+        score = facial_match_score(
+            treatment,
+            service,
+        )
+
+        if score:
+            matches.append((score, service))
+
+    if not matches:
+        return None
+
+    return max(matches, key=lambda item: item[0])[1]
+
+
+def facial_message_is_generic(value: str | None) -> bool:
+    cleaned = normalise_service_match_text(value)
+
+    if not cleaned:
+        return False
+
+    if "facial" not in cleaned:
+        return False
+
+    return find_facial_service(value) is None
+
+
+def apply_dynamic_facial_details(
+    lead_data: dict,
+    latest_message: str,
+) -> dict:
+    """
+    Handle facials dynamically from public.services.
+
+    A generic facial request remains unresolved until the customer chooses a
+    specific facial. Specific services receive their fixed duration
+    automatically from Supabase.
+    """
+    result = dict(lead_data)
+    current_treatment = normalise_treatment_name(
+        result.get("treatment")
+    )
+
+    service = find_facial_service(
+        latest_message
+    )
+
+    if service:
+        result["treatment"] = service["service_name"]
+
+        duration = format_minutes_as_duration(
+            service.get("fixed_duration_minutes")
+        )
+
+        if duration:
+            result["duration"] = duration
+
+        result["status"] = calculate_lead_status(
+            result,
+            result.get("status"),
+        )
+
+        if result["status"] != "booking_request_complete":
+            result["notification_sent_at"] = None
+
+        return result
+
+    if current_treatment == "facial":
+        result["duration"] = None
+        result["status"] = calculate_lead_status(
+            result,
+            result.get("status"),
+        )
+        result["notification_sent_at"] = None
+        return result
+
+    if facial_message_is_generic(latest_message):
+        result["treatment"] = "Facial"
+        result["duration"] = None
+        result["status"] = calculate_lead_status(
+            result,
+            result.get("status"),
+        )
+        result["notification_sent_at"] = None
+        return result
+
+    service = find_facial_service(
+        result.get("treatment")
+    )
+
+    if not service:
+        return result
+
+    result["treatment"] = service["service_name"]
+
+    duration = format_minutes_as_duration(
+        service.get("fixed_duration_minutes")
+    )
+
+    if duration:
+        result["duration"] = duration
+
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
+
+
+def needs_facial_variant(lead_data: dict) -> bool:
+    return (
+        normalise_treatment_name(
+            lead_data.get("treatment")
+        )
+        == "facial"
+    )
+
+
+def is_dynamic_facial_fixed_duration(
+    treatment: str | None,
+) -> bool:
+    service = find_facial_service(treatment)
+
+    return bool(
+        service
+        and service.get("booking_mode") == "fixed_duration"
+        and service.get("fixed_duration_minutes")
+    )
+
+
+def format_live_facial_services_context() -> tuple[str, bool]:
+    """
+    Produce the facial catalogue block sent to the LLM.
+    """
+    services, from_supabase = load_facial_services()
+    lines = [
+        "Facial services (authoritative live catalogue):"
+    ]
+
+    for service in services:
+        duration = format_minutes_as_duration(
+            service.get("fixed_duration_minutes")
+        )
+        price = format_price_pence(
+            service.get("price_pence")
+        )
+        details = []
+
+        if duration:
+            details.append(duration)
+
+        if price:
+            details.append(price)
+
+        if service.get("description"):
+            details.append(service["description"])
+
+        lines.append(
+            f"- {service.get('service_name')} "
+            f"[{service.get('booking_mode')}]: "
+            + "; ".join(details)
+        )
+
+    return "\n".join(lines), from_supabase
+
+
 def format_duration_options(durations: set[int]) -> str:
     ordered = sorted(durations)
 
@@ -2431,31 +2796,6 @@ def format_duration_options(durations: set[int]) -> str:
 # Services with one fixed duration. These are resolved deterministically
 # before the AI decides which booking detail to ask for next.
 FIXED_TREATMENT_DETAILS = [
-    {
-        "name": "Deep Facial Cleanse",
-        "duration": "1 hour",
-        "aliases": ["deep facial cleanse"],
-    },
-    {
-        "name": "Radio Frequency Facial",
-        "duration": "1 hour",
-        "aliases": ["radio frequency facial"],
-    },
-    {
-        "name": "Facial Treatment for Young Skin",
-        "duration": "1 hour",
-        "aliases": ["facial treatment for young skin", "young skin facial"],
-    },
-    {
-        "name": "Hydraface Facial Treatment",
-        "duration": "1 hour",
-        "aliases": ["hydraface facial treatment", "hydraface facial", "hydraface"],
-    },
-    {
-        "name": "Hydrafacial for 90 Minutes",
-        "duration": "1 hour 30 minutes",
-        "aliases": ["90 minute hydrafacial", "hydrafacial 90 minutes", "hydrafacial for 90 minutes"],
-    },
     {
         "name": "Dermal Filler (Lip Filler, 0.5 ml)",
         "duration": "45 minutes",
@@ -2958,6 +3298,9 @@ def remove_invalid_fixed_duration_questions(
         and not is_dynamic_microneedling_fixed_duration(
             lead_data.get("treatment")
         )
+        and not is_dynamic_facial_fixed_duration(
+            lead_data.get("treatment")
+        )
     ) or lead_data.get("duration") in [None, ""]:
         return reply
 
@@ -3425,6 +3768,14 @@ def build_schedule_first_question(lead_data: dict) -> str:
             "Which option would you like?"
         )
 
+    if needs_facial_variant(lead_data):
+        return (
+            "We offer Deep Facial Cleanse (£60, 60 minutes), Radio Frequency "
+            "Facial (£60, 60 minutes), Facial Treatment for Young Skin "
+            "(£45, 60 minutes), Hydraface Facial Treatment (£60, 60 minutes), "
+            "and Hydrafacial (£80, 90 minutes). Which facial would you like?"
+        )
+
     ultrasound_service = find_ultrasound_service(
         lead_data.get("treatment")
     )
@@ -3666,6 +4017,14 @@ def latest_message_selects_ultrasound_variant(
     }
 
 
+def latest_message_selects_facial_service(
+    message: str,
+) -> bool:
+    return bool(
+        find_facial_service(message)
+    )
+
+
 def latest_message_selects_microneedling_variant(
     message: str,
 ) -> bool:
@@ -3735,6 +4094,9 @@ def strip_structured_service_price_sentences(
                     "microneedling",
                     "stretch marks",
                     "face and neck",
+                    "facial",
+                    "hydraface",
+                    "hydrafacial",
                 ]
             )
         )
@@ -3773,6 +4135,11 @@ def finalise_dynamic_service_reply(
             lead_data
         )
 
+    if needs_facial_variant(lead_data):
+        return build_schedule_first_question(
+            lead_data
+        )
+
     ultrasound_service = find_ultrasound_service(
         lead_data.get("treatment")
     )
@@ -3785,12 +4152,16 @@ def finalise_dynamic_service_reply(
     microneedling_service = find_microneedling_service(
         lead_data.get("treatment")
     )
+    facial_service = find_facial_service(
+        lead_data.get("treatment")
+    )
 
     service = (
         ultrasound_service
         or vitamin_service
         or body_treatment_service
         or microneedling_service
+        or facial_service
     )
 
     if not service:
@@ -3808,6 +4179,9 @@ def finalise_dynamic_service_reply(
             latest_message
         )
         or latest_message_selects_microneedling_variant(
+            latest_message
+        )
+        or latest_message_selects_facial_service(
             latest_message
         )
     )
@@ -5810,6 +6184,9 @@ async def chat(
     live_microneedling_context, microneedling_from_supabase = (
         format_live_microneedling_services_context()
     )
+    live_facial_context, facials_from_supabase = (
+        format_live_facial_services_context()
+    )
 
     context_rows = []
 
@@ -5869,6 +6246,19 @@ async def chat(
         ):
             continue
 
+        if (
+            facials_from_supabase
+            and re.match(
+                r"(?i)^\s*(?:deep\s+facial\s+cleanse|"
+                r"radio\s+frequency\s+facial|"
+                r"facial\s+treatment\s+for\s+young\s+skin|"
+                r"hydraface\s+facial\s+treatment|"
+                r"hydrafacial(?:\s+for\s+90\s+minutes)?)\s*:",
+                content,
+            )
+        ):
+            continue
+
         context_rows.append(content)
 
     context_rows.append(live_massage_context)
@@ -5876,6 +6266,7 @@ async def chat(
     context_rows.append(live_ultrasound_context)
     context_rows.append(live_body_treatment_context)
     context_rows.append(live_microneedling_context)
+    context_rows.append(live_facial_context)
 
     context = "\n".join(context_rows) if context_rows else "No information available."
 
@@ -5975,6 +6366,11 @@ async def chat(
     )
 
     merged_lead = apply_dynamic_microneedling_details(
+        merged_lead,
+        request.message,
+    )
+
+    merged_lead = apply_dynamic_facial_details(
         merged_lead,
         request.message,
     )
@@ -6179,6 +6575,7 @@ Locked rules:
 - The "Ultrasound services (authoritative live catalogue)" block is the only authoritative source for ultrasound options, durations, and prices. For the package, check availability for the first 45-minute session only; the therapist arranges the remaining sessions manually.
 - The "Body-treatment services (authoritative live catalogue)" block is the only authoritative source for Body Sculpting and EMS durations and prices. Ignore older conflicting body-treatment text elsewhere.
 - The "Microneedling services (authoritative live catalogue)" block is the only authoritative source for microneedling variants, durations, and prices. Ignore older conflicting microneedling text elsewhere.
+- The "Facial services (authoritative live catalogue)" block is the only authoritative source for facial names, durations, and prices. Ignore older conflicting facial text elsewhere.
 - When listing fixed-price service options or when the customer asks how much a structured fixed-price service costs, state the price clearly before continuing the booking flow.
 - If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. If duration is missing, ask for duration first so the backend can calculate valid alternatives. If alternatives are supplied, ask the customer to choose one first.
 - If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
