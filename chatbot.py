@@ -6353,18 +6353,55 @@ def format_pending_action_reminder(
     )
 
 
-def append_pending_action_reminder(
+def has_pending_booking_actions(
+    session_id: str,
+) -> bool:
+    return bool(
+        load_pending_booking_actions(session_id)
+    )
+
+
+def suppress_contact_collection_while_pending(
     reply: str,
     session_id: str,
 ) -> str:
+    """
+    Pending cart decisions take priority over contact collection.
+
+    A customer should finish choosing treatments before the bot asks for a
+    name or phone number. This also prevents premature handover wording while
+    an unresolved add / separate-appointment decision still exists.
+    """
     reminder = format_pending_action_reminder(
         session_id
     )
 
     if not reminder:
-        return reply
+        return str(reply or "").strip()
 
-    return str(reply or "").rstrip() + "\n\n" + reminder
+    cleaned = remove_contact_detail_questions(
+        str(reply or "")
+    )
+    cleaned = remove_false_handover_confirmation(
+        cleaned,
+        ["pending_cart_action"],
+    )
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        return reminder
+
+    return cleaned.rstrip() + "\n\n" + reminder
+
+
+def append_pending_action_reminder(
+    reply: str,
+    session_id: str,
+) -> str:
+    return suppress_contact_collection_while_pending(
+        reply,
+        session_id,
+    )
 
 
 def detect_treatment_cart_intent(
@@ -7156,6 +7193,13 @@ def format_confirmed_details(lead_data: dict) -> str:
 
 
 def send_booking_notification(session_id: str):
+    if has_pending_booking_actions(session_id):
+        print(
+            "Email notification skipped because a pending cart action "
+            "still needs the customer's decision."
+        )
+        return
+
     if not RESEND_API_KEY or not NOTIFICATION_EMAIL:
         print("Email notification skipped: missing Resend environment variables.")
         return
@@ -8772,6 +8816,9 @@ async def chat(
 
     if (
         booking_request_is_complete(existing_before_processing)
+        and not has_pending_booking_actions(
+            request.session_id
+        )
         and is_simple_acknowledgement(request.message)
     ):
         reply = "Thanks. The therapist will confirm the appointment shortly."
@@ -9357,6 +9404,9 @@ async def chat(
     if (
         is_simple_acknowledgement(request.message)
         and booking_request_is_complete(merged_lead)
+        and not has_pending_booking_actions(
+            request.session_id
+        )
     ):
         reply = "Thanks. The therapist will confirm the appointment shortly."
 
@@ -9572,6 +9622,11 @@ Reply as Receptionist:
             missing_fields=missing_fields,
             calendar_result=calendar_result,
         )
+
+    reply = suppress_contact_collection_while_pending(
+        reply,
+        request.session_id,
+    )
 
     save_message(
         session_id=request.session_id,
