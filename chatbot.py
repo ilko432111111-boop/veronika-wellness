@@ -4841,6 +4841,32 @@ def build_duration_needed_for_alternatives_reply(
     )
 
 
+def build_direct_calendar_suggestions_reply(
+    calendar_result: dict,
+) -> str:
+    """
+    Render direct availability suggestions in Python.
+
+    The LLM must not rewrite weekday/date combinations because that can create
+    impossible wording such as "Thursday 9 June".
+    """
+    suggestions = calendar_result.get(
+        "suggestions"
+    ) or []
+
+    if not suggestions:
+        return ""
+
+    options = format_natural_list(
+        suggestions
+    )
+
+    return (
+        f"The next available options are {options}.\n\n"
+        "Would any of those times work for you?"
+    )
+
+
 def build_calendar_alternative_reply(
     calendar_result: dict,
 ) -> str:
@@ -7407,6 +7433,59 @@ def format_customer_slot(
     )
 
 
+def format_datetime_slot(
+    slot_start: datetime,
+) -> str:
+    """
+    Render one appointment slot from the real datetime object.
+
+    Never let a generated weekday label drift away from the actual ISO date.
+    Example: 2026-06-11 always renders as Thursday 11 June, never Thursday
+    9 June.
+    """
+    local_start = slot_start.astimezone(
+        BUSINESS_TIMEZONE
+    )
+
+    return format_customer_slot(
+        local_start.date().isoformat(),
+        local_start.strftime("%H:%M"),
+    )
+
+
+def suggested_slot_is_within_live_hours(
+    slot_start: datetime,
+    duration_minutes: int,
+) -> bool:
+    """
+    Defensive display-time validation.
+
+    Suggestions are generated from live hours already, but recheck them before
+    displaying anything to a customer so a closed Tuesday, Wednesday, or
+    Sunday can never appear in the final list.
+    """
+    local_start = slot_start.astimezone(
+        BUSINESS_TIMEZONE
+    )
+    local_end = local_start + timedelta(
+        minutes=duration_minutes
+    )
+    opening_window = working_hours_for_date(
+        local_start.date()
+    )
+
+    if not opening_window:
+        return False
+
+    open_time, close_time = opening_window
+
+    return (
+        local_start >= open_time
+        and local_start < close_time
+        and local_end <= close_time
+    )
+
+
 def previous_reply_offered_calendar_alternatives(
     previous_assistant_message: str,
 ) -> bool:
@@ -8182,16 +8261,19 @@ def find_next_available_slots(
         while candidate + timedelta(minutes=duration_minutes) <= close_time:
             candidate_end = candidate + timedelta(minutes=duration_minutes)
 
-            if not slot_overlaps_busy_period(
-                candidate,
-                candidate_end,
-                busy_periods,
+            if (
+                suggested_slot_is_within_live_hours(
+                    candidate,
+                    duration_minutes,
+                )
+                and not slot_overlaps_busy_period(
+                    candidate,
+                    candidate_end,
+                    busy_periods,
+                )
             ):
                 suggestions.append(
-                    format_customer_slot(
-                        candidate.date().isoformat(),
-                        candidate.strftime("%H:%M"),
-                    )
+                    format_datetime_slot(candidate)
                 )
 
                 if len(suggestions) >= NEXT_SLOT_LIMIT:
@@ -8237,10 +8319,16 @@ def find_nearby_available_slots(
     while candidate + timedelta(minutes=duration_minutes) <= close_time:
         candidate_end = candidate + timedelta(minutes=duration_minutes)
 
-        if not slot_overlaps_busy_period(
-            candidate,
-            candidate_end,
-            busy_periods,
+        if (
+            suggested_slot_is_within_live_hours(
+                candidate,
+                duration_minutes,
+            )
+            and not slot_overlaps_busy_period(
+                candidate,
+                candidate_end,
+                busy_periods,
+            )
         ):
             candidates.append(candidate)
 
@@ -8254,10 +8342,7 @@ def find_nearby_available_slots(
     )
 
     suggestions = [
-        format_customer_slot(
-            value.date().isoformat(),
-            value.strftime("%H:%M"),
-        )
+        format_datetime_slot(value)
         for value in candidates[:NEXT_SLOT_LIMIT]
     ]
 
@@ -8506,6 +8591,7 @@ def check_requested_calendar_slot(
         if suggestions:
             return {
                 "status": "suggestions",
+                "suggestions": suggestions,
                 "message": (
                     "Offer these currently free options briefly: "
                     + "; ".join(suggestions)
@@ -10293,9 +10379,14 @@ Reply as Receptionist:
                 calendar_result,
             )
         elif calendar_result.get("suggestions"):
-            reply = build_calendar_alternative_reply(
-                calendar_result,
-            )
+            if calendar_result.get("status") == "suggestions":
+                reply = build_direct_calendar_suggestions_reply(
+                    calendar_result,
+                )
+            else:
+                reply = build_calendar_alternative_reply(
+                    calendar_result,
+                )
         else:
             reply = append_single_deterministic_followup(
                 reply,
