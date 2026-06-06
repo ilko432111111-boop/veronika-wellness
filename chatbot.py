@@ -5892,6 +5892,509 @@ def update_conversation_active_booking_request(
         print(f"Could not save active booking request pointer: {error}")
 
 
+def load_booking_items(
+    booking_request_id: int,
+) -> list[dict]:
+    try:
+        response = (
+            supabase.table("booking_items")
+            .select("*")
+            .eq("booking_request_id", booking_request_id)
+            .order("item_order")
+            .execute()
+        )
+
+        return list(response.data or [])
+
+    except Exception as error:
+        print(f"Could not load booking items: {error}")
+        return []
+
+
+def latest_message_explicitly_adds_same_visit(
+    latest_message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    same_visit_phrases = [
+        "same visit",
+        "same appointment",
+        "back to back",
+        "one after another",
+        "straight after",
+        "after that",
+        "add it to",
+        "add this to",
+    ]
+
+    return any(
+        phrase in cleaned
+        for phrase in same_visit_phrases
+    )
+
+
+def latest_message_suggests_additional_treatment(
+    latest_message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    addition_phrases = [
+        "also",
+        "add",
+        "another treatment",
+        "as well",
+        "too",
+    ]
+
+    replacement_phrases = [
+        "instead",
+        "change",
+        "switch",
+        "replace",
+        "rather than",
+    ]
+
+    return (
+        any(phrase in cleaned for phrase in addition_phrases)
+        and not any(
+            phrase in cleaned
+            for phrase in replacement_phrases
+        )
+    )
+
+
+def detect_treatment_cart_intent(
+    session_id: str,
+    latest_message: str,
+    existing_lead: dict,
+) -> dict | None:
+    """
+    Detect whether a newly mentioned service should be added to the current
+    appointment instead of replacing the existing treatment.
+
+    We add automatically only when the customer explicitly says the treatments
+    belong to the same visit. Ambiguous "also" messages trigger a clarification
+    question rather than guessing.
+    """
+    existing_treatment = existing_lead.get("treatment")
+
+    if not existing_treatment:
+        return None
+
+    draft_request = load_active_draft_booking_request(
+        session_id
+    )
+
+    if not draft_request:
+        return None
+
+    selected_identity = resolve_latest_structured_service(
+        latest_message,
+        existing_treatment=existing_treatment,
+    )
+
+    if not selected_identity:
+        return None
+
+    selected_name = selected_identity.get("service_name")
+    previous_identity = structured_service_identity(
+        existing_treatment
+    )
+    previous_name = (
+        previous_identity.get("service_name")
+        if previous_identity
+        else existing_treatment
+    )
+
+    if (
+        not selected_name
+        or normalise_treatment_name(selected_name)
+        == normalise_treatment_name(previous_name)
+    ):
+        return None
+
+    if latest_message_explicitly_adds_same_visit(
+        latest_message
+    ):
+        return {
+            "action": "add_same_visit",
+            "draft_request": draft_request,
+            "selected_identity": selected_identity,
+        }
+
+    if latest_message_suggests_additional_treatment(
+        latest_message
+    ):
+        return {
+            "action": "clarify_visit_structure",
+            "draft_request": draft_request,
+            "selected_identity": selected_identity,
+        }
+
+    return None
+
+
+def restore_existing_primary_treatment(
+    existing_lead: dict,
+    lead_data: dict,
+) -> dict:
+    """
+    During cart additions, keep the legacy overview pointed at its original
+    primary treatment. The new treatment is stored as an additional item.
+    """
+    result = dict(lead_data)
+
+    for field in [
+        "treatment",
+        "duration",
+        "active_category",
+    ]:
+        if existing_lead.get(field) not in [None, ""]:
+            result[field] = existing_lead.get(field)
+
+    return result
+
+
+def cart_item_from_selected_identity(
+    selected_identity: dict,
+) -> dict | None:
+    service_row = load_service_row_for_booking_item(
+        selected_identity.get("service_name")
+    )
+
+    if not service_row:
+        return None
+
+    fixed_duration = service_row.get(
+        "fixed_duration_minutes"
+    )
+
+    if fixed_duration in [None, ""]:
+        # Same-visit additions are enabled first for services with a resolved
+        # duration. A selectable-duration massage is handled after the client
+        # chooses its length.
+        return None
+
+    try:
+        duration_minutes = int(fixed_duration)
+    except (TypeError, ValueError):
+        return None
+
+    return {
+        "service_row": service_row,
+        "duration_minutes": duration_minutes,
+        "price_pence": booking_item_price_pence(
+            service_row,
+            duration_minutes,
+        ),
+    }
+
+
+def combined_duration_for_cart_action(
+    cart_intent: dict | None,
+) -> int | None:
+    if (
+        not cart_intent
+        or cart_intent.get("action") != "add_same_visit"
+    ):
+        return None
+
+    draft_request = cart_intent.get("draft_request") or {}
+    selected_identity = cart_intent.get("selected_identity") or {}
+    new_item = cart_item_from_selected_identity(
+        selected_identity
+    )
+
+    if not new_item:
+        return None
+
+    current_total = int(
+        draft_request.get("total_duration_minutes") or 0
+    )
+
+    return current_total + int(
+        new_item["duration_minutes"]
+    )
+
+
+def calendar_lead_for_cart_action(
+    lead_data: dict,
+    cart_intent: dict | None,
+) -> dict:
+    """
+    Calendar checks must use the full back-to-back duration while the legacy
+    lead overview remains unchanged.
+    """
+    result = dict(lead_data)
+    combined_minutes = combined_duration_for_cart_action(
+        cart_intent
+    )
+
+    if combined_minutes:
+        result["duration"] = format_minutes_as_duration(
+            combined_minutes
+        )
+
+    return result
+
+
+def sync_same_visit_treatment_item(
+    session_id: str,
+    lead_data: dict,
+    cart_intent: dict,
+) -> dict | None:
+    """
+    Append one treatment to the current request and recalculate cart totals.
+    Existing items are never overwritten.
+    """
+    draft_request = cart_intent.get("draft_request") or {}
+    selected_identity = cart_intent.get("selected_identity") or {}
+    booking_request_id = draft_request.get("id")
+
+    if not booking_request_id:
+        return None
+
+    new_item = cart_item_from_selected_identity(
+        selected_identity
+    )
+
+    if not new_item:
+        return {
+            "status": "needs_duration",
+            "selected_service_name": selected_identity.get(
+                "service_name"
+            ),
+        }
+
+    service_row = new_item["service_row"]
+    duration_minutes = int(
+        new_item["duration_minutes"]
+    )
+    price_pence = new_item.get("price_pence")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        existing_items = load_booking_items(
+            int(booking_request_id)
+        )
+
+        duplicate = next(
+            (
+                item
+                for item in existing_items
+                if normalise_treatment_name(
+                    item.get("service_name")
+                )
+                == normalise_treatment_name(
+                    service_row.get("service_name")
+                )
+            ),
+            None,
+        )
+
+        if not duplicate:
+            next_order = (
+                max(
+                    [
+                        int(item.get("item_order") or 0)
+                        for item in existing_items
+                    ]
+                    or [0]
+                )
+                + 1
+            )
+
+            (
+                supabase.table("booking_items")
+                .insert({
+                    "booking_request_id": int(
+                        booking_request_id
+                    ),
+                    "service_id": service_row.get("id"),
+                    "service_name": service_row.get(
+                        "service_name"
+                    ),
+                    "category": service_row.get("category"),
+                    "duration_minutes": duration_minutes,
+                    "price_pence": price_pence,
+                    "item_order": next_order,
+                    "updated_at": now_iso,
+                })
+                .execute()
+            )
+
+        items = load_booking_items(
+            int(booking_request_id)
+        )
+        total_duration = sum(
+            int(item.get("duration_minutes") or 0)
+            for item in items
+        )
+        total_price = sum(
+            int(item.get("price_pence") or 0)
+            for item in items
+        )
+
+        (
+            supabase.table("booking_requests")
+            .update({
+                "appointment_structure": (
+                    "back_to_back"
+                    if len(items) > 1
+                    else "single_service"
+                ),
+                "preferred_date": lead_data.get(
+                    "preferred_date"
+                ),
+                "preferred_time": lead_data.get(
+                    "preferred_time"
+                ),
+                "slot_status": lead_data.get(
+                    "slot_status"
+                ) or "not_checked",
+                "item_count": len(items),
+                "total_duration_minutes": total_duration,
+                "total_price_pence": total_price,
+                "missing_detail": lead_data.get(
+                    "next_required_detail"
+                ),
+                "updated_at": now_iso,
+            })
+            .eq("id", int(booking_request_id))
+            .execute()
+        )
+
+        update_conversation_active_booking_request(
+            session_id,
+            int(booking_request_id),
+        )
+
+        return {
+            "status": (
+                "already_present"
+                if duplicate
+                else "added"
+            ),
+            "booking_request_id": int(
+                booking_request_id
+            ),
+            "items": items,
+            "item_count": len(items),
+            "total_duration_minutes": total_duration,
+            "total_price_pence": total_price,
+        }
+
+    except Exception as error:
+        print(f"Could not add same-visit treatment item: {error}")
+        return None
+
+
+def format_cart_item_summary(
+    item: dict,
+) -> str:
+    name = str(
+        item.get("service_name") or "Treatment"
+    )
+    duration = format_minutes_as_duration(
+        item.get("duration_minutes")
+    )
+    price = format_price_pence(
+        item.get("price_pence")
+    )
+
+    details = [
+        value
+        for value in [price, duration]
+        if value
+    ]
+
+    if not details:
+        return name
+
+    return name + " — " + ", ".join(details)
+
+
+def build_same_visit_added_reply(
+    cart_result: dict,
+    lead_data: dict,
+    calendar_result: dict,
+    missing_fields: list[str],
+) -> str:
+    items = cart_result.get("items") or []
+    summaries = [
+        format_cart_item_summary(item)
+        for item in items
+    ]
+    item_list = "; ".join(summaries)
+    total_duration = format_minutes_as_duration(
+        cart_result.get("total_duration_minutes")
+    )
+    total_price = format_price_pence(
+        cart_result.get("total_price_pence")
+    )
+
+    opening = (
+        "I've added that to the same visit. "
+        f"Your request now includes: {item_list}. "
+        f"Total: {total_price}, {total_duration}."
+    )
+
+    if calendar_result.get("suggestions"):
+        return (
+            opening
+            + "\n\n"
+            + build_calendar_alternative_reply(
+                calendar_result
+            )
+        )
+
+    status = str(
+        calendar_result.get("status") or "not_checked"
+    )
+
+    if status == "free":
+        slot = format_customer_slot(
+            lead_data.get("preferred_date"),
+            lead_data.get("preferred_time"),
+        )
+        opening += (
+            f"\n\n{slot} still appears free for the "
+            "combined appointment."
+        )
+
+    question = build_deterministic_next_question(
+        lead_data,
+        missing_fields,
+    )
+
+    if question:
+        return opening + "\n\n" + question
+
+    return (
+        opening
+        + "\n\nYour updated request has been recorded. "
+        "The therapist will confirm it shortly."
+    )
+
+
+def build_visit_structure_clarification_reply(
+    selected_identity: dict,
+) -> str:
+    selected_name = str(
+        selected_identity.get("service_name")
+        or "that treatment"
+    )
+
+    return (
+        f"Would you like to add {selected_name} to the same visit, "
+        "or make it a separate appointment request?"
+    )
+
+
 def sync_single_treatment_draft_request(
     session_id: str,
     lead_data: dict,
@@ -8015,6 +8518,11 @@ async def chat(
 
     extracted_lead = extract_lead_data(conversation_history)
     existing_lead = get_existing_conversation(request.session_id)
+    cart_intent = detect_treatment_cart_intent(
+        session_id=request.session_id,
+        latest_message=request.message,
+        existing_lead=existing_lead,
+    )
     merged_lead = merge_lead_data(existing_lead, extracted_lead)
 
     previous_assistant_message = next(
@@ -8108,11 +8616,18 @@ async def chat(
         request.message,
     )
 
-    merged_lead, service_switch = apply_generic_service_switch_controller(
-        existing_lead=existing_lead,
-        lead_data=merged_lead,
-        latest_message=request.message,
-    )
+    if cart_intent:
+        merged_lead = restore_existing_primary_treatment(
+            existing_lead,
+            merged_lead,
+        )
+        service_switch = None
+    else:
+        merged_lead, service_switch = apply_generic_service_switch_controller(
+            existing_lead=existing_lead,
+            lead_data=merged_lead,
+            latest_message=request.message,
+        )
 
     merged_lead = normalise_misplaced_preferred_fields(
         merged_lead,
@@ -8184,8 +8699,12 @@ async def chat(
         return {"reply": reply}
 
     if booking_flow_active:
-        calendar_result = check_requested_calendar_slot(
+        calendar_lead = calendar_lead_for_cart_action(
             merged_lead,
+            cart_intent,
+        )
+        calendar_result = check_requested_calendar_slot(
+            calendar_lead,
             request.message,
         )
 
@@ -8241,11 +8760,23 @@ async def chat(
         source=request_source,
     )
 
-    sync_single_treatment_draft_request(
-        session_id=request.session_id,
-        lead_data=merged_lead,
-        booking_flow_active=booking_flow_active,
-    )
+    cart_result = None
+
+    if (
+        cart_intent
+        and cart_intent.get("action") == "add_same_visit"
+    ):
+        cart_result = sync_same_visit_treatment_item(
+            session_id=request.session_id,
+            lead_data=merged_lead,
+            cart_intent=cart_intent,
+        )
+    elif not cart_intent:
+        sync_single_treatment_draft_request(
+            session_id=request.session_id,
+            lead_data=merged_lead,
+            booking_flow_active=booking_flow_active,
+        )
 
     missing_fields = (
         [
@@ -8275,6 +8806,48 @@ async def chat(
     service_switch_context = format_service_switch_context(
         service_switch
     )
+
+    if (
+        cart_intent
+        and cart_intent.get("action")
+        == "clarify_visit_structure"
+    ):
+        reply = build_visit_structure_clarification_reply(
+            cart_intent.get("selected_identity") or {}
+        )
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
+
+    if cart_result:
+        if cart_result.get("status") == "needs_duration":
+            reply = (
+                "How long would you like the additional treatment for? "
+                "Once you tell me, I can add it to the same visit and "
+                "recheck the full appointment time."
+            )
+        else:
+            reply = build_same_visit_added_reply(
+                cart_result=cart_result,
+                lead_data=merged_lead,
+                calendar_result=calendar_result,
+                missing_fields=missing_fields,
+            )
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
 
     if (
         is_simple_acknowledgement(request.message)
