@@ -3892,6 +3892,7 @@ def validate_latest_customer_details(
     lead_data: dict,
     latest_message: str,
     previous_assistant_message: str,
+    skip_contact_validation: bool = False,
 ) -> tuple[dict, str | None]:
     """
     Reject obviously invalid booking details before they complete a lead.
@@ -3915,14 +3916,17 @@ def validate_latest_customer_details(
                 + format_duration_options(allowed_durations),
             )
 
-    if "name" in lower_previous:
+    if not skip_contact_validation and "name" in lower_previous:
         if not is_valid_customer_name(result.get("name")):
             result["name"] = None
             result["status"] = "details_incomplete"
             result["notification_sent_at"] = None
             return result, "invalid_name"
 
-    if "phone" in lower_previous or "number" in lower_previous:
+    if (
+        not skip_contact_validation
+        and ("phone" in lower_previous or "number" in lower_previous)
+    ):
         if not is_valid_phone_number(result.get("phone")):
             result["phone"] = None
             result["status"] = "details_incomplete"
@@ -5141,6 +5145,165 @@ def finalise_dynamic_service_reply(
         return information
 
     return information + "\n\n" + cleaned_reply
+
+
+def format_service_switch_summary(
+    lead_data: dict,
+) -> str:
+    """
+    Build one clear customer-facing summary for the newly selected service.
+
+    Use the structured Supabase row so fixed-price services and
+    duration-specific services are both handled consistently.
+    """
+    service_row = load_service_row_for_booking_item(
+        lead_data.get("treatment")
+    )
+
+    if not service_row:
+        return str(
+            lead_data.get("treatment") or "the new treatment"
+        )
+
+    service_name = str(
+        service_row.get("service_name")
+        or lead_data.get("treatment")
+        or "the new treatment"
+    ).strip()
+
+    duration_minutes = booking_item_duration_minutes(
+        lead_data,
+        service_row,
+    )
+    price_pence = booking_item_price_pence(
+        service_row,
+        duration_minutes,
+    )
+
+    details = []
+
+    if price_pence is not None:
+        details.append(
+            format_price_pence(price_pence)
+        )
+
+    duration_label = format_minutes_as_duration(
+        duration_minutes
+    )
+
+    if duration_label:
+        details.append(duration_label)
+
+    if not details:
+        return service_name
+
+    return service_name + " — " + ", ".join(details)
+
+
+def build_service_switch_reply(
+    lead_data: dict,
+    missing_fields: list[str],
+    calendar_result: dict,
+) -> str:
+    """
+    Reply deterministically after a treatment switch.
+
+    The customer may change their mind at any point, including when the
+    previous chatbot message asked for a name or phone number. Confirm the new
+    request clearly, show updated service details, then continue from the next
+    genuinely missing field.
+    """
+    summary = format_service_switch_summary(
+        lead_data
+    )
+    opening = (
+        "No problem. I've updated your request to "
+        f"{summary}."
+    )
+
+    status = str(
+        calendar_result.get("status") or "not_checked"
+    )
+
+    if status in {
+        "busy_needs_duration",
+        "needs_duration_for_alternatives",
+    }:
+        return (
+            opening
+            + "\n\n"
+            + build_duration_needed_for_alternatives_reply(
+                lead_data,
+                calendar_result,
+            )
+        )
+
+    if calendar_result.get("suggestions"):
+        return (
+            opening
+            + "\n\n"
+            + build_calendar_alternative_reply(
+                calendar_result,
+            )
+        )
+
+    if status == "free":
+        slot = format_customer_slot(
+            lead_data.get("preferred_date"),
+            lead_data.get("preferred_time"),
+        )
+
+        if missing_fields:
+            question = build_deterministic_next_question(
+                lead_data,
+                missing_fields,
+            )
+
+            return (
+                opening
+                + f"\n\n{slot} still appears free."
+                + (f"\n\n{question}" if question else "")
+            )
+
+        return (
+            opening
+            + f"\n\n{slot} still appears free."
+            + "\n\nYour updated request has been recorded. "
+            "The therapist will confirm it shortly."
+        )
+
+    if status == "unknown":
+        if missing_fields:
+            question = build_deterministic_next_question(
+                lead_data,
+                missing_fields,
+            )
+
+            return (
+                opening
+                + "\n\nThe therapist will need to check the availability."
+                + (f"\n\n{question}" if question else "")
+            )
+
+        return (
+            opening
+            + "\n\nThe therapist will check the availability and confirm "
+            "the updated request shortly."
+        )
+
+    question = build_deterministic_next_question(
+        lead_data,
+        missing_fields,
+    )
+
+    if question:
+        return opening + "\n\n" + question
+
+    return (
+        opening
+        + "\n\nYour updated request has been recorded. "
+        "The therapist will confirm it shortly."
+    )
 
 
 def build_deterministic_next_question(
@@ -7656,6 +7819,7 @@ async def chat(
         merged_lead,
         request.message,
         previous_assistant_message,
+        skip_contact_validation=bool(service_switch),
     )
 
     save_conversation_overview(
@@ -7986,6 +8150,13 @@ Reply as Receptionist:
         missing_fields=missing_fields,
         calendar_result=calendar_result,
     )
+
+    if service_switch:
+        reply = build_service_switch_reply(
+            lead_data=merged_lead,
+            missing_fields=missing_fields,
+            calendar_result=calendar_result,
+        )
 
     save_message(
         session_id=request.session_id,
