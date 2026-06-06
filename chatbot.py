@@ -9539,7 +9539,6 @@ def build_customer_booking_summary(
     return "\n\n".join(sections)
 
 
-@app.post("/chat")
 def identity_key(
     identity: dict,
 ) -> tuple[str, str]:
@@ -10689,6 +10688,7 @@ def handle_initial_multi_service_intake(
     )
 
 
+@app.post("/chat")
 async def chat(
     request: ChatRequest,
     background_tasks: BackgroundTasks
