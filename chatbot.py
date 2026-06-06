@@ -9127,6 +9127,333 @@ async def google_calendar_status():
 
 
 @app.post("/chat")
+def customer_asks_for_booking_summary(
+    latest_message: str,
+) -> bool:
+    """
+    Detect a clear request to list or summarise the customer's appointment
+    requests. Keep this conservative so normal treatment questions do not
+    trigger a booking summary unexpectedly.
+    """
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    exact_phrases = {
+        "what have i requested",
+        "what have i booked",
+        "what bookings do i have",
+        "what appointments do i have",
+        "show my bookings",
+        "show my booking requests",
+        "show my appointments",
+        "summarise my bookings",
+        "summarize my bookings",
+        "summarise my appointments",
+        "summarize my appointments",
+        "list my bookings",
+        "list my appointments",
+        "what is currently booked",
+        "what is currently requested",
+    }
+
+    if cleaned in exact_phrases:
+        return True
+
+    has_summary_word = any(
+        word in cleaned
+        for word in [
+            "summarise",
+            "summarize",
+            "summary",
+            "list",
+            "show",
+            "what",
+        ]
+    )
+    has_booking_word = any(
+        phrase in cleaned
+        for phrase in [
+            "my booking",
+            "my bookings",
+            "my appointment",
+            "my appointments",
+            "my request",
+            "my requests",
+            "have i requested",
+            "have i booked",
+        ]
+    )
+
+    return has_summary_word and has_booking_word
+
+
+def load_booking_requests_for_summary(
+    session_id: str,
+) -> list[dict]:
+    try:
+        response = (
+            supabase.table("booking_requests")
+            .select("*")
+            .eq("session_id", session_id)
+            .order("request_number")
+            .execute()
+        )
+
+        return list(response.data or [])
+
+    except Exception as error:
+        print(f"Could not load booking requests for summary: {error}")
+        return []
+
+
+def booking_request_status_for_customer(
+    request_status: str | None,
+) -> str:
+    status = str(
+        request_status or "draft"
+    ).strip()
+
+    labels = {
+        "draft": "draft request — details may still be needed",
+        "parked_draft": "saved request — not confirmed yet",
+        "ready_for_review": "ready for therapist review — not confirmed yet",
+        "awaiting_owner_confirmation": "awaiting therapist confirmation",
+        "confirmed": "confirmed",
+        "declined": "declined",
+        "cancelled_by_customer": "cancelled",
+        "abandoned": "unfinished request",
+        "expired": "expired",
+    }
+
+    return labels.get(
+        status,
+        status.replace("_", " "),
+    )
+
+
+def booking_request_items_summary(
+    booking_request_id: int,
+) -> list[str]:
+    items = load_booking_items(
+        booking_request_id
+    )
+    summaries = []
+
+    for item in items:
+        summaries.append(
+            format_cart_item_summary(item)
+        )
+
+    return summaries
+
+
+def booking_request_schedule_summary(
+    booking_request: dict,
+) -> str:
+    preferred_date = booking_request.get(
+        "preferred_date"
+    )
+    preferred_time = booking_request.get(
+        "preferred_time"
+    )
+
+    if preferred_date and preferred_time:
+        return format_customer_slot(
+            preferred_date,
+            preferred_time,
+        )
+
+    if preferred_date:
+        return (
+            f"{format_customer_date(preferred_date)} "
+            "— time still needed"
+        )
+
+    if preferred_time:
+        return (
+            f"time requested: "
+            f"{format_customer_time(preferred_time)} "
+            "— day still needed"
+        )
+
+    return "day and time still needed"
+
+
+def format_single_booking_request_summary(
+    booking_request: dict,
+) -> str:
+    request_number = int(
+        booking_request.get("request_number") or 0
+    )
+    status_label = booking_request_status_for_customer(
+        booking_request.get("request_status")
+    )
+    schedule_label = booking_request_schedule_summary(
+        booking_request
+    )
+    item_summaries = booking_request_items_summary(
+        int(booking_request["id"])
+    )
+
+    lines = [
+        f"{request_number}. {status_label}",
+        f"   When: {schedule_label}",
+    ]
+
+    if item_summaries:
+        lines.append(
+            "   Treatments: "
+            + "; ".join(item_summaries)
+        )
+    else:
+        lines.append(
+            "   Treatments: details still needed"
+        )
+
+    item_count = int(
+        booking_request.get("item_count") or 0
+    )
+
+    if item_count > 1:
+        total_price = format_price_pence(
+            booking_request.get("total_price_pence")
+        )
+        total_duration = format_minutes_as_duration(
+            booking_request.get("total_duration_minutes")
+        )
+        total_details = [
+            value
+            for value in [
+                total_price,
+                total_duration,
+            ]
+            if value
+        ]
+
+        if total_details:
+            lines.append(
+                "   Combined total: "
+                + ", ".join(total_details)
+            )
+
+    return "\n".join(lines)
+
+
+def build_customer_booking_summary(
+    session_id: str,
+) -> str:
+    """
+    Build a clear summary from relational booking data.
+
+    Active requests are shown first. Cancelled, declined, abandoned, and
+    expired requests are shown separately so the customer can distinguish
+    what remains active from what is no longer proceeding.
+    """
+    booking_requests = load_booking_requests_for_summary(
+        session_id
+    )
+    pending_actions = load_pending_booking_actions(
+        session_id
+    )
+
+    if not booking_requests and not pending_actions:
+        return (
+            "You do not currently have any appointment requests recorded "
+            "in this chat. Which treatment would you like to arrange?"
+        )
+
+    inactive_statuses = {
+        "cancelled_by_customer",
+        "declined",
+        "abandoned",
+        "expired",
+    }
+    active_requests = [
+        request
+        for request in booking_requests
+        if request.get("request_status")
+        not in inactive_statuses
+    ]
+    inactive_requests = [
+        request
+        for request in booking_requests
+        if request.get("request_status")
+        in inactive_statuses
+    ]
+
+    sections = []
+
+    if active_requests:
+        active_lines = [
+            "You currently have:"
+        ]
+
+        for request in active_requests:
+            active_lines.append(
+                format_single_booking_request_summary(
+                    request
+                )
+            )
+
+        if not any(
+            request.get("request_status") == "confirmed"
+            for request in active_requests
+        ):
+            active_lines.append(
+                "These are appointment requests, not confirmed bookings. "
+                "The therapist still needs to confirm them."
+            )
+
+        sections.append(
+            "\n\n".join(active_lines)
+        )
+    else:
+        sections.append(
+            "You do not currently have any active appointment requests."
+        )
+
+    if pending_actions:
+        names = [
+            str(
+                action.get("service_name")
+                or "an additional treatment"
+            )
+            for action in pending_actions
+        ]
+
+        sections.append(
+            "Still waiting for your decision: "
+            + "; ".join(names)
+            + ". Please tell me whether you want "
+            + (
+                "it"
+                if len(names) == 1
+                else "them"
+            )
+            + " added to an existing visit or arranged as "
+            "a separate appointment request."
+        )
+
+    if inactive_requests:
+        inactive_lines = [
+            "No longer active:"
+        ]
+
+        for request in inactive_requests:
+            inactive_lines.append(
+                format_single_booking_request_summary(
+                    request
+                )
+            )
+
+        sections.append(
+            "\n\n".join(inactive_lines)
+        )
+
+    return "\n\n".join(sections)
+
+
 async def chat(
     request: ChatRequest,
     background_tasks: BackgroundTasks
@@ -9143,6 +9470,22 @@ async def chat(
     existing_before_processing = get_existing_conversation(
         request.session_id
     )
+
+    if customer_asks_for_booking_summary(
+        request.message
+    ):
+        reply = build_customer_booking_summary(
+            request.session_id
+        )
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
 
     if (
         booking_request_is_complete(existing_before_processing)
