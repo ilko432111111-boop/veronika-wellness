@@ -3038,6 +3038,181 @@ def find_dermal_filler_service(
     return max(matches, key=lambda item: item[0])[1]
 
 
+DERMAL_FILLER_AREA_LABELS = {
+    "lip": "Lip Filler",
+    "marionette": "Marionette Lines",
+    "nasolabial": "Nasolabial Folds",
+}
+
+
+def dermal_filler_area_from_text(
+    value: str | None,
+) -> str | None:
+    """
+    Resolve the treatment area even when the customer has not chosen the
+    amount yet.
+
+    Examples:
+      "lip filler instead" -> lip
+      "marionette lines" -> marionette
+      "nasolabial folds" -> nasolabial
+    """
+    cleaned = normalise_service_match_text(value)
+
+    if not cleaned:
+        return None
+
+    if "lip" in cleaned:
+        return "lip"
+
+    if "marionette" in cleaned:
+        return "marionette"
+
+    if "nasolabial" in cleaned:
+        return "nasolabial"
+
+    return None
+
+
+def dermal_filler_partial_treatment(
+    area: str,
+) -> str:
+    label = DERMAL_FILLER_AREA_LABELS.get(area)
+
+    if not label:
+        return "Dermal Filler"
+
+    return f"Dermal Filler — {label}"
+
+
+def dermal_filler_partial_area(
+    treatment: str | None,
+) -> str | None:
+    cleaned = normalise_service_match_text(treatment)
+
+    if not cleaned.startswith("dermal filler"):
+        return None
+
+    return dermal_filler_area_from_text(cleaned)
+
+
+def is_partial_dermal_filler_treatment(
+    treatment: str | None,
+) -> bool:
+    cleaned = normalise_service_match_text(treatment)
+
+    return bool(
+        cleaned.startswith("dermal filler")
+        and dermal_filler_partial_area(treatment)
+        and find_dermal_filler_service(treatment) is None
+    )
+
+
+def dermal_filler_services_for_area(
+    area: str | None,
+) -> list[dict]:
+    if not area:
+        return []
+
+    matches = []
+
+    for service in load_dermal_filler_services()[0]:
+        if dermal_filler_area_from_text(
+            service.get("service_name")
+        ) == area:
+            matches.append(service)
+
+    return matches
+
+
+def find_dermal_filler_service_for_partial_reply(
+    current_treatment: str | None,
+    latest_message: str,
+) -> dict | None:
+    """
+    Resolve short amount-only replies after the area has already been chosen.
+
+    Example:
+      active partial choice: Lip Filler
+      newest message: 0.5 ml
+      resolved service: Dermal Filler — Lip Filler 0.5 ml
+    """
+    area = dermal_filler_partial_area(
+        current_treatment
+    )
+
+    if not area:
+        return None
+
+    return find_service_from_short_variant_reply(
+        latest_message,
+        dermal_filler_services_for_area(area),
+        category_tokens={
+            "dermal",
+            "filler",
+            "fillers",
+            "lip",
+            "marionette",
+            "lines",
+            "nasolabial",
+            "folds",
+        },
+    )
+
+
+def customer_asks_dermal_filler_areas(
+    message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(message)
+
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "which area",
+            "which areas",
+            "what area",
+            "what areas",
+            "areas do you do",
+            "where can",
+            "what do you do",
+        ]
+    )
+
+
+def build_dermal_filler_variant_prompt(
+    lead_data: dict,
+    latest_message: str | None = None,
+) -> str:
+    area = dermal_filler_partial_area(
+        lead_data.get("treatment")
+    )
+
+    if area:
+        label = DERMAL_FILLER_AREA_LABELS[area]
+        amount_question = (
+            f"For {label.lower()}, would you like 0.5 ml "
+            "(£70, 45 minutes) or 1 ml (£100, 1 hour)?"
+        )
+
+        if customer_asks_dermal_filler_areas(
+            latest_message or ""
+        ):
+            return (
+                "Dermal fillers are available for the lips, marionette "
+                "lines, or nasolabial folds. "
+                + amount_question
+            )
+
+        return amount_question
+
+    return (
+        "Dermal fillers are available for the lips, marionette lines, "
+        "or nasolabial folds. A 0.5 ml treatment is £70 and takes "
+        "45 minutes. A 1 ml treatment is £100 and takes 1 hour. "
+        "Which area and amount would you like?"
+    )
+
+
 def dermal_filler_message_is_generic(value: str | None) -> bool:
     cleaned = normalise_service_match_text(value)
 
@@ -3078,6 +3253,14 @@ def apply_dynamic_dermal_filler_details(
         latest_message
     )
 
+    if not service and is_partial_dermal_filler_treatment(
+        result.get("treatment")
+    ):
+        service = find_dermal_filler_service_for_partial_reply(
+            result.get("treatment"),
+            latest_message,
+        )
+
     if not service and current_treatment == "dermal filler":
         service = find_service_from_short_variant_reply(
             latest_message,
@@ -3105,7 +3288,28 @@ def apply_dynamic_dermal_filler_details(
 
         return result
 
-    if current_treatment == "dermal filler":
+    latest_area = dermal_filler_area_from_text(
+        latest_message
+    )
+
+    if latest_area:
+        result["treatment"] = dermal_filler_partial_treatment(
+            latest_area
+        )
+        result["duration"] = None
+        result["status"] = calculate_lead_status(
+            result,
+            result.get("status"),
+        )
+        result["notification_sent_at"] = None
+        return result
+
+    if (
+        current_treatment == "dermal filler"
+        or is_partial_dermal_filler_treatment(
+            result.get("treatment")
+        )
+    ):
         result["duration"] = None
         result["status"] = calculate_lead_status(
             result,
@@ -3152,11 +3356,11 @@ def apply_dynamic_dermal_filler_details(
 
 
 def needs_dermal_filler_variant(lead_data: dict) -> bool:
+    treatment = lead_data.get("treatment")
+
     return (
-        normalise_treatment_name(
-            lead_data.get("treatment")
-        )
-        == "dermal filler"
+        normalise_treatment_name(treatment) == "dermal filler"
+        or is_partial_dermal_filler_treatment(treatment)
     )
 
 
@@ -3266,6 +3470,69 @@ def structured_service_identity(
             "allowed_durations_minutes": None,
         }
 
+    if is_partial_dermal_filler_treatment(treatment):
+        return {
+            "category": "dermal_fillers",
+            "service_name": str(treatment),
+            "booking_mode": "choose_variant",
+            "fixed_duration_minutes": None,
+            "allowed_durations_minutes": None,
+        }
+
+    return None
+
+
+def resolve_latest_generic_or_partial_service(
+    latest_message: str,
+) -> dict | None:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    if not cleaned:
+        return None
+
+    area = dermal_filler_area_from_text(
+        latest_message
+    )
+
+    if area and (
+        "filler" in cleaned
+        or "dermal" in cleaned
+        or "instead" in cleaned
+        or "change" in cleaned
+        or "switch" in cleaned
+    ):
+        return {
+            "category": "dermal_fillers",
+            "service_name": dermal_filler_partial_treatment(area),
+            "booking_mode": "choose_variant",
+            "fixed_duration_minutes": None,
+            "allowed_durations_minutes": None,
+        }
+
+    generic_checks = [
+        ("vitamin_shots", "Vitamin Shot", ["vitamin shot"]),
+        ("ultrasound", "Ultrasound", ["ultrasound"]),
+        ("microneedling", "Microneedling", ["microneedling"]),
+        ("facials", "Facial", ["facial"]),
+        (
+            "dermal_fillers",
+            "Dermal Filler",
+            ["dermal filler", "dermal fillers", "fillers"],
+        ),
+    ]
+
+    for category, service_name, phrases in generic_checks:
+        if any(phrase in cleaned for phrase in phrases):
+            return {
+                "category": category,
+                "service_name": service_name,
+                "booking_mode": "choose_variant",
+                "fixed_duration_minutes": None,
+                "allowed_durations_minutes": None,
+            }
+
     return None
 
 
@@ -3305,6 +3572,13 @@ def resolve_latest_structured_service(
                     "allowed_durations_minutes"
                 ),
             }
+
+    generic_or_partial = resolve_latest_generic_or_partial_service(
+        latest_message
+    )
+
+    if generic_or_partial:
+        return generic_or_partial
 
     current = normalise_treatment_name(existing_treatment)
 
@@ -3886,6 +4160,51 @@ def is_valid_phone_number(value: str | None) -> bool:
     digits = re.sub(r"\D", "", str(value))
 
     return 10 <= len(digits) <= 15
+
+
+def customer_message_interrupts_contact_collection(
+    latest_message: str,
+) -> bool:
+    """
+    Do not force name or phone validation when the customer is asking a side
+    question, changing treatment, or clarifying a treatment variant.
+    """
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    if not cleaned:
+        return False
+
+    if "?" in str(latest_message or ""):
+        return True
+
+    interruption_phrases = [
+        "actually",
+        "instead",
+        "change",
+        "switch",
+        "what",
+        "which",
+        "how much",
+        "do you",
+        "can i",
+        "could i",
+        "where",
+    ]
+
+    if any(
+        phrase in cleaned
+        for phrase in interruption_phrases
+    ):
+        return True
+
+    if resolve_latest_generic_or_partial_service(
+        latest_message
+    ):
+        return True
+
+    return False
 
 
 def validate_latest_customer_details(
@@ -4671,11 +4990,8 @@ def build_schedule_first_question(lead_data: dict) -> str:
         )
 
     if needs_dermal_filler_variant(lead_data):
-        return (
-            "Dermal fillers are available for the lips, marionette lines, "
-            "or nasolabial folds. A 0.5 ml treatment is £70 and takes "
-            "45 minutes. A 1 ml treatment is £100 and takes 1 hour. "
-            "Which area and amount would you like?"
+        return build_dermal_filler_variant_prompt(
+            lead_data
         )
 
     ultrasound_service = find_ultrasound_service(
@@ -5055,8 +5371,9 @@ def finalise_dynamic_service_reply(
         )
 
     if needs_dermal_filler_variant(lead_data):
-        return build_schedule_first_question(
-            lead_data
+        return build_dermal_filler_variant_prompt(
+            lead_data,
+            latest_message,
         )
 
     ultrasound_service = find_ultrasound_service(
@@ -5213,13 +5530,28 @@ def build_service_switch_reply(
     request clearly, show updated service details, then continue from the next
     genuinely missing field.
     """
-    summary = format_service_switch_summary(
-        lead_data
-    )
-    opening = (
-        "No problem. I've updated your request to "
-        f"{summary}."
-    )
+    if is_partial_dermal_filler_treatment(
+        lead_data.get("treatment")
+    ):
+        area = dermal_filler_partial_area(
+            lead_data.get("treatment")
+        )
+        label = DERMAL_FILLER_AREA_LABELS.get(
+            area,
+            "dermal filler",
+        )
+        opening = (
+            "No problem. I've changed the request to "
+            f"{label.lower()}."
+        )
+    else:
+        summary = format_service_switch_summary(
+            lead_data
+        )
+        opening = (
+            "No problem. I've updated your request to "
+            f"{summary}."
+        )
 
     status = str(
         calendar_result.get("status") or "not_checked"
@@ -7819,7 +8151,12 @@ async def chat(
         merged_lead,
         request.message,
         previous_assistant_message,
-        skip_contact_validation=bool(service_switch),
+        skip_contact_validation=(
+            bool(service_switch)
+            or customer_message_interrupts_contact_collection(
+                request.message
+            )
+        ),
     )
 
     save_conversation_overview(
