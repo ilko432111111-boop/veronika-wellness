@@ -5216,6 +5216,304 @@ def ensure_next_booking_question(
     return reply.rstrip() + "\n\n" + question
 
 
+def load_service_row_for_booking_item(
+    treatment: str | None,
+) -> dict | None:
+    """
+    Load the structured public.services row used for a booking item.
+
+    Use the database row when available so the shadow booking item remains
+    linked to owner-editable Supabase configuration. If the lookup fails,
+    retain a safe minimal fallback from the structured identity.
+    """
+    identity = structured_service_identity(
+        treatment
+    )
+
+    if not identity:
+        return None
+
+    service_name = identity.get("service_name")
+
+    if not service_name:
+        return None
+
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "id, category, service_name, booking_mode, "
+                "fixed_duration_minutes, allowed_durations_minutes, "
+                "price_pence, price_by_duration"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("service_name", service_name)
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        print(f"Could not load service row for booking item: {error}")
+
+    return {
+        "id": None,
+        "category": identity.get("category"),
+        "service_name": service_name,
+        "booking_mode": identity.get("booking_mode"),
+        "fixed_duration_minutes": identity.get(
+            "fixed_duration_minutes"
+        ),
+        "allowed_durations_minutes": identity.get(
+            "allowed_durations_minutes"
+        ),
+        "price_pence": None,
+        "price_by_duration": None,
+    }
+
+
+def booking_item_duration_minutes(
+    lead_data: dict,
+    service_row: dict,
+) -> int | None:
+    """
+    Resolve one authoritative duration for the active booking item.
+
+    Fixed-duration services use their structured Supabase value. Services such
+    as massage use the customer's selected duration.
+    """
+    fixed_duration = service_row.get(
+        "fixed_duration_minutes"
+    )
+
+    if fixed_duration not in [None, ""]:
+        try:
+            return int(fixed_duration)
+        except (TypeError, ValueError):
+            pass
+
+    return parse_duration_minutes(
+        lead_data.get("duration")
+    )
+
+
+def booking_item_price_pence(
+    service_row: dict,
+    duration_minutes: int | None,
+) -> int | None:
+    """
+    Resolve the configured fixed price or duration-specific price.
+    """
+    fixed_price = service_row.get("price_pence")
+
+    if fixed_price not in [None, ""]:
+        try:
+            return int(fixed_price)
+        except (TypeError, ValueError):
+            return None
+
+    prices = service_row.get("price_by_duration") or {}
+
+    if duration_minutes is None:
+        return None
+
+    value = prices.get(
+        str(duration_minutes)
+    )
+
+    if value in [None, ""]:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_active_draft_booking_request(
+    session_id: str,
+) -> dict | None:
+    try:
+        response = (
+            supabase.table("booking_requests")
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("request_status", "draft")
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        print(f"Could not load active draft booking request: {error}")
+
+    return None
+
+
+def next_booking_request_number(
+    session_id: str,
+) -> int:
+    try:
+        response = (
+            supabase.table("booking_requests")
+            .select("request_number")
+            .eq("session_id", session_id)
+            .order("request_number", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return int(
+                response.data[0].get("request_number") or 0
+            ) + 1
+
+    except Exception as error:
+        print(f"Could not calculate next booking request number: {error}")
+
+    return 1
+
+
+def update_conversation_active_booking_request(
+    session_id: str,
+    booking_request_id: int,
+):
+    try:
+        (
+            supabase.table("conversations")
+            .update({
+                "active_booking_request_id": booking_request_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("session_id", session_id)
+            .execute()
+        )
+
+    except Exception as error:
+        print(f"Could not save active booking request pointer: {error}")
+
+
+def sync_single_treatment_draft_request(
+    session_id: str,
+    lead_data: dict,
+    booking_flow_active: bool,
+):
+    """
+    Shadow-write the active single-treatment booking flow into the new tables.
+
+    This does not alter replies or notifications yet. It gives us a safe way to
+    verify that:
+      conversation -> draft booking request -> booking item
+    is populated correctly before treatment-cart behaviour is enabled.
+    """
+    if not booking_flow_active:
+        return
+
+    service_row = load_service_row_for_booking_item(
+        lead_data.get("treatment")
+    )
+
+    if not service_row:
+        return
+
+    duration_minutes = booking_item_duration_minutes(
+        lead_data,
+        service_row,
+    )
+
+    # booking_items.duration_minutes is intentionally required. For selectable
+    # services such as massage, wait until the client has chosen a duration.
+    if duration_minutes is None or duration_minutes <= 0:
+        return
+
+    price_pence = booking_item_price_pence(
+        service_row,
+        duration_minutes,
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    request_row = load_active_draft_booking_request(
+        session_id
+    )
+
+    request_payload = {
+        "session_id": session_id,
+        "request_status": "draft",
+        "appointment_structure": "single_service",
+        "preferred_date": lead_data.get("preferred_date"),
+        "preferred_time": lead_data.get("preferred_time"),
+        "slot_status": lead_data.get("slot_status") or "not_checked",
+        "item_count": 1,
+        "total_duration_minutes": duration_minutes,
+        "total_price_pence": price_pence or 0,
+        "missing_detail": lead_data.get("next_required_detail"),
+        "updated_at": now_iso,
+    }
+
+    try:
+        if request_row:
+            booking_request_id = int(
+                request_row["id"]
+            )
+
+            (
+                supabase.table("booking_requests")
+                .update(request_payload)
+                .eq("id", booking_request_id)
+                .execute()
+            )
+
+        else:
+            request_payload["request_number"] = (
+                next_booking_request_number(session_id)
+            )
+
+            response = (
+                supabase.table("booking_requests")
+                .insert(request_payload)
+                .execute()
+            )
+
+            if not response.data:
+                return
+
+            booking_request_id = int(
+                response.data[0]["id"]
+            )
+
+        item_payload = {
+            "booking_request_id": booking_request_id,
+            "service_id": service_row.get("id"),
+            "service_name": service_row.get("service_name"),
+            "category": service_row.get("category"),
+            "duration_minutes": duration_minutes,
+            "price_pence": price_pence,
+            "item_order": 1,
+            "updated_at": now_iso,
+        }
+
+        (
+            supabase.table("booking_items")
+            .upsert(
+                item_payload,
+                on_conflict="booking_request_id,item_order",
+            )
+            .execute()
+        )
+
+        update_conversation_active_booking_request(
+            session_id,
+            booking_request_id,
+        )
+
+    except Exception as error:
+        # Shadow persistence must never break the working customer chat.
+        print(f"Could not sync draft booking request shadow data: {error}")
+
+
 def save_conversation_overview(
     session_id: str,
     lead_data: dict,
@@ -7440,6 +7738,12 @@ async def chat(
         session_id=request.session_id,
         lead_data=merged_lead,
         source=request_source,
+    )
+
+    sync_single_treatment_draft_request(
+        session_id=request.session_id,
+        lead_data=merged_lead,
+        booking_flow_active=booking_flow_active,
     )
 
     missing_fields = (
