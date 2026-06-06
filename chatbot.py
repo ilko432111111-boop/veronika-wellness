@@ -6304,7 +6304,7 @@ def detect_pending_cart_action_resolution(
         latest_message
     ):
         return {
-            "action": "separate_request_deferred",
+            "action": "create_separate_request",
             "pending_action": action,
         }
 
@@ -6577,6 +6577,324 @@ def calendar_lead_for_cart_action(
         )
 
     return result
+
+
+def active_lead_for_separate_request(
+    existing_lead: dict,
+    service_row: dict,
+    duration_minutes: int,
+) -> dict:
+    """
+    Build the conversations overview for the newly active separate draft.
+
+    Contact details remain attached to the conversation, but date and time are
+    cleared because they belong to the original appointment request.
+    """
+    result = dict(existing_lead)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    result["treatment"] = service_row.get(
+        "service_name"
+    )
+    result["duration"] = format_minutes_as_duration(
+        duration_minutes
+    )
+    result["preferred_date"] = None
+    result["preferred_time"] = None
+    result["status"] = "details_incomplete"
+    result["notification_sent_at"] = None
+    result["conversation_mode"] = "booking_request"
+    result["active_category"] = service_row.get(
+        "category"
+    )
+    result["slot_status"] = "not_checked"
+    result["next_required_detail"] = "preferred_date"
+    result["last_service_switch_at"] = now_iso
+
+    return result
+
+
+def restore_parked_request_after_failure(
+    session_id: str,
+    original_request_id: int,
+):
+    """
+    Best-effort rollback so a failed second-request creation cannot strand the
+    customer's original appointment as parked.
+    """
+    try:
+        (
+            supabase.table("booking_requests")
+            .update({
+                "request_status": "draft",
+                "parked_at": None,
+                "updated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            })
+            .eq("id", original_request_id)
+            .execute()
+        )
+
+        update_conversation_active_booking_request(
+            session_id,
+            original_request_id,
+        )
+
+    except Exception as error:
+        print(
+            "Could not restore original draft after separate-request "
+            f"failure: {error}"
+        )
+
+
+def create_separate_draft_booking_request(
+    session_id: str,
+    pending_action: dict,
+    existing_lead: dict,
+) -> dict | None:
+    """
+    Park the current draft and create one new independent appointment request.
+
+    Only one request remains actively editable as request_status='draft'.
+    The original appointment remains stored as parked_draft and is never
+    overwritten by the new request.
+    """
+    original_request = load_active_draft_booking_request(
+        session_id
+    )
+
+    if not original_request:
+        return {
+            "status": "missing_original_draft",
+        }
+
+    selected_identity = selected_identity_from_pending_action(
+        pending_action
+    )
+
+    if not selected_identity:
+        return {
+            "status": "missing_service",
+        }
+
+    new_item = cart_item_from_selected_identity(
+        selected_identity
+    )
+
+    if not new_item:
+        return {
+            "status": "needs_duration",
+            "selected_service_name": selected_identity.get(
+                "service_name"
+            ),
+        }
+
+    service_row = new_item["service_row"]
+    duration_minutes = int(
+        new_item["duration_minutes"]
+    )
+    price_pence = new_item.get("price_pence")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    original_request_id = int(
+        original_request["id"]
+    )
+    new_request_id = None
+
+    try:
+        # Park first: the database intentionally permits only one active
+        # request_status='draft' row for a session.
+        (
+            supabase.table("booking_requests")
+            .update({
+                "request_status": "parked_draft",
+                "parked_at": now_iso,
+                "updated_at": now_iso,
+            })
+            .eq("id", original_request_id)
+            .execute()
+        )
+
+        response = (
+            supabase.table("booking_requests")
+            .insert({
+                "session_id": session_id,
+                "request_number": next_booking_request_number(
+                    session_id
+                ),
+                "request_status": "draft",
+                "appointment_structure": "single_service",
+                "preferred_date": None,
+                "preferred_time": None,
+                "slot_status": "not_checked",
+                "item_count": 1,
+                "total_duration_minutes": duration_minutes,
+                "total_price_pence": price_pence or 0,
+                "missing_detail": "preferred_date",
+                "updated_at": now_iso,
+            })
+            .execute()
+        )
+
+        if not response.data:
+            raise RuntimeError(
+                "Supabase returned no new booking request row."
+            )
+
+        new_request_id = int(
+            response.data[0]["id"]
+        )
+
+        (
+            supabase.table("booking_items")
+            .insert({
+                "booking_request_id": new_request_id,
+                "service_id": service_row.get("id"),
+                "service_name": service_row.get(
+                    "service_name"
+                ),
+                "category": service_row.get("category"),
+                "duration_minutes": duration_minutes,
+                "price_pence": price_pence,
+                "item_order": 1,
+                "updated_at": now_iso,
+            })
+            .execute()
+        )
+
+        update_conversation_active_booking_request(
+            session_id,
+            new_request_id,
+        )
+
+        active_lead = active_lead_for_separate_request(
+            existing_lead,
+            service_row,
+            duration_minutes,
+        )
+
+        save_conversation_overview(
+            session_id=session_id,
+            lead_data=active_lead,
+            source=existing_lead.get("source") or "website",
+        )
+
+        if pending_action.get("id"):
+            update_pending_booking_action_status(
+                int(pending_action["id"]),
+                "resolved",
+            )
+
+        return {
+            "status": "created",
+            "original_request": original_request,
+            "new_request_id": new_request_id,
+            "service_row": service_row,
+            "duration_minutes": duration_minutes,
+            "price_pence": price_pence,
+        }
+
+    except Exception as error:
+        print(
+            "Could not create separate appointment request: "
+            f"{error}"
+        )
+
+        if new_request_id is not None:
+            try:
+                (
+                    supabase.table("booking_requests")
+                    .delete()
+                    .eq("id", new_request_id)
+                    .execute()
+                )
+            except Exception as cleanup_error:
+                print(
+                    "Could not remove failed second appointment draft: "
+                    f"{cleanup_error}"
+                )
+
+        restore_parked_request_after_failure(
+            session_id,
+            original_request_id,
+        )
+
+        return {
+            "status": "failed",
+        }
+
+
+def format_original_request_summary(
+    original_request: dict,
+) -> str:
+    items = load_booking_items(
+        int(original_request["id"])
+    )
+    names = [
+        str(item.get("service_name") or "Treatment")
+        for item in items
+    ]
+
+    if names:
+        treatment_text = "; ".join(names)
+    else:
+        treatment_text = "your original appointment"
+
+    preferred_date = original_request.get(
+        "preferred_date"
+    )
+    preferred_time = original_request.get(
+        "preferred_time"
+    )
+
+    if preferred_date and preferred_time:
+        return (
+            f"{treatment_text} for "
+            f"{format_customer_slot(preferred_date, preferred_time)}"
+        )
+
+    return treatment_text
+
+
+def build_separate_request_started_reply(
+    separate_result: dict,
+    session_id: str,
+) -> str:
+    original_summary = format_original_request_summary(
+        separate_result["original_request"]
+    )
+    service_row = separate_result["service_row"]
+    service_name = str(
+        service_row.get("service_name")
+        or "the new treatment"
+    )
+    price = format_price_pence(
+        separate_result.get("price_pence")
+    )
+    duration = format_minutes_as_duration(
+        separate_result.get("duration_minutes")
+    )
+    details = [
+        value
+        for value in [price, duration]
+        if value
+    ]
+    new_summary = service_name
+
+    if details:
+        new_summary += " — " + ", ".join(details)
+
+    reply = (
+        f"No problem. Your original request for {original_summary} "
+        "is still saved unchanged. "
+        f"I've started a separate appointment request for {new_summary}.\n\n"
+        "Which day and time would suit you for the separate appointment?"
+    )
+
+    return append_pending_action_reminder(
+        reply,
+        session_id,
+    )
 
 
 def sync_same_visit_treatment_item(
@@ -9348,21 +9666,43 @@ async def chat(
     if (
         cart_intent
         and cart_intent.get("action")
-        == "separate_request_deferred"
+        == "create_separate_request"
     ):
-        pending_action = (
-            cart_intent.get("pending_action") or {}
-        )
-        service_name = str(
-            pending_action.get("service_name")
-            or "that treatment"
+        separate_result = create_separate_draft_booking_request(
+            session_id=request.session_id,
+            pending_action=(
+                cart_intent.get("pending_action")
+                or {}
+            ),
+            existing_lead=existing_lead,
         )
 
-        reply = (
-            f"No problem. I have kept {service_name} aside as a "
-            "separate appointment request. Your current appointment "
-            "has not been changed."
-        )
+        if (
+            separate_result
+            and separate_result.get("status") == "created"
+        ):
+            reply = build_separate_request_started_reply(
+                separate_result,
+                request.session_id,
+            )
+        elif (
+            separate_result
+            and separate_result.get("status") == "needs_duration"
+        ):
+            service_name = str(
+                separate_result.get("selected_service_name")
+                or "the additional treatment"
+            )
+            reply = (
+                f"Before I start a separate request for {service_name}, "
+                "how long would you like the session for?"
+            )
+        else:
+            reply = (
+                "I could not start the separate appointment request just "
+                "now. Your original request is still saved unchanged. "
+                "Please try again shortly or call 07943319617."
+            )
 
         save_message(
             session_id=request.session_id,
