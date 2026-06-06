@@ -6107,6 +6107,46 @@ def update_pending_booking_action_status(
         print(f"Could not update pending booking action: {error}")
 
 
+
+def resolve_matching_pending_booking_actions(
+    session_id: str,
+    service_name: str | None,
+):
+    """
+    Resolve any unanswered appointment-structure question for a service that
+    has now been explicitly added to the same visit.
+    """
+    cleaned_name = str(service_name or "").strip()
+
+    if not cleaned_name:
+        return
+
+    try:
+        response = (
+            supabase.table("pending_booking_actions")
+            .select("id")
+            .eq("session_id", session_id)
+            .eq("service_name", cleaned_name)
+            .eq(
+                "action_type",
+                "choose_appointment_structure",
+            )
+            .eq("action_status", "pending")
+            .execute()
+        )
+
+        for row in response.data or []:
+            update_pending_booking_action_status(
+                int(row["id"]),
+                "resolved",
+            )
+
+    except Exception as error:
+        print(
+            "Could not resolve matching pending booking action: "
+            f"{error}"
+        )
+
 def latest_message_confirms_same_visit(
     latest_message: str,
 ) -> bool:
@@ -8878,17 +8918,22 @@ async def chat(
 
     extracted_lead = extract_lead_data(conversation_history)
     existing_lead = get_existing_conversation(request.session_id)
-    pending_cart_resolution = detect_pending_cart_action_resolution(
+    explicit_cart_intent = detect_treatment_cart_intent(
         session_id=request.session_id,
         latest_message=request.message,
+        existing_lead=existing_lead,
     )
-    cart_intent = (
-        pending_cart_resolution
-        or detect_treatment_cart_intent(
+    pending_cart_resolution = (
+        None
+        if explicit_cart_intent
+        else detect_pending_cart_action_resolution(
             session_id=request.session_id,
             latest_message=request.message,
-            existing_lead=existing_lead,
         )
+    )
+    cart_intent = (
+        explicit_cart_intent
+        or pending_cart_resolution
     )
     merged_lead = merge_lead_data(existing_lead, extracted_lead)
 
@@ -9035,6 +9080,7 @@ async def chat(
         previous_assistant_message,
         skip_contact_validation=(
             bool(service_switch)
+            or bool(cart_intent)
             or customer_message_interrupts_contact_collection(
                 request.message
             )
@@ -9145,11 +9191,20 @@ async def chat(
                 "added",
                 "already_present",
             }
-            and cart_intent.get("pending_action_id")
         ):
-            update_pending_booking_action_status(
-                int(cart_intent["pending_action_id"]),
-                "resolved",
+            if cart_intent.get("pending_action_id"):
+                update_pending_booking_action_status(
+                    int(cart_intent["pending_action_id"]),
+                    "resolved",
+                )
+
+            selected_identity = (
+                cart_intent.get("selected_identity")
+                or {}
+            )
+            resolve_matching_pending_booking_actions(
+                request.session_id,
+                selected_identity.get("service_name"),
             )
     elif not cart_intent:
         sync_single_treatment_draft_request(
