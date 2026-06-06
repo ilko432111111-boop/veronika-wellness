@@ -9126,7 +9126,6 @@ async def google_calendar_status():
     }
 
 
-@app.post("/chat")
 def customer_asks_for_booking_summary(
     latest_message: str,
 ) -> bool:
@@ -9454,6 +9453,7 @@ def build_customer_booking_summary(
     return "\n\n".join(sections)
 
 
+@app.post("/chat")
 async def chat(
     request: ChatRequest,
     background_tasks: BackgroundTasks
