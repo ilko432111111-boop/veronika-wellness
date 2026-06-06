@@ -9540,6 +9540,1155 @@ def build_customer_booking_summary(
 
 
 @app.post("/chat")
+def identity_key(
+    identity: dict,
+) -> tuple[str, str]:
+    return (
+        str(identity.get("category") or "").strip(),
+        normalise_treatment_name(
+            identity.get("service_name")
+        ),
+    )
+
+
+def dedupe_service_identities(
+    identities: list[dict],
+) -> list[dict]:
+    seen = set()
+    result = []
+
+    for identity in identities:
+        key = identity_key(identity)
+
+        if not key[1] or key in seen:
+            continue
+
+        seen.add(key)
+        result.append(identity)
+
+    return result
+
+
+def generic_massage_identity() -> dict:
+    return {
+        "category": "massage",
+        "service_name": "Massage",
+        "booking_mode": "choose_variant",
+        "fixed_duration_minutes": None,
+        "allowed_durations_minutes": None,
+    }
+
+
+def message_explicitly_requests_same_visit(
+    latest_message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    phrases = [
+        "together",
+        "same visit",
+        "same appointment",
+        "back to back",
+        "one after another",
+        "straight after",
+        "during the same visit",
+    ]
+
+    return any(
+        phrase in cleaned
+        for phrase in phrases
+    )
+
+
+def split_multi_service_message(
+    latest_message: str,
+) -> list[str]:
+    """
+    Split only on clear service-list separators.
+
+    The full message is also scanned separately, so this helper does not need
+    to understand every sentence structure.
+    """
+    cleaned = str(latest_message or "")
+
+    pieces = re.split(
+        r"(?i)\s*(?:,|&|\+|\band\b|\bplus\b|\bwith\b|\btogether\b)\s*",
+        cleaned,
+    )
+
+    return [
+        piece.strip()
+        for piece in pieces
+        if piece.strip()
+    ]
+
+
+def detect_all_structured_services(
+    latest_message: str,
+) -> list[dict]:
+    """
+    Resolve every service explicitly mentioned in the newest customer message.
+
+    Existing single-service resolvers return only one result. This controller
+    scans each list segment and each structured category independently so
+    same-category combinations such as Body Sculpting + EMS are preserved.
+    """
+    identities = []
+
+    direct_lookups = [
+        ("massage", find_massage_service),
+        ("vitamin_shots", find_vitamin_shot_service),
+        ("ultrasound", find_ultrasound_service),
+        ("body_treatments", find_body_treatment_service),
+        ("microneedling", find_microneedling_service),
+        ("facials", find_facial_service),
+        ("dermal_fillers", find_dermal_filler_service),
+    ]
+
+    segments = split_multi_service_message(
+        latest_message
+    )
+
+    for segment in segments:
+        resolved = resolve_latest_structured_service(
+            segment
+        )
+
+        if resolved:
+            identities.append(resolved)
+            continue
+
+        cleaned_segment = normalise_service_match_text(
+            segment
+        )
+
+        if re.search(r"\bmassages?\b", cleaned_segment):
+            identities.append(
+                generic_massage_identity()
+            )
+
+    # Scan category finders against the full message as a second pass.
+    # This improves recall when the customer's grammar is less tidy.
+    for category, finder in direct_lookups:
+        service = finder(latest_message)
+
+        if service:
+            identities.append({
+                "category": category,
+                "service_name": service.get("service_name"),
+                "booking_mode": service.get("booking_mode"),
+                "fixed_duration_minutes": service.get(
+                    "fixed_duration_minutes"
+                ),
+                "allowed_durations_minutes": service.get(
+                    "allowed_durations_minutes"
+                ),
+            })
+
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    if (
+        re.search(r"\bmassages?\b", cleaned)
+        and not any(
+            identity.get("category") == "massage"
+            for identity in identities
+        )
+    ):
+        identities.append(
+            generic_massage_identity()
+        )
+
+    # Preserve partial filler choices such as "lip filler" when amount is
+    # still missing.
+    generic_or_partial = resolve_latest_generic_or_partial_service(
+        latest_message
+    )
+
+    if generic_or_partial and not any(
+        identity.get("category")
+        == generic_or_partial.get("category")
+        for identity in identities
+    ):
+        identities.append(
+            generic_or_partial
+        )
+
+    return dedupe_service_identities(
+        identities
+    )
+
+
+def load_pending_service_detail_actions(
+    session_id: str,
+) -> list[dict]:
+    try:
+        response = (
+            supabase.table("pending_booking_actions")
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("action_status", "pending")
+            .in_(
+                "action_type",
+                ["choose_variant", "choose_duration"],
+            )
+            .order("created_at")
+            .execute()
+        )
+
+        return list(response.data or [])
+
+    except Exception as error:
+        print(
+            "Could not load pending service-detail actions: "
+            f"{error}"
+        )
+        return []
+
+
+def save_pending_service_detail_action(
+    session_id: str,
+    identity: dict,
+    action_type: str,
+    source_message: str,
+) -> dict | None:
+    service_name = str(
+        identity.get("service_name") or ""
+    ).strip()
+
+    if (
+        not service_name
+        or action_type not in {
+            "choose_variant",
+            "choose_duration",
+        }
+    ):
+        return None
+
+    service_row = load_service_row_for_booking_item(
+        service_name
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    payload = {
+        "session_id": session_id,
+        "service_id": (
+            service_row.get("id")
+            if service_row
+            else None
+        ),
+        "service_name": service_name,
+        "category": (
+            identity.get("category")
+            or (
+                service_row.get("category")
+                if service_row
+                else None
+            )
+        ),
+        "action_type": action_type,
+        "action_status": "pending",
+        "source_message": source_message,
+        "updated_at": now_iso,
+    }
+
+    try:
+        existing_response = (
+            supabase.table("pending_booking_actions")
+            .select("id")
+            .eq("session_id", session_id)
+            .eq("service_name", service_name)
+            .eq("action_type", action_type)
+            .eq("action_status", "pending")
+            .limit(1)
+            .execute()
+        )
+
+        if existing_response.data:
+            action_id = int(
+                existing_response.data[0]["id"]
+            )
+
+            response = (
+                supabase.table("pending_booking_actions")
+                .update(payload)
+                .eq("id", action_id)
+                .execute()
+            )
+        else:
+            response = (
+                supabase.table("pending_booking_actions")
+                .insert(payload)
+                .execute()
+            )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        print(
+            "Could not save pending service-detail action: "
+            f"{error}"
+        )
+
+    return None
+
+
+def update_pending_service_detail_action(
+    action_id: int,
+    identity: dict,
+    action_type: str,
+):
+    service_name = str(
+        identity.get("service_name") or ""
+    ).strip()
+    service_row = load_service_row_for_booking_item(
+        service_name
+    )
+
+    try:
+        (
+            supabase.table("pending_booking_actions")
+            .update({
+                "service_id": (
+                    service_row.get("id")
+                    if service_row
+                    else None
+                ),
+                "service_name": service_name,
+                "category": (
+                    identity.get("category")
+                    or (
+                        service_row.get("category")
+                        if service_row
+                        else None
+                    )
+                ),
+                "action_type": action_type,
+                "updated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            })
+            .eq("id", action_id)
+            .execute()
+        )
+
+    except Exception as error:
+        print(
+            "Could not update pending service-detail action: "
+            f"{error}"
+        )
+
+
+def pending_action_needs_variant(
+    identity: dict,
+) -> bool:
+    return (
+        identity.get("booking_mode") == "choose_variant"
+        or identity.get("service_name") in {
+            "Massage",
+            "Vitamin Shot",
+            "Ultrasound",
+            "Microneedling",
+            "Facial",
+            "Dermal Filler",
+        }
+        or is_partial_dermal_filler_treatment(
+            identity.get("service_name")
+        )
+    )
+
+
+def pending_action_needs_duration(
+    identity: dict,
+) -> bool:
+    allowed = identity.get(
+        "allowed_durations_minutes"
+    ) or []
+
+    return bool(
+        allowed
+        and not identity.get(
+            "fixed_duration_minutes"
+        )
+    )
+
+
+def build_pending_service_detail_question(
+    action: dict,
+) -> str:
+    service_name = str(
+        action.get("service_name") or ""
+    )
+    category = str(
+        action.get("category") or ""
+    )
+    action_type = str(
+        action.get("action_type") or ""
+    )
+
+    if action_type == "choose_duration":
+        service_row = load_service_row_for_booking_item(
+            service_name
+        ) or {}
+        durations = service_row.get(
+            "allowed_durations_minutes"
+        ) or []
+        options = format_duration_options(
+            {int(value) for value in durations}
+        ) if durations else ""
+
+        if options:
+            return (
+                f"How long would you like the {service_name} for: "
+                f"{options}?"
+            )
+
+        return (
+            f"How long would you like the {service_name} for?"
+        )
+
+    if category == "massage":
+        return (
+            "Which massage would you like: Relaxing Massage, Swedish "
+            "Massage, Deep Tissue Massage, or Hot Stone Massage?"
+        )
+
+    if category == "dermal_fillers":
+        return build_dermal_filler_variant_prompt({
+            "treatment": service_name,
+        })
+
+    if category == "vitamin_shots":
+        return (
+            "Would you like a B12 Vitamin Shot or a Vitamin C Shot? "
+            "Both cost £20 and take 15 minutes."
+        )
+
+    if category == "ultrasound":
+        return (
+            "Would you like a single ultrasound session (£50, 45 minutes) "
+            "or the package of 5 sessions (£220 total, 45 minutes each)?"
+        )
+
+    if category == "microneedling":
+        return (
+            "Would you like microneedling for stretch marks (£60, "
+            "1 hour 15 minutes) or for the face and neck (£70, "
+            "1 hour 15 minutes)?"
+        )
+
+    if category == "facials":
+        return (
+            "Which facial would you like: Deep Facial Cleanse (£60, "
+            "60 minutes), Radio Frequency Facial (£60, 60 minutes), "
+            "Facial Treatment for Young Skin (£45, 60 minutes), "
+            "Hydraface Facial Treatment (£60, 60 minutes), or "
+            "Hydrafacial (£80, 90 minutes)?"
+        )
+
+    return (
+        f"Which {service_name or 'treatment'} option would you like?"
+    )
+
+
+def append_booking_item_to_request(
+    booking_request_id: int,
+    service_row: dict,
+    duration_minutes: int,
+) -> dict | None:
+    price_pence = booking_item_price_pence(
+        service_row,
+        duration_minutes,
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        items = load_booking_items(
+            booking_request_id
+        )
+
+        duplicate = next(
+            (
+                item
+                for item in items
+                if normalise_treatment_name(
+                    item.get("service_name")
+                )
+                == normalise_treatment_name(
+                    service_row.get("service_name")
+                )
+            ),
+            None,
+        )
+
+        if not duplicate:
+            next_order = (
+                max(
+                    [
+                        int(item.get("item_order") or 0)
+                        for item in items
+                    ]
+                    or [0]
+                )
+                + 1
+            )
+
+            (
+                supabase.table("booking_items")
+                .insert({
+                    "booking_request_id": booking_request_id,
+                    "service_id": service_row.get("id"),
+                    "service_name": service_row.get(
+                        "service_name"
+                    ),
+                    "category": service_row.get("category"),
+                    "duration_minutes": duration_minutes,
+                    "price_pence": price_pence,
+                    "item_order": next_order,
+                    "updated_at": now_iso,
+                })
+                .execute()
+            )
+
+        items = load_booking_items(
+            booking_request_id
+        )
+        total_duration = sum(
+            int(item.get("duration_minutes") or 0)
+            for item in items
+        )
+        total_price = sum(
+            int(item.get("price_pence") or 0)
+            for item in items
+        )
+
+        (
+            supabase.table("booking_requests")
+            .update({
+                "appointment_structure": (
+                    "back_to_back"
+                    if len(items) > 1
+                    else "single_service"
+                ),
+                "item_count": len(items),
+                "total_duration_minutes": total_duration,
+                "total_price_pence": total_price,
+                "updated_at": now_iso,
+            })
+            .eq("id", booking_request_id)
+            .execute()
+        )
+
+        return {
+            "items": items,
+            "item_count": len(items),
+            "total_duration_minutes": total_duration,
+            "total_price_pence": total_price,
+        }
+
+    except Exception as error:
+        print(
+            "Could not append booking item to request: "
+            f"{error}"
+        )
+        return None
+
+
+def create_initial_multi_service_request(
+    session_id: str,
+    identities: list[dict],
+    source_message: str,
+    source: str,
+) -> dict | None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    request_id = None
+
+    try:
+        response = (
+            supabase.table("booking_requests")
+            .insert({
+                "session_id": session_id,
+                "request_number": next_booking_request_number(
+                    session_id
+                ),
+                "request_status": "draft",
+                "appointment_structure": "back_to_back",
+                "preferred_date": parse_relative_date_from_text(
+                    source_message
+                ),
+                "preferred_time": parse_time_from_text(
+                    source_message
+                ),
+                "slot_status": "not_checked",
+                "item_count": 0,
+                "total_duration_minutes": 0,
+                "total_price_pence": 0,
+                "missing_detail": "service_variant",
+                "updated_at": now_iso,
+            })
+            .execute()
+        )
+
+        if not response.data:
+            return None
+
+        request_id = int(
+            response.data[0]["id"]
+        )
+
+        update_conversation_active_booking_request(
+            session_id,
+            request_id,
+        )
+
+        first_resolved_service = None
+
+        for identity in identities:
+            if pending_action_needs_variant(
+                identity
+            ):
+                save_pending_service_detail_action(
+                    session_id,
+                    identity,
+                    "choose_variant",
+                    source_message,
+                )
+                continue
+
+            service_row = load_service_row_for_booking_item(
+                identity.get("service_name")
+            )
+
+            if not service_row:
+                continue
+
+            fixed_duration = service_row.get(
+                "fixed_duration_minutes"
+            )
+
+            if fixed_duration not in [None, ""]:
+                duration_minutes = int(
+                    fixed_duration
+                )
+                append_booking_item_to_request(
+                    request_id,
+                    service_row,
+                    duration_minutes,
+                )
+
+                if not first_resolved_service:
+                    first_resolved_service = service_row
+
+                continue
+
+            if pending_action_needs_duration(
+                identity
+            ):
+                save_pending_service_detail_action(
+                    session_id,
+                    identity,
+                    "choose_duration",
+                    source_message,
+                )
+
+        items = load_booking_items(
+            request_id
+        )
+        pending_actions = load_pending_service_detail_actions(
+            session_id
+        )
+        request_row = load_active_draft_booking_request(
+            session_id
+        ) or {}
+
+        primary_item = (
+            items[0]
+            if items
+            else None
+        )
+        primary_name = (
+            primary_item.get("service_name")
+            if primary_item
+            else (
+                identities[0].get("service_name")
+                if identities
+                else "Multiple treatments"
+            )
+        )
+        primary_duration = (
+            format_minutes_as_duration(
+                primary_item.get("duration_minutes")
+            )
+            if primary_item
+            else None
+        )
+
+        lead_data = {
+            "treatment": primary_name,
+            "duration": primary_duration,
+            "preferred_date": request_row.get(
+                "preferred_date"
+            ),
+            "preferred_time": request_row.get(
+                "preferred_time"
+            ),
+            "status": "details_incomplete",
+            "summary": (
+                "Customer requested multiple treatments in one visit."
+            ),
+            "conversation_mode": "booking_request",
+            "active_category": (
+                primary_item.get("category")
+                if primary_item
+                else identities[0].get("category")
+            ),
+            "slot_status": "not_checked",
+            "next_required_detail": (
+                "service_variant"
+                if pending_actions
+                else (
+                    "preferred_date"
+                    if not request_row.get("preferred_date")
+                    else (
+                        "preferred_time"
+                        if not request_row.get("preferred_time")
+                        else "name"
+                    )
+                )
+            ),
+            "notification_sent_at": None,
+        }
+
+        save_conversation_overview(
+            session_id=session_id,
+            lead_data=lead_data,
+            source=source,
+        )
+
+        return {
+            "request_id": request_id,
+            "items": items,
+            "pending_actions": pending_actions,
+            "request": request_row,
+        }
+
+    except Exception as error:
+        print(
+            "Could not create initial multi-service request: "
+            f"{error}"
+        )
+
+        if request_id is not None:
+            try:
+                (
+                    supabase.table("booking_requests")
+                    .delete()
+                    .eq("id", request_id)
+                    .execute()
+                )
+            except Exception as cleanup_error:
+                print(
+                    "Could not clean failed initial multi-service request: "
+                    f"{cleanup_error}"
+                )
+
+        return None
+
+
+def format_multi_service_cart_summary(
+    request_id: int,
+) -> str:
+    items = load_booking_items(
+        request_id
+    )
+
+    if not items:
+        return ""
+
+    item_text = "; ".join(
+        format_cart_item_summary(item)
+        for item in items
+    )
+    total_duration = sum(
+        int(item.get("duration_minutes") or 0)
+        for item in items
+    )
+    total_price = sum(
+        int(item.get("price_pence") or 0)
+        for item in items
+    )
+
+    return (
+        f"Your same-visit request currently includes: {item_text}. "
+        f"Total so far: {format_price_pence(total_price)}, "
+        f"{format_minutes_as_duration(total_duration)}."
+    )
+
+
+def next_multi_service_question(
+    session_id: str,
+    request_id: int,
+) -> str:
+    pending_actions = load_pending_service_detail_actions(
+        session_id
+    )
+
+    if pending_actions:
+        return build_pending_service_detail_question(
+            pending_actions[0]
+        )
+
+    request_row = load_active_draft_booking_request(
+        session_id
+    ) or {}
+    preferred_date = request_row.get(
+        "preferred_date"
+    )
+    preferred_time = request_row.get(
+        "preferred_time"
+    )
+
+    if not preferred_date and not preferred_time:
+        return "Which day and time would suit you?"
+
+    if not preferred_date:
+        return (
+            f"Which day did you have in mind for "
+            f"{format_customer_time(preferred_time)}?"
+        )
+
+    if not preferred_time:
+        return (
+            f"What time would suit you on "
+            f"{format_customer_date(preferred_date)}?"
+        )
+
+    return (
+        "Could I take your name and phone number, please?"
+    )
+
+
+def build_initial_multi_service_reply(
+    session_id: str,
+    request_id: int,
+) -> str:
+    summary = format_multi_service_cart_summary(
+        request_id
+    )
+    question = next_multi_service_question(
+        session_id,
+        request_id,
+    )
+
+    if summary:
+        return summary + "\n\n" + question
+
+    return (
+        "I can help arrange those treatments together.\n\n"
+        + question
+    )
+
+
+def resolve_pending_variant_identity(
+    action: dict,
+    latest_message: str,
+) -> dict | None:
+    category = str(
+        action.get("category") or ""
+    )
+    service_name = str(
+        action.get("service_name") or ""
+    )
+
+    if category == "massage":
+        service = find_massage_service(
+            latest_message
+        )
+
+        if service:
+            return {
+                "category": "massage",
+                "service_name": service.get("service_name"),
+                "booking_mode": service.get("booking_mode"),
+                "fixed_duration_minutes": service.get(
+                    "fixed_duration_minutes"
+                ),
+                "allowed_durations_minutes": service.get(
+                    "allowed_durations_minutes"
+                ),
+            }
+
+    if category == "dermal_fillers":
+        service = (
+            find_dermal_filler_service(latest_message)
+            or find_dermal_filler_service_for_partial_reply(
+                service_name,
+                latest_message,
+            )
+        )
+
+        if service:
+            return {
+                "category": "dermal_fillers",
+                "service_name": service.get("service_name"),
+                "booking_mode": service.get("booking_mode"),
+                "fixed_duration_minutes": service.get(
+                    "fixed_duration_minutes"
+                ),
+                "allowed_durations_minutes": service.get(
+                    "allowed_durations_minutes"
+                ),
+            }
+
+    category_configs = {
+        "vitamin_shots": (
+            load_vitamin_shot_services,
+            {"vitamin", "shot", "shots"},
+        ),
+        "ultrasound": (
+            load_ultrasound_services,
+            {"ultrasound"},
+        ),
+        "microneedling": (
+            load_microneedling_services,
+            {"microneedling"},
+        ),
+        "facials": (
+            load_facial_services,
+            {"facial", "facials"},
+        ),
+    }
+
+    if category in category_configs:
+        loader, tokens = category_configs[category]
+        service = find_service_from_short_variant_reply(
+            latest_message,
+            loader()[0],
+            category_tokens=tokens,
+        )
+
+        if service:
+            return {
+                "category": category,
+                "service_name": service.get("service_name"),
+                "booking_mode": service.get("booking_mode"),
+                "fixed_duration_minutes": service.get(
+                    "fixed_duration_minutes"
+                ),
+                "allowed_durations_minutes": service.get(
+                    "allowed_durations_minutes"
+                ),
+            }
+
+    return None
+
+
+def handle_pending_multi_service_detail_reply(
+    session_id: str,
+    latest_message: str,
+) -> str | None:
+    actions = load_pending_service_detail_actions(
+        session_id
+    )
+
+    if not actions:
+        return None
+
+    action = actions[0]
+    request_row = load_active_draft_booking_request(
+        session_id
+    )
+
+    if not request_row:
+        return None
+
+    request_id = int(
+        request_row["id"]
+    )
+    action_type = action.get(
+        "action_type"
+    )
+
+    if action_type == "choose_variant":
+        identity = resolve_pending_variant_identity(
+            action,
+            latest_message,
+        )
+
+        if not identity:
+            return None
+
+        if pending_action_needs_duration(
+            identity
+        ):
+            update_pending_service_detail_action(
+                int(action["id"]),
+                identity,
+                "choose_duration",
+            )
+
+            summary = format_multi_service_cart_summary(
+                request_id
+            )
+            question = build_pending_service_detail_question({
+                **action,
+                "service_name": identity.get("service_name"),
+                "category": identity.get("category"),
+                "action_type": "choose_duration",
+            })
+
+            return (
+                (summary + "\n\n" if summary else "")
+                + question
+            )
+
+        service_row = load_service_row_for_booking_item(
+            identity.get("service_name")
+        )
+
+        if not service_row:
+            return None
+
+        duration_minutes = service_row.get(
+            "fixed_duration_minutes"
+        )
+
+        if duration_minutes in [None, ""]:
+            return None
+
+        append_booking_item_to_request(
+            request_id,
+            service_row,
+            int(duration_minutes),
+        )
+        update_pending_booking_action_status(
+            int(action["id"]),
+            "resolved",
+        )
+
+        return build_initial_multi_service_reply(
+            session_id,
+            request_id,
+        )
+
+    if action_type == "choose_duration":
+        service_row = load_service_row_for_booking_item(
+            action.get("service_name")
+        )
+
+        if not service_row:
+            return None
+
+        chosen_duration = parse_duration_minutes(
+            latest_message
+        )
+        allowed = {
+            int(value)
+            for value in (
+                service_row.get(
+                    "allowed_durations_minutes"
+                ) or []
+            )
+        }
+
+        if (
+            not chosen_duration
+            or (
+                allowed
+                and chosen_duration not in allowed
+            )
+        ):
+            options = format_duration_options(
+                allowed
+            ) if allowed else ""
+
+            if options:
+                return (
+                    f"Please choose one of the available durations "
+                    f"for {service_row.get('service_name')}: "
+                    f"{options}."
+                )
+
+            return (
+                f"Please tell me how long you would like "
+                f"{service_row.get('service_name')} for."
+            )
+
+        append_booking_item_to_request(
+            request_id,
+            service_row,
+            chosen_duration,
+        )
+        update_pending_booking_action_status(
+            int(action["id"]),
+            "resolved",
+        )
+
+        return build_initial_multi_service_reply(
+            session_id,
+            request_id,
+        )
+
+    return None
+
+
+def handle_initial_multi_service_intake(
+    session_id: str,
+    latest_message: str,
+    source: str,
+) -> str | None:
+    """
+    Intercept explicit same-visit multi-service requests before the old
+    single-treatment extractor can discard one of the treatments.
+    """
+    if load_active_draft_booking_request(
+        session_id
+    ):
+        return None
+
+    identities = detect_all_structured_services(
+        latest_message
+    )
+
+    if len(identities) < 2:
+        return None
+
+    if not message_explicitly_requests_same_visit(
+        latest_message
+    ):
+        names = "; ".join(
+            identity.get("service_name") or "treatment"
+            for identity in identities
+        )
+
+        return (
+            f"I can help with {names}. Would you like those treatments "
+            "during the same visit, or as separate appointment requests?"
+        )
+
+    result = create_initial_multi_service_request(
+        session_id=session_id,
+        identities=identities,
+        source_message=latest_message,
+        source=source,
+    )
+
+    if not result:
+        return (
+            "I could not start that combined treatment request just now. "
+            "Please try again shortly or call 07943319617."
+        )
+
+    return build_initial_multi_service_reply(
+        session_id,
+        int(result["request_id"]),
+    )
+
+
 async def chat(
     request: ChatRequest,
     background_tasks: BackgroundTasks
@@ -9721,6 +10870,41 @@ async def chat(
         history_lines.append(f"customer: {request.message}")
 
     conversation_history = "\n".join(history_lines[-20:])
+
+    pending_multi_service_reply = (
+        handle_pending_multi_service_detail_reply(
+            session_id=request.session_id,
+            latest_message=request.message,
+        )
+    )
+
+    if pending_multi_service_reply:
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=pending_multi_service_reply,
+            source=request_source,
+        )
+
+        return {"reply": pending_multi_service_reply}
+
+    initial_multi_service_reply = (
+        handle_initial_multi_service_intake(
+            session_id=request.session_id,
+            latest_message=request.message,
+            source=request_source,
+        )
+    )
+
+    if initial_multi_service_reply:
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=initial_multi_service_reply,
+            source=request_source,
+        )
+
+        return {"reply": initial_multi_service_reply}
 
     extracted_lead = extract_lead_data(conversation_history)
     existing_lead = get_existing_conversation(request.session_id)
