@@ -7377,12 +7377,24 @@ def format_customer_time(value: str | None) -> str:
     if value in [None, ""]:
         return "the requested time"
 
-    try:
-        parsed_time = datetime.strptime(str(value), "%H:%M")
-        return parsed_time.strftime("%H:%M")
+    raw_value = str(value).strip()
 
-    except ValueError:
-        return str(value)
+    for time_format in [
+        "%H:%M",
+        "%H:%M:%S",
+        "%H:%M:%S.%f",
+    ]:
+        try:
+            parsed_time = datetime.strptime(
+                raw_value,
+                time_format,
+            )
+            return parsed_time.strftime("%H:%M")
+
+        except ValueError:
+            continue
+
+    return raw_value
 
 
 def format_customer_slot(
