@@ -126,7 +126,7 @@
 
         .summary-row {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(5, minmax(0, 1fr));
             gap: 12px;
             margin-bottom: 16px;
         }
@@ -383,6 +383,16 @@
         .status-details_incomplete { background: #fef3c7; color: #92400e; }
         .status-booking_request_complete { background: #dcfce7; color: #166534; }
 
+        .status-draft { background: #fef3c7; color: #92400e; }
+        .status-parked_draft { background: #e0f2fe; color: #0369a1; }
+        .status-ready_for_review,
+        .status-awaiting_owner_confirmation { background: #ede9fe; color: #6d28d9; }
+        .status-confirmed { background: #dcfce7; color: #166534; }
+        .status-declined,
+        .status-cancelled_by_customer,
+        .status-abandoned,
+        .status-expired { background: #e5e7eb; color: #4b5563; }
+
         .owner-select {
             min-width: 140px;
             padding: 8px 10px;
@@ -408,8 +418,8 @@
         }
 
         .modal {
-            width: min(760px, 100%);
-            max-height: 88vh;
+            width: min(980px, 100%);
+            max-height: 90vh;
             background: white;
             border-radius: 16px;
             overflow: hidden;
@@ -435,10 +445,139 @@
             font-size: 1.4rem;
         }
 
-        .transcript {
+        .modal-body {
             padding: 16px;
             overflow-y: auto;
             background: #f8fafb;
+        }
+
+        .lead-overview {
+            display: grid;
+            gap: 14px;
+            margin-bottom: 18px;
+        }
+
+        .detail-section {
+            background: white;
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 14px;
+        }
+
+        .detail-section h4 {
+            margin: 0 0 10px;
+            color: var(--primary);
+        }
+
+        .lead-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .lead-summary-field {
+            min-width: 0;
+        }
+
+        .lead-summary-field span {
+            display: block;
+            margin-bottom: 4px;
+            color: var(--muted);
+            font-size: 0.76rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .lead-summary-field strong {
+            display: block;
+            overflow-wrap: anywhere;
+        }
+
+        .request-list {
+            display: grid;
+            gap: 10px;
+        }
+
+        .request-card {
+            border: 1px solid var(--border);
+            border-left: 5px solid var(--accent);
+            border-radius: 12px;
+            padding: 12px;
+            background: #fbfdfc;
+        }
+
+        .request-card.inactive {
+            border-left-color: var(--muted);
+            background: #f5f6f7;
+            opacity: 0.82;
+        }
+
+        .request-card.active-draft {
+            box-shadow: 0 0 0 2px rgba(39, 174, 96, 0.12);
+        }
+
+        .request-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: flex-start;
+            margin-bottom: 9px;
+        }
+
+        .request-header h5 {
+            margin: 0;
+            font-size: 1rem;
+        }
+
+        .request-meta {
+            display: grid;
+            gap: 4px;
+            color: var(--muted);
+            font-size: 0.88rem;
+        }
+
+        .request-items {
+            margin: 10px 0 0;
+            padding-left: 18px;
+        }
+
+        .request-items li {
+            margin: 5px 0;
+        }
+
+        .request-total {
+            margin-top: 10px;
+            padding-top: 9px;
+            border-top: 1px solid var(--border);
+            font-weight: 700;
+        }
+
+        .pending-card {
+            border: 1px solid #f4d58d;
+            border-left: 5px solid #d97706;
+            border-radius: 12px;
+            padding: 12px;
+            background: #fffbeb;
+        }
+
+        .pending-card + .pending-card {
+            margin-top: 8px;
+        }
+
+        .pending-card strong {
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .transcript-heading {
+            margin: 4px 0 10px;
+            color: var(--primary);
+        }
+
+        .transcript {
+            padding: 0;
+            background: transparent;
         }
 
         .message {
@@ -474,6 +613,10 @@
 
             .settings-grid {
                 grid-template-columns: 1fr;
+            }
+
+            .lead-summary-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
             }
 
             .hours-row {
@@ -536,6 +679,10 @@
                 <div class="summary-card">
                     <span>Interested</span>
                     <strong id="interested-count">0</strong>
+                </div>
+                <div class="summary-card">
+                    <span>Active appointment requests</span>
+                    <strong id="active-request-count">0</strong>
                 </div>
             </div>
 
@@ -667,10 +814,9 @@
                                 <th>Owner status</th>
                                 <th>Name</th>
                                 <th>Phone</th>
-                                <th>Treatment</th>
-                                <th>Duration</th>
-                                <th>Preferred date</th>
-                                <th>Preferred time</th>
+                                <th>Active treatment</th>
+                                <th>Requests</th>
+                                <th>Next requested slot</th>
                                 <th>Summary</th>
                                 <th>Actions</th>
                             </tr>
@@ -693,10 +839,14 @@
     <div id="modal-backdrop" class="modal-backdrop hidden">
         <div class="modal">
             <div class="modal-header">
-                <h3>Chat transcript</h3>
+                <h3 id="modal-title">Lead details</h3>
                 <button id="close-modal-button" class="close-button" type="button">×</button>
             </div>
-            <div id="transcript" class="transcript"></div>
+            <div class="modal-body">
+                <div id="lead-overview" class="lead-overview"></div>
+                <h4 class="transcript-heading">Chat transcript</h4>
+                <div id="transcript" class="transcript"></div>
+            </div>
         </div>
     </div>
 
@@ -742,6 +892,8 @@
         const modalBackdrop = document.getElementById("modal-backdrop");
         const closeModalButton = document.getElementById("close-modal-button");
         const transcript = document.getElementById("transcript");
+        const leadOverview = document.getElementById("lead-overview");
+        const modalTitle = document.getElementById("modal-title");
 
         const WEEKDAY_NAMES = [
             "Monday",
@@ -757,6 +909,9 @@
         let filteredLeads = [];
         let businessHours = [];
         let currentPage = 1;
+        let bookingRequestsBySession = new Map();
+        let bookingItemsByRequest = new Map();
+        let pendingActionsBySession = new Map();
 
         function showLogin() {
             loginPage.classList.remove("hidden");
@@ -775,6 +930,149 @@
         function formatDate(value) {
             if (!value) return "—";
             return new Date(value).toLocaleString();
+        }
+
+        function formatDateOnly(value) {
+            if (!value) return "—";
+
+            const date = new Date(`${value}T00:00:00`);
+
+            return date.toLocaleDateString("en-GB", {
+                weekday: "short",
+                day: "numeric",
+                month: "short",
+                year: "numeric"
+            });
+        }
+
+        function formatTimeOnly(value) {
+            if (!value) return "—";
+            return String(value).slice(0, 5);
+        }
+
+        function formatRequestedSlot(date, time) {
+            if (date && time) {
+                return `${formatDateOnly(date)} at ${formatTimeOnly(time)}`;
+            }
+
+            if (date) {
+                return `${formatDateOnly(date)} — time needed`;
+            }
+
+            if (time) {
+                return `${formatTimeOnly(time)} — day needed`;
+            }
+
+            return "Day and time needed";
+        }
+
+        function formatMoneyPence(value) {
+            if (value === null || value === undefined || value === "") {
+                return "—";
+            }
+
+            const pounds = Number(value) / 100;
+
+            return new Intl.NumberFormat("en-GB", {
+                style: "currency",
+                currency: "GBP",
+                minimumFractionDigits: pounds % 1 === 0 ? 0 : 2,
+                maximumFractionDigits: 2
+            }).format(pounds);
+        }
+
+        function formatDurationMinutes(value) {
+            const minutes = Number(value || 0);
+
+            if (!minutes) return "—";
+
+            const hours = Math.floor(minutes / 60);
+            const remainder = minutes % 60;
+
+            if (hours && remainder) return `${hours} hr ${remainder} min`;
+            if (hours) return `${hours} hr`;
+            return `${remainder} min`;
+        }
+
+        function bookingRequestStatusLabel(status) {
+            const labels = {
+                draft: "Draft request",
+                parked_draft: "Saved request",
+                ready_for_review: "Ready for review",
+                awaiting_owner_confirmation: "Awaiting confirmation",
+                confirmed: "Confirmed",
+                declined: "Declined",
+                cancelled_by_customer: "Cancelled by customer",
+                abandoned: "Abandoned",
+                expired: "Expired"
+            };
+
+            return labels[status] || safeText(status);
+        }
+
+        function isInactiveRequestStatus(status) {
+            return [
+                "declined",
+                "cancelled_by_customer",
+                "abandoned",
+                "expired"
+            ].includes(status);
+        }
+
+        function activeRequestsForSession(sessionId) {
+            return (bookingRequestsBySession.get(sessionId) || [])
+                .filter((request) => !isInactiveRequestStatus(request.request_status));
+        }
+
+        function requestCountLabel(sessionId) {
+            const requests = bookingRequestsBySession.get(sessionId) || [];
+            const activeCount = requests.filter(
+                (request) => !isInactiveRequestStatus(request.request_status)
+            ).length;
+            const inactiveCount = requests.length - activeCount;
+
+            if (!requests.length) return "—";
+            if (!inactiveCount) return String(activeCount);
+
+            return `${activeCount} active / ${inactiveCount} inactive`;
+        }
+
+        function nextRequestedSlotLabel(sessionId) {
+            const requests = activeRequestsForSession(sessionId);
+
+            const withSlots = requests
+                .filter((request) => request.preferred_date || request.preferred_time)
+                .sort((a, b) => {
+                    const aValue = `${a.preferred_date || "9999-99-99"}T${a.preferred_time || "99:99"}`;
+                    const bValue = `${b.preferred_date || "9999-99-99"}T${b.preferred_time || "99:99"}`;
+                    return aValue.localeCompare(bValue);
+                });
+
+            if (!withSlots.length) {
+                return requests.length ? "Needs details" : "—";
+            }
+
+            return formatRequestedSlot(
+                withSlots[0].preferred_date,
+                withSlots[0].preferred_time
+            );
+        }
+
+        function servicesForSession(sessionId) {
+            const requests = bookingRequestsBySession.get(sessionId) || [];
+            const names = [];
+
+            for (const request of requests) {
+                const items = bookingItemsByRequest.get(String(request.id)) || [];
+
+                for (const item of items) {
+                    if (item.service_name && !names.includes(item.service_name)) {
+                        names.push(item.service_name);
+                    }
+                }
+            }
+
+            return names;
         }
 
         function statusLabel(status) {
@@ -796,6 +1094,14 @@
                 leads.filter((lead) => lead.status === "details_incomplete").length;
             document.getElementById("interested-count").textContent =
                 leads.filter((lead) => lead.status === "interested").length;
+
+            const activeRequestCount = Array.from(bookingRequestsBySession.values())
+                .flat()
+                .filter((request) => !isInactiveRequestStatus(request.request_status))
+                .length;
+
+            document.getElementById("active-request-count").textContent =
+                activeRequestCount;
         }
 
         async function loadChatbotSettings() {
@@ -1054,9 +1360,8 @@
                     <td>${safeText(lead.name)}</td>
                     <td>${safeText(lead.phone)}</td>
                     <td>${safeText(lead.treatment)}</td>
-                    <td>${safeText(lead.duration)}</td>
-                    <td>${safeText(lead.preferred_date)}</td>
-                    <td>${safeText(lead.preferred_time)}</td>
+                    <td>${requestCountLabel(lead.session_id)}</td>
+                    <td>${nextRequestedSlotLabel(lead.session_id)}</td>
                     <td>${safeText(lead.summary)}</td>
                     <td>
                         <div class="row-actions">
@@ -1122,6 +1427,7 @@
                     lead.treatment,
                     lead.summary,
                     lead.source,
+                    ...servicesForSession(lead.session_id),
                 ]
                     .filter(Boolean)
                     .join(" ")
@@ -1136,41 +1442,246 @@
             renderLeads(filteredLeads);
         }
 
+        function groupRows(rows, key) {
+            const grouped = new Map();
+
+            for (const row of rows || []) {
+                const groupKey = String(row[key]);
+
+                if (!grouped.has(groupKey)) {
+                    grouped.set(groupKey, []);
+                }
+
+                grouped.get(groupKey).push(row);
+            }
+
+            return grouped;
+        }
+
+        async function loadDashboardBookingData() {
+            const [
+                requestResult,
+                itemResult,
+                pendingResult
+            ] = await Promise.all([
+                supabaseClient
+                    .from("booking_requests")
+                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, created_at, updated_at")
+                    .order("request_number", { ascending: true }),
+                supabaseClient
+                    .from("booking_items")
+                    .select("id, booking_request_id, service_name, category, duration_minutes, price_pence, item_order")
+                    .order("item_order", { ascending: true }),
+                supabaseClient
+                    .from("pending_booking_actions")
+                    .select("id, session_id, service_name, category, action_type, action_status, source_message, created_at")
+                    .eq("action_status", "pending")
+                    .order("created_at", { ascending: true })
+            ]);
+
+            if (requestResult.error) throw requestResult.error;
+            if (itemResult.error) throw itemResult.error;
+            if (pendingResult.error) throw pendingResult.error;
+
+            bookingRequestsBySession = groupRows(
+                requestResult.data || [],
+                "session_id"
+            );
+
+            bookingItemsByRequest = groupRows(
+                itemResult.data || [],
+                "booking_request_id"
+            );
+
+            pendingActionsBySession = groupRows(
+                pendingResult.data || [],
+                "session_id"
+            );
+        }
+
         async function loadLeads() {
             tableMessage.textContent = "Loading leads...";
 
-            const { data, error } = await supabaseClient
+            const leadResult = await supabaseClient
                 .from("conversations")
                 .select("*")
                 .order("updated_at", { ascending: false });
 
-            if (error) {
-                tableMessage.textContent = `Could not load leads: ${error.message}`;
+            if (leadResult.error) {
+                tableMessage.textContent = `Could not load leads: ${leadResult.error.message}`;
                 return;
             }
 
-            allLeads = data || [];
+            try {
+                await loadDashboardBookingData();
+            } catch (error) {
+                tableMessage.textContent =
+                    `Leads loaded, but appointment requests could not be loaded: ${error.message}`;
+            }
+
+            allLeads = leadResult.data || [];
             applyFilters();
         }
 
-        async function openTranscript(sessionId) {
-            transcript.innerHTML = "<p>Loading transcript...</p>";
-            modalBackdrop.classList.remove("hidden");
+        function appendSummaryField(parent, label, value) {
+            const wrapper = document.createElement("div");
+            wrapper.className = "lead-summary-field";
 
-            const { data, error } = await supabaseClient
-                .from("messages")
-                .select("role, content, created_at")
-                .eq("session_id", sessionId)
-                .order("created_at", { ascending: true });
+            const labelElement = document.createElement("span");
+            labelElement.textContent = label;
 
-            if (error) {
-                transcript.innerHTML = `<p>Could not load transcript: ${error.message}</p>`;
-                return;
+            const valueElement = document.createElement("strong");
+            valueElement.textContent = safeText(value);
+
+            wrapper.append(labelElement, valueElement);
+            parent.appendChild(wrapper);
+        }
+
+        function renderLeadOverview(lead, requests, items, pendingActions) {
+            leadOverview.innerHTML = "";
+
+            const customerSection = document.createElement("section");
+            customerSection.className = "detail-section";
+
+            const customerHeading = document.createElement("h4");
+            customerHeading.textContent = "Customer overview";
+
+            const customerGrid = document.createElement("div");
+            customerGrid.className = "lead-summary-grid";
+
+            appendSummaryField(customerGrid, "Name", lead?.name);
+            appendSummaryField(customerGrid, "Phone", lead?.phone);
+            appendSummaryField(customerGrid, "Source", lead?.source || "website");
+            appendSummaryField(
+                customerGrid,
+                "Owner status",
+                (lead?.owner_status || "unreviewed").replaceAll("_", " ")
+            );
+
+            customerSection.append(customerHeading, customerGrid);
+            leadOverview.appendChild(customerSection);
+
+            const requestSection = document.createElement("section");
+            requestSection.className = "detail-section";
+
+            const requestHeading = document.createElement("h4");
+            requestHeading.textContent = "Appointment requests";
+            requestSection.appendChild(requestHeading);
+
+            const requestList = document.createElement("div");
+            requestList.className = "request-list";
+
+            if (!requests.length) {
+                const empty = document.createElement("p");
+                empty.className = "muted";
+                empty.textContent = "No structured appointment requests have been recorded for this chat yet.";
+                requestList.appendChild(empty);
             }
 
+            for (const request of requests) {
+                const card = document.createElement("article");
+                card.className = "request-card";
+
+                if (isInactiveRequestStatus(request.request_status)) {
+                    card.classList.add("inactive");
+                }
+
+                if (lead?.active_booking_request_id === request.id) {
+                    card.classList.add("active-draft");
+                }
+
+                const header = document.createElement("div");
+                header.className = "request-header";
+
+                const title = document.createElement("h5");
+                title.textContent = `Request ${request.request_number}`;
+
+                const status = document.createElement("span");
+                status.className = `status status-${safeText(request.request_status, "draft")}`;
+                status.textContent = bookingRequestStatusLabel(request.request_status);
+
+                header.append(title, status);
+
+                const meta = document.createElement("div");
+                meta.className = "request-meta";
+
+                const schedule = document.createElement("div");
+                schedule.textContent = `When: ${formatRequestedSlot(
+                    request.preferred_date,
+                    request.preferred_time
+                )}`;
+
+                const structure = document.createElement("div");
+                structure.textContent =
+                    `Structure: ${(request.appointment_structure || "single_service").replaceAll("_", " ")}`;
+
+                meta.append(schedule, structure);
+
+                const list = document.createElement("ul");
+                list.className = "request-items";
+
+                const requestItems = items.filter(
+                    (item) => String(item.booking_request_id) === String(request.id)
+                );
+
+                if (!requestItems.length) {
+                    const item = document.createElement("li");
+                    item.textContent = "Treatment details still needed";
+                    list.appendChild(item);
+                }
+
+                for (const item of requestItems) {
+                    const row = document.createElement("li");
+                    row.textContent =
+                        `${safeText(item.service_name)} — ${formatDurationMinutes(item.duration_minutes)} — ${formatMoneyPence(item.price_pence)}`;
+                    list.appendChild(row);
+                }
+
+                const total = document.createElement("div");
+                total.className = "request-total";
+                total.textContent =
+                    `Total: ${formatDurationMinutes(request.total_duration_minutes)} — ${formatMoneyPence(request.total_price_pence)}`;
+
+                card.append(header, meta, list, total);
+                requestList.appendChild(card);
+            }
+
+            requestSection.appendChild(requestList);
+            leadOverview.appendChild(requestSection);
+
+            if (pendingActions.length) {
+                const pendingSection = document.createElement("section");
+                pendingSection.className = "detail-section";
+
+                const pendingHeading = document.createElement("h4");
+                pendingHeading.textContent = "Pending customer decisions";
+                pendingSection.appendChild(pendingHeading);
+
+                for (const action of pendingActions) {
+                    const card = document.createElement("div");
+                    card.className = "pending-card";
+
+                    const title = document.createElement("strong");
+                    title.textContent = safeText(action.service_name, "Additional treatment");
+
+                    const description = document.createElement("div");
+                    description.textContent =
+                        action.action_type === "choose_appointment_structure"
+                            ? "Waiting for the customer to choose same visit or separate appointment."
+                            : `Waiting for customer input: ${safeText(action.action_type)}`;
+
+                    card.append(title, description);
+                    pendingSection.appendChild(card);
+                }
+
+                leadOverview.appendChild(pendingSection);
+            }
+        }
+
+        function renderTranscript(messages) {
             transcript.innerHTML = "";
 
-            for (const message of data || []) {
+            for (const message of messages || []) {
                 const bubble = document.createElement("div");
                 const roleClass =
                     message.role === "user"
@@ -1182,9 +1693,89 @@
                 transcript.appendChild(bubble);
             }
 
-            if (!data?.length) {
+            if (!messages?.length) {
                 transcript.innerHTML = "<p>No transcript messages found.</p>";
             }
+        }
+
+        async function openTranscript(sessionId) {
+            modalTitle.textContent = "Lead details";
+            leadOverview.innerHTML = "<p>Loading appointment requests...</p>";
+            transcript.innerHTML = "<p>Loading transcript...</p>";
+            modalBackdrop.classList.remove("hidden");
+
+            const lead = allLeads.find(
+                (item) => item.session_id === sessionId
+            ) || {};
+
+            const [
+                messageResult,
+                requestResult,
+                pendingResult
+            ] = await Promise.all([
+                supabaseClient
+                    .from("messages")
+                    .select("role, content, created_at")
+                    .eq("session_id", sessionId)
+                    .order("created_at", { ascending: true }),
+                supabaseClient
+                    .from("booking_requests")
+                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail")
+                    .eq("session_id", sessionId)
+                    .order("request_number", { ascending: true }),
+                supabaseClient
+                    .from("pending_booking_actions")
+                    .select("id, session_id, service_name, category, action_type, action_status, source_message")
+                    .eq("session_id", sessionId)
+                    .eq("action_status", "pending")
+                    .order("created_at", { ascending: true })
+            ]);
+
+            if (messageResult.error) {
+                transcript.innerHTML = `<p>Could not load transcript: ${messageResult.error.message}</p>`;
+            } else {
+                renderTranscript(messageResult.data || []);
+            }
+
+            if (requestResult.error) {
+                leadOverview.innerHTML =
+                    `<p>Could not load appointment requests: ${requestResult.error.message}</p>`;
+                return;
+            }
+
+            const requests = requestResult.data || [];
+            let items = [];
+
+            if (requests.length) {
+                const requestIds = requests.map((request) => request.id);
+
+                const itemResult = await supabaseClient
+                    .from("booking_items")
+                    .select("id, booking_request_id, service_name, category, duration_minutes, price_pence, item_order")
+                    .in("booking_request_id", requestIds)
+                    .order("item_order", { ascending: true });
+
+                if (itemResult.error) {
+                    leadOverview.innerHTML =
+                        `<p>Could not load treatment items: ${itemResult.error.message}</p>`;
+                    return;
+                }
+
+                items = itemResult.data || [];
+            }
+
+            if (pendingResult.error) {
+                leadOverview.innerHTML =
+                    `<p>Could not load pending decisions: ${pendingResult.error.message}</p>`;
+                return;
+            }
+
+            renderLeadOverview(
+                lead,
+                requests,
+                items,
+                pendingResult.data || []
+            );
         }
 
         loginForm.addEventListener("submit", async (event) => {
