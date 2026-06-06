@@ -5967,6 +5967,335 @@ def latest_message_suggests_additional_treatment(
     )
 
 
+def load_pending_booking_actions(
+    session_id: str,
+) -> list[dict]:
+    try:
+        response = (
+            supabase.table("pending_booking_actions")
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("action_status", "pending")
+            .order("created_at")
+            .execute()
+        )
+
+        return list(response.data or [])
+
+    except Exception as error:
+        print(f"Could not load pending booking actions: {error}")
+        return []
+
+
+def save_pending_booking_action(
+    session_id: str,
+    selected_identity: dict,
+    source_message: str,
+) -> dict | None:
+    service_name = str(
+        selected_identity.get("service_name") or ""
+    ).strip()
+
+    if not service_name:
+        return None
+
+    service_row = load_service_row_for_booking_item(
+        service_name
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    payload = {
+        "session_id": session_id,
+        "service_id": (
+            service_row.get("id")
+            if service_row
+            else None
+        ),
+        "service_name": service_name,
+        "category": (
+            selected_identity.get("category")
+            or (
+                service_row.get("category")
+                if service_row
+                else None
+            )
+        ),
+        "action_type": "choose_appointment_structure",
+        "action_status": "pending",
+        "source_message": source_message,
+        "updated_at": now_iso,
+    }
+
+    try:
+        response = (
+            supabase.table("pending_booking_actions")
+            .upsert(
+                payload,
+                on_conflict=(
+                    "session_id,service_name,action_type"
+                ),
+            )
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        print(f"Could not save pending booking action: {error}")
+
+    return None
+
+
+def update_pending_booking_action_status(
+    action_id: int,
+    action_status: str,
+):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "action_status": action_status,
+        "updated_at": now_iso,
+    }
+
+    if action_status in {
+        "resolved",
+        "cancelled",
+        "superseded",
+    }:
+        payload["resolved_at"] = now_iso
+
+    try:
+        (
+            supabase.table("pending_booking_actions")
+            .update(payload)
+            .eq("id", action_id)
+            .execute()
+        )
+
+    except Exception as error:
+        print(f"Could not update pending booking action: {error}")
+
+
+def latest_message_confirms_same_visit(
+    latest_message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    phrases = [
+        "same visit",
+        "same appointment",
+        "back to back",
+        "one after another",
+        "together",
+        "add it",
+        "add that",
+        "yes same",
+    ]
+
+    return any(
+        phrase in cleaned
+        for phrase in phrases
+    )
+
+
+def latest_message_requests_separate_appointment(
+    latest_message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    phrases = [
+        "separate",
+        "separately",
+        "different appointment",
+        "another appointment",
+        "another day",
+    ]
+
+    return any(
+        phrase in cleaned
+        for phrase in phrases
+    )
+
+
+def latest_message_cancels_pending_action(
+    latest_message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    phrases = [
+        "cancel that",
+        "forget that",
+        "dont add",
+        "do not add",
+        "leave it",
+        "never mind",
+        "nevermind",
+    ]
+
+    return any(
+        phrase in cleaned
+        for phrase in phrases
+    )
+
+
+def selected_identity_from_pending_action(
+    action: dict,
+) -> dict | None:
+    service_name = action.get("service_name")
+    identity = structured_service_identity(
+        service_name
+    )
+
+    if identity:
+        return identity
+
+    service_row = load_service_row_for_booking_item(
+        service_name
+    )
+
+    if not service_row:
+        return None
+
+    return {
+        "category": (
+            service_row.get("category")
+            or action.get("category")
+        ),
+        "service_name": service_row.get(
+            "service_name"
+        ),
+        "booking_mode": service_row.get(
+            "booking_mode"
+        ),
+        "fixed_duration_minutes": service_row.get(
+            "fixed_duration_minutes"
+        ),
+        "allowed_durations_minutes": service_row.get(
+            "allowed_durations_minutes"
+        ),
+    }
+
+
+def detect_pending_cart_action_resolution(
+    session_id: str,
+    latest_message: str,
+) -> dict | None:
+    """
+    Resolve the oldest unanswered appointment-structure question.
+
+    The same-visit branch is enabled now. Separate-request creation is kept as
+    a clearly stored pending decision until Stage 4C creates a second
+    booking_request safely.
+    """
+    actions = load_pending_booking_actions(
+        session_id
+    )
+
+    if not actions:
+        return None
+
+    action = actions[0]
+
+    if latest_message_confirms_same_visit(
+        latest_message
+    ):
+        selected_identity = (
+            selected_identity_from_pending_action(
+                action
+            )
+        )
+
+        if not selected_identity:
+            return None
+
+        draft_request = load_active_draft_booking_request(
+            session_id
+        )
+
+        if not draft_request:
+            return None
+
+        return {
+            "action": "add_same_visit",
+            "draft_request": draft_request,
+            "selected_identity": selected_identity,
+            "pending_action_id": action.get("id"),
+            "resolved_from_pending": True,
+        }
+
+    if latest_message_requests_separate_appointment(
+        latest_message
+    ):
+        return {
+            "action": "separate_request_deferred",
+            "pending_action": action,
+        }
+
+    if latest_message_cancels_pending_action(
+        latest_message
+    ):
+        return {
+            "action": "cancel_pending_action",
+            "pending_action": action,
+        }
+
+    return None
+
+
+def format_pending_action_reminder(
+    session_id: str,
+) -> str:
+    actions = load_pending_booking_actions(
+        session_id
+    )
+
+    if not actions:
+        return ""
+
+    names = [
+        str(action.get("service_name") or "").strip()
+        for action in actions
+        if str(action.get("service_name") or "").strip()
+    ]
+
+    if not names:
+        return ""
+
+    if len(names) == 1:
+        return (
+            f"{names[0]} is still waiting for your decision. "
+            "Would you like to add it to this same visit, or make it "
+            "a separate appointment request?"
+        )
+
+    return (
+        "These treatments are still waiting for your decision: "
+        + "; ".join(names)
+        + ". Would you like to add them to this same visit, or handle "
+        "them as separate appointment requests?"
+    )
+
+
+def append_pending_action_reminder(
+    reply: str,
+    session_id: str,
+) -> str:
+    reminder = format_pending_action_reminder(
+        session_id
+    )
+
+    if not reminder:
+        return reply
+
+    return str(reply or "").rstrip() + "\n\n" + reminder
+
+
 def detect_treatment_cart_intent(
     session_id: str,
     latest_message: str,
@@ -8518,10 +8847,17 @@ async def chat(
 
     extracted_lead = extract_lead_data(conversation_history)
     existing_lead = get_existing_conversation(request.session_id)
-    cart_intent = detect_treatment_cart_intent(
+    pending_cart_resolution = detect_pending_cart_action_resolution(
         session_id=request.session_id,
         latest_message=request.message,
-        existing_lead=existing_lead,
+    )
+    cart_intent = (
+        pending_cart_resolution
+        or detect_treatment_cart_intent(
+            session_id=request.session_id,
+            latest_message=request.message,
+            existing_lead=existing_lead,
+        )
     )
     merged_lead = merge_lead_data(existing_lead, extracted_lead)
 
@@ -8771,6 +9107,19 @@ async def chat(
             lead_data=merged_lead,
             cart_intent=cart_intent,
         )
+
+        if (
+            cart_result
+            and cart_result.get("status") in {
+                "added",
+                "already_present",
+            }
+            and cart_intent.get("pending_action_id")
+        ):
+            update_pending_booking_action_status(
+                int(cart_intent["pending_action_id"]),
+                "resolved",
+            )
     elif not cart_intent:
         sync_single_treatment_draft_request(
             session_id=request.session_id,
@@ -8812,8 +9161,74 @@ async def chat(
         and cart_intent.get("action")
         == "clarify_visit_structure"
     ):
+        save_pending_booking_action(
+            session_id=request.session_id,
+            selected_identity=(
+                cart_intent.get("selected_identity")
+                or {}
+            ),
+            source_message=request.message,
+        )
+
         reply = build_visit_structure_clarification_reply(
             cart_intent.get("selected_identity") or {}
+        )
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
+
+    if (
+        cart_intent
+        and cart_intent.get("action")
+        == "cancel_pending_action"
+    ):
+        pending_action = (
+            cart_intent.get("pending_action") or {}
+        )
+
+        if pending_action.get("id"):
+            update_pending_booking_action_status(
+                int(pending_action["id"]),
+                "cancelled",
+            )
+
+        reply = (
+            "No problem. I have removed that unfinished treatment "
+            "request. Your existing appointment request is unchanged."
+        )
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
+
+    if (
+        cart_intent
+        and cart_intent.get("action")
+        == "separate_request_deferred"
+    ):
+        pending_action = (
+            cart_intent.get("pending_action") or {}
+        )
+        service_name = str(
+            pending_action.get("service_name")
+            or "that treatment"
+        )
+
+        reply = (
+            f"No problem. I have kept {service_name} aside as a "
+            "separate appointment request. Your current appointment "
+            "has not been changed."
         )
 
         save_message(
@@ -8838,6 +9253,10 @@ async def chat(
                 lead_data=merged_lead,
                 calendar_result=calendar_result,
                 missing_fields=missing_fields,
+            )
+            reply = append_pending_action_reminder(
+                reply,
+                request.session_id,
             )
 
         save_message(
