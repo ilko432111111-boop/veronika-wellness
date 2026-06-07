@@ -5089,6 +5089,7 @@ def remove_generated_booking_detail_questions(reply: str) -> str:
 
     patterns = [
         r"(?is)(?:\s*\n\s*)?(?:which|what) treatment[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:which|what) massage(?: option)?(?: would you like)?[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:how long|what duration|which duration)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i (?:have|take) your name[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide|could i take) your (?:phone|contact|mobile) number[^?]*\?",
@@ -5278,6 +5279,7 @@ def strip_model_booking_questions(reply: str) -> str:
         r"(?is)(?:\s*\n\s*)?(?:could|can|may|would) i (?:take|have) your (?:name|phone number|contact number|mobile number)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)) your (?:name|phone number|contact number|mobile number)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:which treatment|what treatment|which service|which treatment option)[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:which|what) massage(?: option)?(?: would you like)?[^?]*\?",
     ]
 
     for pattern in question_patterns:
@@ -5287,6 +5289,84 @@ def strip_model_booking_questions(reply: str) -> str:
     cleaned = re.sub(r"(?i)(?:,|\s)\s*and\s*$", "", cleaned.strip())
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+
+    return cleaned.strip()
+
+
+def normalise_reply_for_comparison(value: str) -> str:
+    cleaned = normalise_service_match_text(
+        value
+    )
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def collapse_repeated_reply_content(
+    reply: str,
+) -> str:
+    """
+    Remove accidental repetition without rewriting useful information.
+
+    This is intentionally conservative:
+    - exact duplicate paragraphs are collapsed;
+    - repeated therapist-confirmation sentences are collapsed;
+    - factual availability sentences remain intact.
+    """
+    cleaned = normalise_reply_line_breaks(
+        reply
+    ).strip()
+
+    if not cleaned:
+        return cleaned
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", cleaned)
+        if paragraph.strip()
+    ]
+    unique_paragraphs = []
+    seen_paragraphs = set()
+
+    for paragraph in paragraphs:
+        key = normalise_reply_for_comparison(
+            paragraph
+        )
+
+        if key and key in seen_paragraphs:
+            continue
+
+        seen_paragraphs.add(key)
+        unique_paragraphs.append(paragraph)
+
+    cleaned = "\n\n".join(unique_paragraphs)
+
+    # Collapse repeated handover wording even when the second sentence begins
+    # with "Thanks." or uses slightly different punctuation.
+    handover_pattern = re.compile(
+        r"(?is)(?:\s*\n\s*)?"
+        r"(?:thanks[.!]?\s*)?"
+        r"(?:the therapist will confirm(?: the appointment)? shortly[.!]?|"
+        r"the therapist will confirm(?: it| the request| the appointment)? shortly[.!]?|"
+        r"the therapist still needs to confirm(?: the appointment| the request)?[.!]?)"
+    )
+
+    matches = list(
+        handover_pattern.finditer(cleaned)
+    )
+
+    if len(matches) > 1:
+        first = matches[0]
+        before = cleaned[:first.end()]
+        after = cleaned[first.end():]
+
+        after = handover_pattern.sub(
+            "",
+            after,
+        )
+        cleaned = before + after
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
 
     return cleaned.strip()
 
@@ -11969,6 +12049,10 @@ Reply as Receptionist:
             reply,
             request.session_id,
         )
+
+    reply = collapse_repeated_reply_content(
+        reply
+    )
 
     save_message(
         session_id=request.session_id,
