@@ -7602,7 +7602,10 @@ def format_confirmed_details(lead_data: dict) -> str:
 
 
 def send_booking_notification(session_id: str):
-    if has_pending_booking_actions(session_id):
+    if (
+        advanced_multi_booking_enabled()
+        and has_pending_booking_actions(session_id)
+    ):
         print(
             "Email notification skipped because a pending cart action "
             "still needs the customer's decision."
@@ -7739,13 +7742,17 @@ def load_chatbot_settings() -> dict:
         "tone": "friendly",
         "reply_length": "short",
         "emoji_style": "light",
-        "personality_notes": ""
+        "personality_notes": "",
+        "enable_multi_booking": False,
     }
 
     try:
         response = (
             supabase.table("chatbot_settings")
-            .select("tone, reply_length, emoji_style, personality_notes")
+            .select(
+                "tone, reply_length, emoji_style, personality_notes, "
+                "enable_multi_booking"
+            )
             .eq("business_slug", "veronika")
             .limit(1)
             .execute()
@@ -7760,6 +7767,9 @@ def load_chatbot_settings() -> dict:
         reply_length = saved.get("reply_length")
         emoji_style = saved.get("emoji_style")
         personality_notes = saved.get("personality_notes") or ""
+        enable_multi_booking = bool(
+            saved.get("enable_multi_booking")
+        )
 
         if tone in ["friendly", "professional", "relaxed", "luxury"]:
             defaults["tone"] = tone
@@ -7771,6 +7781,7 @@ def load_chatbot_settings() -> dict:
             defaults["emoji_style"] = emoji_style
 
         defaults["personality_notes"] = personality_notes[:600]
+        defaults["enable_multi_booking"] = enable_multi_booking
 
     except Exception as error:
         print(f"Could not load chatbot settings: {error}")
@@ -10688,12 +10699,165 @@ def handle_initial_multi_service_intake(
     )
 
 
+def advanced_multi_booking_enabled() -> bool:
+    """
+    Business-level feature flag.
+
+    Advanced same-visit carts and separate appointment drafts remain in the
+    codebase, but they are disabled by default for the receptionist MVP.
+    """
+    return bool(
+        load_chatbot_settings().get(
+            "enable_multi_booking",
+            False,
+        )
+    )
+
+
+def format_manual_multi_treatment_names(
+    identities: list[dict],
+) -> str:
+    names = []
+
+    for identity in identities:
+        name = str(
+            identity.get("service_name")
+            or "treatment"
+        ).strip()
+
+        if name and name not in names:
+            names.append(name)
+
+    if not names:
+        return "multiple treatments"
+
+    if len(names) == 1:
+        return names[0]
+
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+
+    return (
+        ", ".join(names[:-1])
+        + f", and {names[-1]}"
+    )
+
+
+def append_manual_multi_treatment_note(
+    existing_notes: str | None,
+    treatment_names: str,
+) -> str:
+    note = (
+        "Customer mentioned multiple treatments: "
+        f"{treatment_names}. "
+        "Exact arrangement should be confirmed manually by Veronika."
+    )
+    current = str(
+        existing_notes or ""
+    ).strip()
+
+    if not current:
+        return note
+
+    if note.lower() in current.lower():
+        return current
+
+    return current + " " + note
+
+
+def handle_simple_multi_treatment_handoff(
+    session_id: str,
+    latest_message: str,
+    source: str,
+) -> str | None:
+    """
+    Default receptionist-mode behaviour for rare multi-treatment enquiries.
+
+    Do not start the advanced cart controller. Record the customer's request
+    as a lead note and hand the exact arrangement to Veronika for manual
+    confirmation.
+    """
+    identities = detect_all_structured_services(
+        latest_message
+    )
+
+    if len(identities) < 2:
+        return None
+
+    treatment_names = format_manual_multi_treatment_names(
+        identities
+    )
+    existing = get_existing_conversation(
+        session_id
+    )
+    existing_summary = str(
+        existing.get("summary") or ""
+    ).strip()
+    summary = (
+        f"Customer is interested in {treatment_names}. "
+        "Exact multi-treatment arrangement requires manual follow-up."
+    )
+
+    if existing_summary and summary.lower() not in existing_summary.lower():
+        summary = existing_summary + " " + summary
+
+    lead_data = {
+        "treatment": (
+            existing.get("treatment")
+            or identities[0].get("service_name")
+            or "Multiple treatments"
+        ),
+        "duration": existing.get("duration"),
+        "preferred_date": (
+            parse_relative_date_from_text(
+                latest_message,
+                reference_date=existing.get(
+                    "preferred_date"
+                ),
+            )
+            or existing.get("preferred_date")
+        ),
+        "preferred_time": (
+            parse_time_from_text(latest_message)
+            or existing.get("preferred_time")
+        ),
+        "name": existing.get("name"),
+        "phone": existing.get("phone"),
+        "notes": append_manual_multi_treatment_note(
+            existing.get("notes"),
+            treatment_names,
+        ),
+        "summary": summary,
+        "status": "details_incomplete",
+        "conversation_mode": "booking_request",
+        "slot_status": "not_checked",
+        "next_required_detail": "preferred_date",
+        "notification_sent_at": None,
+    }
+
+    save_conversation_overview(
+        session_id=session_id,
+        lead_data=lead_data,
+        source=source,
+    )
+
+    return (
+        f"Of course. I have noted that you are interested in "
+        f"{treatment_names}. Veronika will confirm the exact arrangement "
+        "with you manually. Which day and time would suit you, and could "
+        "I take your name and phone number?"
+    )
+
+
 @app.post("/chat")
 async def chat(
     request: ChatRequest,
     background_tasks: BackgroundTasks
 ):
     request_source = normalise_source(request.source)
+    multi_booking_enabled = (
+        advanced_multi_booking_enabled()
+    )
 
     save_message(
         session_id=request.session_id,
@@ -10706,8 +10870,11 @@ async def chat(
         request.session_id
     )
 
-    if customer_asks_for_booking_summary(
-        request.message
+    if (
+        multi_booking_enabled
+        and customer_asks_for_booking_summary(
+            request.message
+        )
     ):
         reply = build_customer_booking_summary(
             request.session_id
@@ -10724,8 +10891,11 @@ async def chat(
 
     if (
         booking_request_is_complete(existing_before_processing)
-        and not has_pending_booking_actions(
-            request.session_id
+        and (
+            not multi_booking_enabled
+            or not has_pending_booking_actions(
+                request.session_id
+            )
         )
         and is_simple_acknowledgement(request.message)
     ):
@@ -10871,55 +11041,83 @@ async def chat(
 
     conversation_history = "\n".join(history_lines[-20:])
 
-    pending_multi_service_reply = (
-        handle_pending_multi_service_detail_reply(
-            session_id=request.session_id,
-            latest_message=request.message,
-        )
-    )
-
-    if pending_multi_service_reply:
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=pending_multi_service_reply,
-            source=request_source,
+    if multi_booking_enabled:
+        pending_multi_service_reply = (
+            handle_pending_multi_service_detail_reply(
+                session_id=request.session_id,
+                latest_message=request.message,
+            )
         )
 
-        return {"reply": pending_multi_service_reply}
+        if pending_multi_service_reply:
+            save_message(
+                session_id=request.session_id,
+                role="assistant",
+                content=pending_multi_service_reply,
+                source=request_source,
+            )
 
-    initial_multi_service_reply = (
-        handle_initial_multi_service_intake(
-            session_id=request.session_id,
-            latest_message=request.message,
-            source=request_source,
+            return {"reply": pending_multi_service_reply}
+
+        initial_multi_service_reply = (
+            handle_initial_multi_service_intake(
+                session_id=request.session_id,
+                latest_message=request.message,
+                source=request_source,
+            )
         )
-    )
 
-    if initial_multi_service_reply:
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=initial_multi_service_reply,
-            source=request_source,
+        if initial_multi_service_reply:
+            save_message(
+                session_id=request.session_id,
+                role="assistant",
+                content=initial_multi_service_reply,
+                source=request_source,
+            )
+
+            return {"reply": initial_multi_service_reply}
+
+    else:
+        manual_multi_treatment_reply = (
+            handle_simple_multi_treatment_handoff(
+                session_id=request.session_id,
+                latest_message=request.message,
+                source=request_source,
+            )
         )
 
-        return {"reply": initial_multi_service_reply}
+        if manual_multi_treatment_reply:
+            save_message(
+                session_id=request.session_id,
+                role="assistant",
+                content=manual_multi_treatment_reply,
+                source=request_source,
+            )
+
+            return {"reply": manual_multi_treatment_reply}
 
     extracted_lead = extract_lead_data(conversation_history)
     existing_lead = get_existing_conversation(request.session_id)
-    explicit_cart_intent = detect_treatment_cart_intent(
-        session_id=request.session_id,
-        latest_message=request.message,
-        existing_lead=existing_lead,
-    )
-    pending_cart_resolution = (
-        None
-        if explicit_cart_intent
-        else detect_pending_cart_action_resolution(
+    explicit_cart_intent = (
+        detect_treatment_cart_intent(
             session_id=request.session_id,
             latest_message=request.message,
+            existing_lead=existing_lead,
         )
+        if multi_booking_enabled
+        else None
+    )
+    pending_cart_resolution = (
+        (
+            None
+            if explicit_cart_intent
+            else detect_pending_cart_action_resolution(
+                session_id=request.session_id,
+                latest_message=request.message,
+            )
+        )
+        if multi_booking_enabled
+        else None
     )
     cart_intent = (
         explicit_cart_intent
@@ -11369,8 +11567,11 @@ async def chat(
     if (
         is_simple_acknowledgement(request.message)
         and booking_request_is_complete(merged_lead)
-        and not has_pending_booking_actions(
-            request.session_id
+        and (
+            not multi_booking_enabled
+            or not has_pending_booking_actions(
+                request.session_id
+            )
         )
     ):
         reply = "Thanks. The therapist will confirm the appointment shortly."
@@ -11593,10 +11794,11 @@ Reply as Receptionist:
             calendar_result=calendar_result,
         )
 
-    reply = suppress_contact_collection_while_pending(
-        reply,
-        request.session_id,
-    )
+    if multi_booking_enabled:
+        reply = suppress_contact_collection_while_pending(
+            reply,
+            request.session_id,
+        )
 
     save_message(
         session_id=request.session_id,
