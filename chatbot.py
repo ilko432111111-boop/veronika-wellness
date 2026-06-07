@@ -674,6 +674,70 @@ def normalise_misplaced_preferred_fields(
     return result
 
 
+def recover_schedule_from_customer_history(
+    lead_data: dict,
+    conversation_history: str,
+    latest_message: str,
+) -> dict:
+    """
+    Recover an explicitly supplied date or time from recent customer messages.
+
+    This is needed when a customer gives the schedule before completing a
+    service variant, for example:
+      customer: "lip filler tomorrow at 9 am"
+      assistant: "0.5 ml or 1 ml?"
+      customer: "0.5"
+
+    The newest explicit customer value wins. Assistant suggestions are never
+    treated as confirmed details.
+    """
+    result = dict(lead_data)
+    customer_messages = []
+
+    for line in str(conversation_history or "").splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if lower.startswith(("customer:", "user:")):
+            customer_messages.append(
+                stripped.split(":", 1)[1].strip()
+            )
+
+    if (
+        not customer_messages
+        or customer_messages[-1].strip()
+        != str(latest_message or "").strip()
+    ):
+        customer_messages.append(
+            str(latest_message or "").strip()
+        )
+
+    recovered_date = None
+    recovered_time = None
+
+    for message in reversed(customer_messages):
+        if recovered_date is None:
+            recovered_date = parse_relative_date_from_text(
+                message
+            )
+
+        if recovered_time is None:
+            recovered_time = parse_time_from_text(
+                message
+            )
+
+        if recovered_date and recovered_time:
+            break
+
+    if result.get("preferred_date") in [None, ""] and recovered_date:
+        result["preferred_date"] = recovered_date
+
+    if result.get("preferred_time") in [None, ""] and recovered_time:
+        result["preferred_time"] = recovered_time
+
+    return result
+
+
 def apply_authoritative_schedule_fields(
     lead_data: dict,
     existing_lead: dict,
@@ -5094,6 +5158,7 @@ def remove_generated_booking_detail_questions(reply: str) -> str:
         r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i (?:have|take) your name[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide|could i take) your (?:phone|contact|mobile) number[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date)[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:could|can|may|would) i (?:have|take) your preferred (?:day|date|time)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:which|what) time[^?]*\?",
     ]
 
@@ -5276,6 +5341,7 @@ def strip_model_booking_questions(reply: str) -> str:
     question_patterns = [
         r"(?is)(?:\s*\n\s*)?(?:how long|which duration|what duration)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date|time)[^?]*\?",
+        r"(?is)(?:\s*\n\s*)?(?:could|can|may|would) i (?:have|take) your preferred (?:day|date|time)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:could|can|may|would) i (?:take|have) your (?:name|phone number|contact number|mobile number)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)) your (?:name|phone number|contact number|mobile number)[^?]*\?",
         r"(?is)(?:\s*\n\s*)?(?:which treatment|what treatment|which service|which treatment option)[^?]*\?",
@@ -11487,6 +11553,12 @@ async def chat(
     merged_lead = apply_authoritative_schedule_fields(
         merged_lead,
         existing_lead,
+        request.message,
+    )
+
+    merged_lead = recover_schedule_from_customer_history(
+        merged_lead,
+        conversation_history,
         request.message,
     )
 
