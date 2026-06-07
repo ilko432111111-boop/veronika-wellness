@@ -1169,6 +1169,66 @@ def format_live_massage_services_context() -> tuple[str, bool]:
     return "\n".join(lines), from_supabase
 
 
+def needs_massage_variant(
+    lead_data: dict,
+) -> bool:
+    """
+    A generic massage enquiry must resolve the massage type before duration.
+    """
+    return (
+        normalise_treatment_name(
+            lead_data.get("treatment")
+        )
+        == "massage"
+    )
+
+
+def build_massage_variant_prompt() -> str:
+    services, _ = load_massage_services()
+    names = [
+        str(service.get("service_name") or "").strip()
+        for service in services
+        if str(service.get("service_name") or "").strip()
+    ]
+
+    if not names:
+        names = [
+            "Relaxing Massage",
+            "Swedish Massage",
+            "Deep Tissue Massage",
+            "Hot Stone Massage",
+        ]
+
+    return (
+        "Which massage would you like: "
+        + format_natural_list(names)
+        + "?"
+    )
+
+
+def customer_asks_for_treatment_options(
+    latest_message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        latest_message
+    )
+
+    phrases = [
+        "what treatments do you have",
+        "which treatments do you have",
+        "what massages do you have",
+        "which massages do you have",
+        "what massage options do you have",
+        "which massage options do you have",
+        "what options do you have",
+    ]
+
+    return any(
+        phrase in cleaned
+        for phrase in phrases
+    )
+
+
 FALLBACK_VITAMIN_SHOT_SERVICES = [
     {
         "service_name": "Vitamin Shot",
@@ -3472,6 +3532,7 @@ def format_live_dermal_filler_services_context() -> tuple[str, bool]:
 
 
 GENERIC_STRUCTURED_CATEGORIES = {
+    "massage": "massage",
     "vitamin shot": "vitamin_shots",
     "ultrasound": "ultrasound",
     "microneedling": "microneedling",
@@ -3571,6 +3632,7 @@ def resolve_latest_generic_or_partial_service(
         }
 
     generic_checks = [
+        ("massage", "Massage", ["massage", "massages"]),
         ("vitamin_shots", "Vitamin Shot", ["vitamin shot"]),
         ("ultrasound", "Ultrasound", ["ultrasound"]),
         ("microneedling", "Microneedling", ["microneedling"]),
@@ -3814,7 +3876,8 @@ def calculate_next_required_detail(
     Variant selection always comes before duration, date, time, name, or phone.
     """
     if (
-        needs_vitamin_shot_variant(lead_data)
+        needs_massage_variant(lead_data)
+        or needs_vitamin_shot_variant(lead_data)
         or needs_ultrasound_variant(lead_data)
         or needs_microneedling_variant(lead_data)
         or needs_facial_variant(lead_data)
@@ -4738,6 +4801,11 @@ def canonical_missing_question(
     lead_data: dict | None = None,
 ) -> str:
     if field == "duration":
+        if needs_massage_variant(
+            lead_data or {}
+        ):
+            return build_massage_variant_prompt()
+
         allowed_durations = allowed_durations_for_treatment(
             (lead_data or {}).get("treatment")
         )
@@ -5068,6 +5136,9 @@ def build_schedule_first_question(lead_data: dict) -> str:
     duration = lead_data.get("duration")
     preferred_date = lead_data.get("preferred_date")
     preferred_time = lead_data.get("preferred_time")
+
+    if needs_massage_variant(lead_data):
+        return build_massage_variant_prompt()
 
     if needs_vitamin_shot_variant(lead_data):
         return (
@@ -10951,6 +11022,23 @@ async def chat(
     existing_before_processing = get_existing_conversation(
         request.session_id
     )
+
+    if (
+        needs_massage_variant(existing_before_processing)
+        and customer_asks_for_treatment_options(
+            request.message
+        )
+    ):
+        reply = build_massage_variant_prompt()
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
 
     if (
         multi_booking_enabled
