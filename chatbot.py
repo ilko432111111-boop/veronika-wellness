@@ -769,6 +769,55 @@ def looks_like_customer_name(message: str) -> bool:
     )
 
 
+def explicit_duration_minutes_from_reply(
+    latest_message: str,
+    previous_assistant_message: str = "",
+    treatment: str | None = None,
+) -> int | None:
+    """
+    Extract a duration deterministically from the newest customer message.
+
+    Normal phrases such as "120 minutes" are parsed directly. Compact replies
+    such as "60 tomorrow at 12:00" are accepted only when the previous bot
+    message asked how long the treatment should be and the number matches one
+    of the configured durations for that treatment.
+    """
+    direct = parse_duration_minutes(
+        latest_message
+    )
+
+    if direct is not None:
+        return direct
+
+    lower_previous = str(
+        previous_assistant_message or ""
+    ).lower()
+
+    if (
+        "how long" not in lower_previous
+        and "duration" not in lower_previous
+    ):
+        return None
+
+    allowed = allowed_durations_for_treatment(
+        treatment
+    )
+
+    if not allowed:
+        allowed = {30, 45, 60, 75, 90, 105, 120}
+
+    for match in re.finditer(
+        r"(?<!\d)(\d{1,3})(?!\d)",
+        str(latest_message or ""),
+    ):
+        value = int(match.group(1))
+
+        if value in allowed:
+            return value
+
+    return None
+
+
 def apply_latest_message_fallbacks(
     lead_data: dict,
     latest_message: str,
@@ -790,6 +839,11 @@ def apply_latest_message_fallbacks(
     )
     latest_time = parse_time_from_text(latest_message)
     latest_phone = parse_phone_from_text(latest_message)
+    latest_duration = explicit_duration_minutes_from_reply(
+        latest_message,
+        previous_assistant_message,
+        result.get("treatment"),
+    )
 
     if latest_date:
         result["preferred_date"] = latest_date
@@ -799,6 +853,11 @@ def apply_latest_message_fallbacks(
 
     if latest_phone:
         result["phone"] = latest_phone
+
+    if latest_duration is not None:
+        result["duration"] = format_minutes_as_duration(
+            latest_duration
+        )
 
     if (
         result.get("name") in [None, ""]
@@ -3693,19 +3752,29 @@ def apply_generic_service_switch_controller(
     fixed_duration = duration_for_structured_service(
         selected_identity
     )
-
-    if fixed_duration:
-        result["duration"] = fixed_duration
-    else:
-        # Selectable-duration services, such as massages, must not inherit a
-        # stale fixed duration from the previous treatment.
-        result["duration"] = None
+    explicit_duration = explicit_duration_minutes_from_reply(
+        latest_message,
+        treatment=selected_name,
+    )
 
     switched = bool(
         previous_name
         and normalise_treatment_name(previous_name)
         != normalise_treatment_name(selected_name)
     )
+
+    if fixed_duration:
+        result["duration"] = fixed_duration
+    elif explicit_duration is not None:
+        # The customer selected a variable-duration service and its length in
+        # the same message, for example: "120 minutes deep tissue".
+        result["duration"] = format_minutes_as_duration(
+            explicit_duration
+        )
+    elif switched:
+        # Clear only a genuinely stale duration inherited from a different
+        # treatment. Do not erase a valid duration for the current service.
+        result["duration"] = None
 
     if not switched:
         result["status"] = calculate_lead_status(
@@ -4218,7 +4287,11 @@ def validate_latest_customer_details(
     """
     result = dict(lead_data)
     lower_previous = previous_assistant_message.lower()
-    latest_duration = parse_duration_minutes(latest_message)
+    latest_duration = explicit_duration_minutes_from_reply(
+        latest_message,
+        previous_assistant_message,
+        result.get("treatment"),
+    )
     allowed_durations = allowed_durations_for_treatment(
         result.get("treatment")
     )
@@ -4412,7 +4485,16 @@ def preserve_existing_booking_details(
     )
     explicit_time = parse_time_from_text(latest_message)
     explicit_phone = parse_phone_from_text(latest_message)
-    explicit_duration = parse_duration_minutes(latest_message)
+    explicit_duration = explicit_duration_minutes_from_reply(
+        latest_message,
+        previous_assistant_message,
+        result.get("treatment") or existing.get("treatment"),
+    )
+
+    if explicit_duration is not None:
+        result["duration"] = format_minutes_as_duration(
+            explicit_duration
+        )
 
     if existing.get("preferred_date") not in [None, ""] and not explicit_date:
         result["preferred_date"] = existing.get("preferred_date")
