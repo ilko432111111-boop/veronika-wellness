@@ -541,7 +541,7 @@ class GoogleCalendarDiagnosticTests(unittest.TestCase):
                         self.assertIsNone(self.chatbot.refresh_google_access_token())
                         self.assertEqual(
                             self.chatbot.GOOGLE_CALENDAR_LAST_DIAGNOSTIC,
-                            "refresh_token_request_failed",
+                            "refresh_token_http_400",
                         )
 
                     with patch.object(
@@ -552,7 +552,7 @@ class GoogleCalendarDiagnosticTests(unittest.TestCase):
                         self.assertIsNone(self.chatbot.refresh_google_access_token())
                         self.assertEqual(
                             self.chatbot.GOOGLE_CALENDAR_LAST_DIAGNOSTIC,
-                            "access_token_missing_from_refresh_response",
+                            "refresh_token_missing_access_token",
                         )
 
         with patch.object(

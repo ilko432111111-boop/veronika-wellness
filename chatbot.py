@@ -5045,6 +5045,34 @@ def exchange_google_code_for_tokens(code: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def refresh_token_http_error_diagnostic(error: urllib_error.HTTPError) -> str:
+    oauth_error = None
+
+    try:
+        response_data = json.loads(error.read().decode("utf-8"))
+
+        if isinstance(response_data, dict):
+            oauth_error = response_data.get("error")
+    except Exception:
+        pass
+    finally:
+        error.close()
+
+    if oauth_error == "invalid_grant":
+        return "refresh_token_invalid_grant"
+
+    if oauth_error == "invalid_client":
+        return "refresh_token_invalid_client"
+
+    if error.code == 400:
+        return "refresh_token_http_400"
+
+    if error.code == 401:
+        return "refresh_token_http_401"
+
+    return "refresh_token_unexpected_error"
+
+
 def refresh_google_access_token() -> str | None:
     refresh_token = get_google_refresh_token()
 
@@ -5075,34 +5103,46 @@ def refresh_google_access_token() -> str | None:
         )
 
         with urllib_request.urlopen(token_request, timeout=15) as response:
-            token_data = json.loads(response.read().decode("utf-8"))
+            try:
+                token_data = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                set_google_calendar_diagnostic(
+                    "refresh_token_malformed_response"
+                )
+                return None
+
+        if not isinstance(token_data, dict):
+            set_google_calendar_diagnostic("refresh_token_malformed_response")
+            return None
 
         access_token = token_data.get("access_token")
 
         if not access_token:
             set_google_calendar_diagnostic(
-                "access_token_missing_from_refresh_response"
+                "refresh_token_missing_access_token"
             )
             return None
 
         set_google_calendar_diagnostic("access_token_refreshed")
         return access_token
 
-    except urllib_error.HTTPError:
-        set_google_calendar_diagnostic("refresh_token_request_failed")
+    except urllib_error.HTTPError as error:
+        set_google_calendar_diagnostic(
+            refresh_token_http_error_diagnostic(error)
+        )
 
     except TimeoutError:
-        set_google_calendar_diagnostic("network_timeout")
+        set_google_calendar_diagnostic("refresh_token_timeout")
 
     except urllib_error.URLError as error:
         set_google_calendar_diagnostic(
-            "network_timeout"
+            "refresh_token_timeout"
             if isinstance(error.reason, TimeoutError)
-            else "refresh_token_request_failed"
+            else "refresh_token_network_error"
         )
 
     except Exception:
-        set_google_calendar_diagnostic("unexpected_exception")
+        set_google_calendar_diagnostic("refresh_token_unexpected_error")
 
     return None
 
@@ -6267,8 +6307,8 @@ async def google_calendar_callback(
         )
 
     except urllib_error.HTTPError as oauth_error:
-        body = oauth_error.read().decode("utf-8", errors="replace")
-        print(f"Google OAuth token exchange failed: HTTP {oauth_error.code} {body}")
+        oauth_error.close()
+        print(f"Google OAuth token exchange failed: HTTP {oauth_error.code}")
 
         return HTMLResponse(
             """
@@ -6278,8 +6318,8 @@ async def google_calendar_callback(
             status_code=500,
         )
 
-    except Exception as oauth_error:
-        print(f"Google Calendar connection failed: {oauth_error}")
+    except Exception:
+        print("Google Calendar connection failed.")
 
         return HTMLResponse(
             """
