@@ -3548,6 +3548,237 @@ FIXED_TREATMENT_DETAILS = [
 ]
 
 
+def fixed_treatment_metadata(
+    treatment: str | None,
+) -> dict | None:
+    """
+    Temporary fallback for services that have not yet been migrated into
+    public.services.
+
+    New businesses should store these values in public.services. This fallback
+    remains only so older configured treatments continue to work during the
+    migration.
+    """
+    cleaned = normalise_service_match_text(
+        treatment
+    )
+
+    if not cleaned:
+        return None
+
+    for item in FIXED_TREATMENT_DETAILS:
+        candidates = [
+            item.get("name"),
+            *(item.get("aliases") or []),
+        ]
+
+        for candidate in candidates:
+            candidate_cleaned = normalise_service_match_text(
+                candidate
+            )
+
+            if (
+                candidate_cleaned
+                and (
+                    cleaned == candidate_cleaned
+                    or candidate_cleaned in cleaned
+                    or cleaned in candidate_cleaned
+                )
+            ):
+                minutes = parse_duration_minutes(
+                    item.get("duration")
+                )
+
+                return {
+                    "service_id": None,
+                    "service_name": item.get("name"),
+                    "category": "legacy_fixed_treatments",
+                    "booking_mode": "fixed_duration",
+                    "fixed_duration_minutes": minutes,
+                    "allowed_durations_minutes": (
+                        [minutes] if minutes else []
+                    ),
+                    "price_pence": item.get("price_pence"),
+                    "price_by_duration": None,
+                    "source": "legacy_fallback",
+                }
+
+    return None
+
+
+def load_service_metadata_from_table(
+    treatment: str | None,
+) -> dict | None:
+    """
+    Generic public.services lookup used by the reusable controller.
+
+    This is deliberately category-agnostic so another business can add a
+    fixed-duration service in Supabase without requiring another Python patch.
+    """
+    cleaned = normalise_service_match_text(
+        treatment
+    )
+
+    if not cleaned:
+        return None
+
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "id, category, service_name, aliases, booking_mode, "
+                "fixed_duration_minutes, allowed_durations_minutes, "
+                "price_pence, price_by_duration, is_active"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("is_active", True)
+            .execute()
+        )
+
+        matches = []
+
+        for row in response.data or []:
+            candidates = [
+                row.get("service_name"),
+                *(row.get("aliases") or []),
+            ]
+            best_score = 0
+
+            for candidate in candidates:
+                candidate_cleaned = normalise_service_match_text(
+                    candidate
+                )
+
+                if not candidate_cleaned:
+                    continue
+
+                if cleaned == candidate_cleaned:
+                    best_score = max(best_score, 10000)
+                elif candidate_cleaned in cleaned:
+                    best_score = max(
+                        best_score,
+                        5000 + len(candidate_cleaned),
+                    )
+                elif cleaned in candidate_cleaned:
+                    best_score = max(
+                        best_score,
+                        1000 + len(cleaned),
+                    )
+
+            if best_score:
+                matches.append((best_score, row))
+
+        if not matches:
+            return None
+
+        matches.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        if (
+            len(matches) > 1
+            and matches[0][0] == matches[1][0]
+        ):
+            return None
+
+        row = matches[0][1]
+        fixed_minutes = row.get(
+            "fixed_duration_minutes"
+        )
+
+        if fixed_minutes not in [None, ""]:
+            fixed_minutes = int(fixed_minutes)
+
+        allowed = [
+            int(value)
+            for value in (
+                row.get("allowed_durations_minutes")
+                or []
+            )
+        ]
+
+        return {
+            "service_id": row.get("id"),
+            "service_name": row.get("service_name"),
+            "category": row.get("category"),
+            "booking_mode": row.get("booking_mode"),
+            "fixed_duration_minutes": fixed_minutes,
+            "allowed_durations_minutes": allowed,
+            "price_pence": row.get("price_pence"),
+            "price_by_duration": row.get("price_by_duration"),
+            "source": "services_table",
+        }
+
+    except Exception as error:
+        print(
+            "Could not load generic service metadata: "
+            f"{error}"
+        )
+
+    return None
+
+
+def authoritative_service_metadata(
+    treatment: str | None,
+) -> dict | None:
+    """
+    Return the authoritative service configuration for the active treatment.
+
+    Prefer public.services. Fall back to older hardcoded fixed-treatment
+    metadata only for services that have not yet been migrated.
+    """
+    return (
+        load_service_metadata_from_table(
+            treatment
+        )
+        or fixed_treatment_metadata(
+            treatment
+        )
+    )
+
+
+def hydrate_configured_service_defaults(
+    state: dict,
+) -> dict:
+    """
+    Apply deterministic service defaults before deciding what to ask next.
+
+    A configured service with one fixed duration must never ask the customer
+    to choose a duration. The extractor and responder do not control this.
+    """
+    result = dict(state)
+    metadata = authoritative_service_metadata(
+        result.get("treatment")
+    )
+
+    if not metadata:
+        return result
+
+    service_name = metadata.get(
+        "service_name"
+    )
+
+    if service_name:
+        result["treatment"] = service_name
+
+    fixed_minutes = metadata.get(
+        "fixed_duration_minutes"
+    )
+
+    if fixed_minutes not in [None, ""]:
+        result["duration"] = format_minutes_as_duration(
+            int(fixed_minutes)
+        )
+
+    if metadata.get("category"):
+        result["active_category"] = metadata.get(
+            "category"
+        )
+
+    return result
+
+
 def normalise_service_match_text(value: str | None) -> str:
     cleaned = normalise_treatment_name(value)
     cleaned = cleaned.replace("&", " and ")
@@ -6230,24 +6461,11 @@ def apply_validated_state_patch(
     ):
         result["duration"] = None
 
-    # Fixed-duration structured services always use configured durations.
-    identity = structured_service_identity(
-        result.get("treatment")
+    # Apply defaults from the owner-editable services table. Legacy fixed
+    # metadata remains a temporary fallback for categories not migrated yet.
+    result = hydrate_configured_service_defaults(
+        result
     )
-
-    if identity:
-        fixed_minutes = identity.get(
-            "fixed_duration_minutes"
-        )
-
-        if fixed_minutes not in [None, ""]:
-            result["duration"] = format_minutes_as_duration(
-                int(fixed_minutes)
-            )
-
-        result["active_category"] = identity.get(
-            "category"
-        )
 
     result["notes"] = merge_notes(
         result.get("notes"),
@@ -6389,7 +6607,9 @@ def apply_canonical_controller_state(
     booking_flow_active: bool,
     calendar_result: dict | None = None,
 ) -> dict:
-    result = dict(state)
+    result = hydrate_configured_service_defaults(
+        state
+    )
     next_detail = compute_next_required_detail(
         result,
         booking_flow_active,
@@ -6464,8 +6684,22 @@ def safe_calendar_customer_text(
         )
 
     if status == "unknown":
+        if (
+            state.get("preferred_date") not in [None, ""]
+            and state.get("preferred_time") not in [None, ""]
+        ):
+            return (
+                "I could not verify "
+                + format_customer_slot(
+                    state.get("preferred_date"),
+                    state.get("preferred_time"),
+                )
+                + " automatically. Veronika will check the availability "
+                "manually before confirming."
+            )
+
         return (
-            "The therapist will need to check the availability manually."
+            "Veronika will need to check the availability manually."
         )
 
     return ""
@@ -6567,6 +6801,40 @@ def generate_natural_reply_body(
         return ""
 
 
+def strip_unverified_calendar_claims(
+    reply: str,
+    calendar_result: dict,
+) -> str:
+    """
+    Remove model-written calendar claims unless Python has verified that the
+    wording is allowed. Calendar text is appended deterministically later.
+    """
+    cleaned = str(reply or "")
+    status = str(
+        calendar_result.get("status") or "not_checked"
+    )
+
+    if status == "free":
+        return cleaned
+
+    patterns = [
+        r"(?is)(?:\s*\n\s*)?i(?:'ll| will)? have the therapist check that slot and confirm[.!]?",
+        r"(?is)(?:\s*\n\s*)?the therapist will check (?:that|the) slot and confirm[.!]?",
+        r"(?is)(?:\s*\n\s*)?(?:that|the requested) slot (?:looks|appears|is) free[.!]?",
+        r"(?is)(?:\s*\n\s*)?(?:that|the requested) time (?:looks|appears|is) free[.!]?",
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(
+            pattern,
+            "",
+            cleaned,
+        )
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def compose_verified_customer_reply(
     state: dict,
     extractor_result: dict,
@@ -6607,6 +6875,11 @@ def compose_verified_customer_reply(
     )
 
     parts = []
+
+    body = strip_unverified_calendar_claims(
+        body,
+        calendar_result,
+    )
 
     if body:
         parts.append(body)
@@ -6666,6 +6939,211 @@ def add_manual_multi_treatment_note(
     )
 
     return result
+
+
+def simple_request_price_pence(
+    metadata: dict | None,
+    duration_minutes: int | None,
+) -> int | None:
+    if not metadata:
+        return None
+
+    fixed_price = metadata.get("price_pence")
+
+    if fixed_price not in [None, ""]:
+        return int(fixed_price)
+
+    prices = metadata.get("price_by_duration") or {}
+
+    if duration_minutes is None:
+        return None
+
+    value = prices.get(
+        str(duration_minutes)
+    )
+
+    if value in [None, ""]:
+        return None
+
+    return int(value)
+
+
+def load_simple_draft_request(
+    session_id: str,
+) -> dict | None:
+    try:
+        response = (
+            supabase.table("booking_requests")
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("request_status", "draft")
+            .order("request_number")
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+    except Exception as error:
+        print(
+            "Could not load simple draft request: "
+            f"{error}"
+        )
+
+    return None
+
+
+def next_simple_request_number(
+    session_id: str,
+) -> int:
+    try:
+        response = (
+            supabase.table("booking_requests")
+            .select("request_number")
+            .eq("session_id", session_id)
+            .order("request_number", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return int(
+                response.data[0].get(
+                    "request_number"
+                ) or 0
+            ) + 1
+
+    except Exception as error:
+        print(
+            "Could not calculate simple request number: "
+            f"{error}"
+        )
+
+    return 1
+
+
+def sync_simple_single_request_projection(
+    session_id: str,
+    state: dict,
+    booking_flow_active: bool,
+):
+    """
+    Mirror the canonical single-treatment lead into the relational dashboard.
+
+    This is intentionally a projection only. It does not implement carts,
+    separate appointment drafts, or multi-booking workflow logic.
+    """
+    if not booking_flow_active:
+        return
+
+    metadata = authoritative_service_metadata(
+        state.get("treatment")
+    )
+
+    if not metadata:
+        return
+
+    duration_minutes = parse_duration_minutes(
+        state.get("duration")
+    )
+
+    if duration_minutes is None:
+        return
+
+    price_pence = simple_request_price_pence(
+        metadata,
+        duration_minutes,
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    request_row = load_simple_draft_request(
+        session_id
+    )
+
+    request_payload = {
+        "session_id": session_id,
+        "request_status": "draft",
+        "appointment_structure": "single_service",
+        "preferred_date": state.get("preferred_date"),
+        "preferred_time": state.get("preferred_time"),
+        "slot_status": state.get("slot_status") or "not_checked",
+        "item_count": 1,
+        "total_duration_minutes": duration_minutes,
+        "total_price_pence": price_pence or 0,
+        "missing_detail": state.get("next_required_detail"),
+        "updated_at": now_iso,
+    }
+
+    try:
+        if request_row:
+            request_id = int(
+                request_row["id"]
+            )
+            (
+                supabase.table("booking_requests")
+                .update(request_payload)
+                .eq("id", request_id)
+                .execute()
+            )
+        else:
+            request_payload["request_number"] = (
+                next_simple_request_number(
+                    session_id
+                )
+            )
+            response = (
+                supabase.table("booking_requests")
+                .insert(request_payload)
+                .execute()
+            )
+
+            if not response.data:
+                return
+
+            request_id = int(
+                response.data[0]["id"]
+            )
+
+        item_payload = {
+            "booking_request_id": request_id,
+            "service_id": metadata.get("service_id"),
+            "service_name": metadata.get("service_name"),
+            "category": metadata.get("category"),
+            "duration_minutes": duration_minutes,
+            "price_pence": price_pence,
+            "item_order": 1,
+            "updated_at": now_iso,
+        }
+
+        (
+            supabase.table("booking_items")
+            .upsert(
+                item_payload,
+                on_conflict="booking_request_id,item_order",
+            )
+            .execute()
+        )
+
+        try:
+            (
+                supabase.table("conversations")
+                .update({
+                    "active_booking_request_id": request_id,
+                })
+                .eq("session_id", session_id)
+                .execute()
+            )
+        except Exception as error:
+            print(
+                "Could not link simple request projection: "
+                f"{error}"
+            )
+
+    except Exception as error:
+        print(
+            "Could not sync simple request projection: "
+            f"{error}"
+        )
 
 
 @app.post("/chat")
@@ -6756,6 +7234,12 @@ async def chat(
         session_id=request.session_id,
         lead_data=merged_state,
         source=request_source,
+    )
+
+    sync_simple_single_request_projection(
+        session_id=request.session_id,
+        state=merged_state,
+        booking_flow_active=booking_flow_active,
     )
 
     reply = compose_verified_customer_reply(
