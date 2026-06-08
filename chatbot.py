@@ -4584,7 +4584,7 @@ def save_conversation_overview(
     session_id: str,
     lead_data: dict,
     source: str = "website",
-):
+) -> bool:
     try:
         payload = {
             "session_id": session_id,
@@ -4597,9 +4597,14 @@ def save_conversation_overview(
             payload,
             on_conflict="session_id"
         ).execute()
+        return True
 
     except Exception as error:
-        print(f"Could not save conversation overview: {error}")
+        print(
+            "Canonical conversation state save failed: "
+            f"{type(error).__name__}"
+        )
+        return False
 
 
 def format_customer_date(value: str | None) -> str:
@@ -5173,18 +5178,19 @@ def build_requested_slot(lead_data: dict):
     preferred_time = lead_data.get("preferred_time")
     duration_minutes = parse_duration_minutes(lead_data.get("duration"))
 
-    if not preferred_date or not preferred_time:
+    if (
+        not preferred_date
+        or not preferred_time
+        or not duration_minutes
+        or duration_minutes <= 0
+    ):
         return None
 
     try:
         start_time = datetime.fromisoformat(
             f"{preferred_date}T{preferred_time}"
         ).replace(tzinfo=BUSINESS_TIMEZONE)
-
-        # If duration is not known yet, check whether the requested start
-        # itself already clashes with a busy period.
-        check_minutes = duration_minutes or 1
-        end_time = start_time + timedelta(minutes=check_minutes)
+        end_time = start_time + timedelta(minutes=duration_minutes)
 
         return start_time, end_time, duration_minutes
 
@@ -5497,6 +5503,12 @@ def check_requested_calendar_slot(
     duration_minutes = parse_duration_minutes(
         lead_data.get("duration")
     )
+
+    if not duration_minutes or duration_minutes <= 0:
+        return {
+            "status": "not_checked",
+            "message": "A positive treatment duration is not saved yet.",
+        }
 
     if (
         asks_for_next_available_time(latest_message)
@@ -6901,13 +6913,21 @@ def verified_calendar_result_for_state(
             "message": "No booking slot check is required.",
         }
 
+    duration_minutes = parse_duration_minutes(
+        state.get("duration")
+    )
+
     if (
         state.get("preferred_date") in [None, ""]
         or state.get("preferred_time") in [None, ""]
+        or not duration_minutes
+        or duration_minutes <= 0
     ):
         return {
             "status": "not_checked",
-            "message": "A date and time are not both saved yet.",
+            "message": (
+                "A positive duration, date, and time are not all saved yet."
+            ),
         }
 
     return check_requested_calendar_slot(
@@ -6963,8 +6983,6 @@ def safe_calendar_customer_text(
 def build_responder_context(
     state: dict,
     extractor_result: dict,
-    calendar_result: dict,
-    next_question: str,
     business_context: str,
     services_context: str,
     latest_message: str,
@@ -6976,10 +6994,9 @@ Write a short, warm and natural reply to the customer's newest message.
 
 IMPORTANT LOCKED RULES:
 - The saved state below is authoritative.
-- Never invent, infer, rewrite, or calculate a date, weekday, time, price, duration, or calendar slot.
-- Never mention availability unless it is explicitly supplied in VERIFIED CALENDAR CUSTOMER TEXT.
+- Never mention, paraphrase, invent, or calculate availability, calendar results, dates, weekdays, times, or slots.
 - Never claim that an appointment is confirmed. Veronika confirms manually.
-- Do not ask workflow questions. Python appends the one allowed next question separately.
+- Do not ask any question or request any missing booking detail.
 - Answer a customer's side question briefly when possible.
 - Do not repeat information unnecessarily.
 - If the customer asks what services are offered, answer using the supplied business information and service catalogue.
@@ -6993,12 +7010,6 @@ HIDDEN EXTRACTOR RESULT:
 CURRENT SAVED STATE AFTER VALIDATION:
 {json.dumps(serialisable_saved_state(state), ensure_ascii=False, indent=2)}
 
-VERIFIED CALENDAR CUSTOMER TEXT:
-{safe_calendar_customer_text(state, calendar_result) or "None"}
-
-ONE ALLOWED NEXT QUESTION APPENDED BY PYTHON:
-{next_question or "None"}
-
 RECENT CONVERSATION:
 {compact_recent_history(history)}
 
@@ -7008,15 +7019,55 @@ AUTHORITATIVE STRUCTURED SERVICES:
 BUSINESS INFORMATION:
 {business_context}
 
-Return only the natural reply body. Do not append a workflow question.
+Return only a question-free natural reply body. Python adds any calendar text
+and workflow question afterward.
 """
+
+
+def sanitise_natural_responder_body(reply: str) -> str:
+    """
+    Keep the model-written body free of calendar wording and workflow prompts.
+
+    Python owns all calendar statements and workflow questions. This cleaner is
+    deliberately conservative because removing an unsafe sentence is better
+    than allowing generated scheduling details into the customer reply.
+    """
+    cleaned = normalise_reply_line_breaks(reply)
+    rejected_patterns = [
+        r"\?",
+        r"(?i)\b(?:availability|available|unavailable|calendar|schedule|slot|free|busy)\b",
+        r"(?i)\b(?:fit you in|opening hours|alternative times?|next available)\b",
+        r"(?i)\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        r"(?i)\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        r"\b20\d{2}-\d{2}-\d{2}\b",
+        r"(?i)\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
+        r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b",
+        r"(?i)\b(?:noon|midday|midnight|morning|afternoon|evening)\b",
+        r"(?i)\b(?:at|around)\s+\d{1,2}\b",
+        r"(?i)\b(?:which|what|when|how long|would you like|do you prefer|could you|can you)\b",
+        r"(?i)\b(?:tell|send|share|provide|give|need|let me know)\b[^.!?\n]*\b(?:name|phone|number|date|day|time|duration|treatment|service)\b",
+    ]
+    safe_sentences = []
+
+    for sentence in re.findall(r"[^.!?\n]+[.!?]?", cleaned):
+        sentence = sentence.strip()
+
+        if not sentence:
+            continue
+
+        if any(re.search(pattern, sentence) for pattern in rejected_patterns):
+            continue
+
+        safe_sentences.append(sentence)
+
+    return collapse_repeated_reply_content(
+        " ".join(safe_sentences)
+    )
 
 
 def generate_natural_reply_body(
     state: dict,
     extractor_result: dict,
-    calendar_result: dict,
-    next_question: str,
     business_context: str,
     services_context: str,
     latest_message: str,
@@ -7025,8 +7076,6 @@ def generate_natural_reply_body(
     prompt = build_responder_context(
         state,
         extractor_result,
-        calendar_result,
-        next_question,
         business_context,
         services_context,
         latest_message,
@@ -7047,8 +7096,7 @@ def generate_natural_reply_body(
             completion.choices[0].message.content
         )
         reply = sanitise_booking_claims(reply)
-        reply = strip_model_booking_questions(reply)
-        reply = collapse_repeated_reply_content(reply)
+        reply = sanitise_natural_responder_body(reply)
         return reply.strip()
 
     except Exception as error:
@@ -7065,14 +7113,11 @@ def strip_unverified_calendar_claims(
     wording is allowed. Calendar text is appended deterministically later.
     """
     cleaned = str(reply or "")
-    status = str(
-        calendar_result.get("status") or "not_checked"
-    )
-
-    if status == "free":
-        return cleaned
-
     patterns = [
+        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:availability|available|unavailable|calendar|schedule|slot|free|busy|fit you in|opening hours|alternative times?|next available)[^.!?]*[.!?]?",
+        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)[^.!?]*[.!?]?",
+        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:january|february|march|april|may|june|july|august|september|october|november|december)[^.!?]*[.!?]?",
+        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:\b(?:[01]?\d|2[0-3]):[0-5]\d\b|\b\d{1,2}\s*(?:am|pm)\b|\b(?:noon|midday|midnight|morning|afternoon|evening)\b|\b(?:at|around)\s+\d{1,2}\b)[^.!?]*[.!?]?",
         r"(?is)(?:\s*\n\s*)?i(?:'ll| will)? have the therapist check that slot and confirm[.!]?",
         r"(?is)(?:\s*\n\s*)?the therapist will check (?:that|the) slot and confirm[.!]?",
         r"(?is)(?:\s*\n\s*)?the therapist will check[^.!?]*(?:and )?confirm[.!]?",
@@ -7119,8 +7164,6 @@ def compose_verified_customer_reply(
     body = generate_natural_reply_body(
         state,
         extractor_result,
-        calendar_result,
-        next_question,
         business_context,
         services_context,
         latest_message,
@@ -7133,6 +7176,7 @@ def compose_verified_customer_reply(
 
     parts = []
 
+    body = sanitise_natural_responder_body(body)
     body = strip_unverified_calendar_claims(
         body,
         calendar_result,
@@ -7420,6 +7464,12 @@ def sync_simple_single_request_projection(
         )
 
 
+CANONICAL_SAVE_FAILURE_REPLY = (
+    "Sorry, I could not safely save your request just now. "
+    "Please try again in a moment or call Veronika directly."
+)
+
+
 @app.post("/chat")
 async def chat(
     request: ChatRequest,
@@ -7479,6 +7529,13 @@ async def chat(
         {"status": "not_checked"},
     )
 
+    if not save_conversation_overview(
+        session_id=request.session_id,
+        lead_data=merged_state,
+        source=request_source,
+    ):
+        return {"reply": CANONICAL_SAVE_FAILURE_REPLY}
+
     calendar_result = verified_calendar_result_for_state(
         merged_state,
         booking_flow_active,
@@ -7504,11 +7561,12 @@ async def chat(
         calendar_result,
     )
 
-    save_conversation_overview(
+    if not save_conversation_overview(
         session_id=request.session_id,
         lead_data=merged_state,
         source=request_source,
-    )
+    ):
+        return {"reply": CANONICAL_SAVE_FAILURE_REPLY}
 
     sync_simple_single_request_projection(
         session_id=request.session_id,
