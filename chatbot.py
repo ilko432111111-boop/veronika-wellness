@@ -53,22 +53,6 @@ if LIVE_CHAT_REASONING_EFFORT not in {"low", "medium", "high"}:
     LIVE_CHAT_REASONING_EFFORT = "low"
 
 
-def read_positive_int_environment_variable(
-    name: str,
-    default: int,
-) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-
-        if value > 0:
-            return value
-
-    except (TypeError, ValueError):
-        pass
-
-    return default
-
-
 LIVE_CHAT_MAX_COMPLETION_TOKENS = read_positive_int_environment_variable(
     "LIVE_CHAT_MAX_COMPLETION_TOKENS",
     1200,
@@ -234,59 +218,6 @@ def calculate_lead_status(lead_data: dict, extracted_status: str | None) -> str:
         return "interested"
 
     return "new_chat"
-
-
-def merge_lead_data(existing: dict, extracted: dict) -> dict:
-    fields = [
-        "name",
-        "phone",
-        "treatment",
-        "duration",
-        "preferred_date",
-        "preferred_time",
-        "notes",
-        "summary",
-    ]
-
-    merged = {}
-
-    for field in fields:
-        new_value = extracted.get(field)
-        old_value = existing.get(field)
-
-        if new_value not in [None, ""]:
-            merged[field] = new_value
-        else:
-            merged[field] = old_value
-
-    merged["status"] = calculate_lead_status(
-        merged,
-        extracted.get("status"),
-    )
-
-    # If a previous buggy version sent an alert too early, clear the marker
-    # while the lead is incomplete so a correct alert can be sent later.
-    if merged["status"] != "booking_request_complete":
-        merged["notification_sent_at"] = None
-
-    return merged
-
-
-def normalise_preferred_date(value: str | None) -> str | None:
-    if value in [None, ""]:
-        return value
-
-    cleaned = str(value).strip()
-    lower_value = cleaned.lower()
-    today = datetime.now(BUSINESS_TIMEZONE).date()
-
-    if lower_value == "today":
-        return today.isoformat()
-
-    if lower_value == "tomorrow":
-        return (today + timedelta(days=1)).isoformat()
-
-    return cleaned
 
 
 def next_weekday_date(
@@ -602,139 +533,6 @@ BOOKING_INTENT_PATTERNS = [
 ]
 
 
-def customer_history_text(conversation_history: str) -> str:
-    lines = []
-
-    for line in str(conversation_history or "").splitlines():
-        lower_line = line.lower().lstrip()
-
-        if lower_line.startswith(("customer:", "user:")):
-            lines.append(line.split(":", 1)[1])
-
-    return "\n".join(lines)
-
-
-def is_affirmative_reply(message: str) -> bool:
-    cleaned = re.sub(r"[^a-z]+", " ", str(message or "").lower()).strip()
-
-    return cleaned in {
-        "yes",
-        "yes please",
-        "yeah",
-        "yep",
-        "sure",
-        "okay",
-        "ok",
-        "please",
-        "sounds good",
-        "that works",
-    }
-
-
-def conversation_has_booking_intent(
-    conversation_history: str,
-    latest_message: str,
-    previous_assistant_message: str,
-    current_lead: dict,
-) -> bool:
-    """
-    Start the booking-detail flow only when the customer actually indicates
-    that they want an appointment. Asking for information about a treatment is
-    not enough.
-    """
-    if current_lead.get("status") in {
-        "details_incomplete",
-        "booking_request_complete",
-    }:
-        return True
-
-    customer_text = customer_history_text(conversation_history)
-    searchable_text = f"{customer_text}\n{latest_message}".lower()
-
-    if any(
-        re.search(pattern, searchable_text)
-        for pattern in BOOKING_INTENT_PATTERNS
-    ):
-        return True
-
-    previous_lower = str(previous_assistant_message or "").lower()
-
-    if (
-        is_affirmative_reply(latest_message)
-        and any(
-            phrase in previous_lower
-            for phrase in [
-                "would you like to book",
-                "would you like me to take your booking request",
-                "would you like to request an appointment",
-                "shall i take your booking details",
-            ]
-        )
-    ):
-        return True
-
-    # Voluntarily providing a date or time while a treatment is already known
-    # in the current message or saved lead is also a clear sign that the
-    # customer wants to arrange an appointment.
-    if current_lead.get("treatment") and (
-        parse_relative_date_from_text(latest_message)
-        or parse_time_from_text(latest_message)
-    ):
-        return True
-
-    return False
-
-
-def normalise_misplaced_preferred_fields(
-    lead_data: dict,
-    latest_message: str,
-) -> dict:
-    """
-    Correct extraction mistakes such as preferred_time='today'. Relative date
-    words are always stored in preferred_date as ISO dates, never as a time.
-    """
-    result = dict(lead_data)
-
-    raw_date = result.get("preferred_date")
-    raw_time = result.get("preferred_time")
-
-    misplaced_date = parse_relative_date_from_text(str(raw_time or ""))
-
-    if misplaced_date and not parse_time_from_text(str(raw_time or "")):
-        result["preferred_date"] = misplaced_date
-        result["preferred_time"] = None
-
-    misplaced_time = parse_time_from_text(str(raw_date or ""))
-
-    if misplaced_time and not parse_relative_date_from_text(str(raw_date or "")):
-        result["preferred_time"] = misplaced_time
-        result["preferred_date"] = None
-
-    latest_date = parse_relative_date_from_text(
-        latest_message,
-        reference_date=result.get("preferred_date"),
-    )
-    latest_time = parse_time_from_text(latest_message)
-
-    if latest_date:
-        result["preferred_date"] = latest_date
-
-        if not latest_time:
-            current_time_value = str(result.get("preferred_time") or "").strip().lower()
-
-            if parse_relative_date_from_text(current_time_value):
-                result["preferred_time"] = None
-
-    if latest_time:
-        result["preferred_time"] = latest_time
-
-    result["preferred_date"] = normalise_preferred_date(
-        result.get("preferred_date")
-    )
-
-    return result
-
-
 def recover_schedule_from_customer_history(
     lead_data: dict,
     conversation_history: str,
@@ -797,104 +595,6 @@ def recover_schedule_from_customer_history(
         result["preferred_time"] = recovered_time
 
     return result
-
-
-def apply_authoritative_schedule_fields(
-    lead_data: dict,
-    existing_lead: dict,
-    latest_message: str,
-) -> dict:
-    """
-    Date and time must come from the customer, not from model inference.
-
-    Preserve a previously accepted value from the saved conversation row.
-    Replace it only when the latest customer message explicitly supplies a
-    new date or time. If no accepted value exists and the latest message does
-    not contain one, clear any value invented by extraction.
-    """
-    result = dict(lead_data)
-
-    existing_date = existing_lead.get("preferred_date")
-    existing_time = existing_lead.get("preferred_time")
-
-    latest_date = parse_relative_date_from_text(
-        latest_message,
-        reference_date=existing_date,
-    )
-    latest_time = parse_time_from_text(latest_message)
-
-    if latest_date:
-        result["preferred_date"] = latest_date
-    elif existing_date not in [None, ""]:
-        result["preferred_date"] = existing_date
-    else:
-        result["preferred_date"] = None
-
-    if latest_time:
-        result["preferred_time"] = latest_time
-    elif existing_time not in [None, ""]:
-        result["preferred_time"] = existing_time
-    else:
-        result["preferred_time"] = None
-
-    return result
-
-
-def align_status_with_booking_intent(
-    lead_data: dict,
-    booking_flow_active: bool,
-) -> dict:
-    result = dict(lead_data)
-
-    if booking_flow_active:
-        result["status"] = calculate_lead_status(
-            result,
-            result.get("status"),
-        )
-    else:
-        result["status"] = (
-            "interested"
-            if result.get("treatment")
-            else "new_chat"
-        )
-        result["notification_sent_at"] = None
-
-    return result
-
-
-def looks_like_customer_name(message: str) -> bool:
-    cleaned = message.strip()
-    lower_message = cleaned.lower()
-
-    rejected = {
-        "yes",
-        "no",
-        "sure",
-        "okay",
-        "ok",
-        "today",
-        "tomorrow",
-        "massage",
-        "swedish massage",
-        "relaxing massage",
-        "deep tissue massage",
-    }
-
-    if lower_message in rejected:
-        return False
-
-    if message_looks_like_schedule_input(cleaned):
-        return False
-
-    if any(char.isdigit() for char in cleaned):
-        return False
-
-    words = cleaned.split()
-
-    return (
-        1 <= len(words) <= 4
-        and all(re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'-]+", word) for word in words)
-    )
 
 
 def explicit_duration_minutes_from_reply(
@@ -966,230 +666,6 @@ def message_looks_like_schedule_input(
             cleaned,
         )
     )
-
-
-def parse_name_from_contact_message(
-    message: str,
-) -> str | None:
-    """
-    Extract a simple name from a combined reply such as:
-      "Ilko 07123456789"
-    """
-    phone = parse_phone_from_text(
-        message
-    )
-
-    if not phone:
-        return None
-
-    index = str(message).find(phone)
-
-    if index <= 0:
-        return None
-
-    possible_name = str(message)[:index].strip(" ,.-")
-
-    if looks_like_customer_name(
-        possible_name
-    ):
-        return possible_name
-
-    return None
-
-
-def latest_message_attempts_phone(
-    message: str,
-) -> bool:
-    """
-    A schedule answer such as "Thursday 2pm" must not be rejected merely
-    because the previous bot question also requested a phone number.
-    """
-    digit_runs = re.findall(
-        r"\d",
-        str(message or ""),
-    )
-
-    return len(digit_runs) >= 6
-
-
-def latest_message_attempts_name(
-    message: str,
-    previous_assistant_message: str,
-) -> bool:
-    lower_previous = str(
-        previous_assistant_message or ""
-    ).lower()
-
-    if "name" not in lower_previous:
-        return False
-
-    if message_looks_like_schedule_input(
-        message
-    ):
-        return False
-
-    if parse_phone_from_text(message):
-        return bool(
-            parse_name_from_contact_message(message)
-        )
-
-    return looks_like_customer_name(
-        message
-    )
-
-
-def extract_latest_customer_facts(
-    latest_message: str,
-    previous_assistant_message: str,
-    current_lead: dict,
-) -> dict:
-    """
-    Parse each supported field independently from the newest customer message.
-
-    The order of details does not matter. A customer may provide treatment,
-    duration, date, time and contact information in one natural sentence.
-    """
-    facts = {}
-
-    preferred_date = parse_relative_date_from_text(
-        latest_message,
-        reference_date=current_lead.get(
-            "preferred_date"
-        ),
-    )
-    preferred_time = parse_time_from_text(
-        latest_message
-    )
-    phone = parse_phone_from_text(
-        latest_message
-    )
-    duration = explicit_duration_minutes_from_reply(
-        latest_message,
-        previous_assistant_message,
-        current_lead.get("treatment"),
-    )
-    name = parse_name_from_contact_message(
-        latest_message
-    )
-
-    if (
-        not name
-        and "name" in str(previous_assistant_message or "").lower()
-        and looks_like_customer_name(latest_message)
-        and not message_looks_like_schedule_input(latest_message)
-    ):
-        name = str(latest_message).strip()
-
-    if preferred_date:
-        facts["preferred_date"] = preferred_date
-
-    if preferred_time:
-        facts["preferred_time"] = preferred_time
-
-    if phone:
-        facts["phone"] = phone
-
-    if duration is not None:
-        facts["duration"] = format_minutes_as_duration(
-            duration
-        )
-
-    if name:
-        facts["name"] = name
-
-    return facts
-
-
-def apply_core_latest_message_state(
-    lead_data: dict,
-    latest_message: str,
-    previous_assistant_message: str,
-) -> dict:
-    """
-    Merge valid newest-message facts into the saved lead state.
-
-    Never clear an existing value merely because the customer answered a
-    different question. Explicit newer details win.
-    """
-    result = dict(lead_data)
-    facts = extract_latest_customer_facts(
-        latest_message,
-        previous_assistant_message,
-        result,
-    )
-
-    for field, value in facts.items():
-        if value not in [None, ""]:
-            result[field] = value
-
-    result["status"] = calculate_lead_status(
-        result,
-        result.get("status"),
-    )
-
-    if result["status"] != "booking_request_complete":
-        result["notification_sent_at"] = None
-
-    return result
-
-
-def apply_latest_message_fallbacks(
-    lead_data: dict,
-    latest_message: str,
-    previous_assistant_message: str,
-) -> dict:
-    """
-    Use the latest customer message as the strongest source for obvious details.
-    This avoids reusing stale dates or times from earlier messages.
-    """
-    result = dict(lead_data)
-
-    result["preferred_date"] = normalise_preferred_date(
-        result.get("preferred_date")
-    )
-
-    latest_date = parse_relative_date_from_text(
-        latest_message,
-        reference_date=result.get("preferred_date"),
-    )
-    latest_time = parse_time_from_text(latest_message)
-    latest_phone = parse_phone_from_text(latest_message)
-    latest_duration = explicit_duration_minutes_from_reply(
-        latest_message,
-        previous_assistant_message,
-        result.get("treatment"),
-    )
-
-    if latest_date:
-        result["preferred_date"] = latest_date
-
-    if latest_time:
-        result["preferred_time"] = latest_time
-
-    if latest_phone:
-        result["phone"] = latest_phone
-
-    if latest_duration is not None:
-        result["duration"] = format_minutes_as_duration(
-            latest_duration
-        )
-
-    if (
-        result.get("name") in [None, ""]
-        and "name" in previous_assistant_message.lower()
-        and looks_like_customer_name(latest_message)
-    ):
-        result["name"] = latest_message.strip()
-
-    result["status"] = calculate_lead_status(
-        result,
-        result.get("status"),
-    )
-
-    if result["status"] != "booking_request_complete":
-        result["notification_sent_at"] = None
-
-    return result
 
 
 FALLBACK_MASSAGE_SERVICES = [
@@ -1521,29 +997,6 @@ def build_massage_variant_prompt() -> str:
     )
 
 
-def customer_asks_for_treatment_options(
-    latest_message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    phrases = [
-        "what treatments do you have",
-        "which treatments do you have",
-        "what massages do you have",
-        "which massages do you have",
-        "what massage options do you have",
-        "which massage options do you have",
-        "what options do you have",
-    ]
-
-    return any(
-        phrase in cleaned
-        for phrase in phrases
-    )
-
-
 FALLBACK_VITAMIN_SHOT_SERVICES = [
     {
         "service_name": "Vitamin Shot",
@@ -1813,18 +1266,6 @@ def needs_vitamin_shot_variant(lead_data: dict) -> bool:
     return bool(
         service
         and service.get("booking_mode") == "choose_variant"
-    )
-
-
-def is_dynamic_fixed_duration_treatment(
-    treatment: str | None,
-) -> bool:
-    service = find_vitamin_shot_service(treatment)
-
-    return bool(
-        service
-        and service.get("booking_mode") == "fixed_duration"
-        and service.get("fixed_duration_minutes")
     )
 
 
@@ -2185,21 +1626,6 @@ def needs_ultrasound_variant(lead_data: dict) -> bool:
     )
 
 
-def is_dynamic_ultrasound_fixed_duration(
-    treatment: str | None,
-) -> bool:
-    service = find_ultrasound_service(treatment)
-
-    return bool(
-        service
-        and service.get("booking_mode") in {
-            "fixed_duration",
-            "package",
-        }
-        and service.get("fixed_duration_minutes")
-    )
-
-
 def format_live_ultrasound_services_context() -> tuple[str, bool]:
     """
     Produce the ultrasound catalogue block sent to the LLM.
@@ -2455,18 +1881,6 @@ def apply_dynamic_body_treatment_details(
         result["notification_sent_at"] = None
 
     return result
-
-
-def is_dynamic_body_treatment_fixed_duration(
-    treatment: str | None,
-) -> bool:
-    service = find_body_treatment_service(treatment)
-
-    return bool(
-        service
-        and service.get("booking_mode") == "fixed_duration"
-        and service.get("fixed_duration_minutes")
-    )
 
 
 def format_live_body_treatment_services_context() -> tuple[str, bool]:
@@ -2809,18 +2223,6 @@ def needs_microneedling_variant(lead_data: dict) -> bool:
             lead_data.get("treatment")
         )
         == "microneedling"
-    )
-
-
-def is_dynamic_microneedling_fixed_duration(
-    treatment: str | None,
-) -> bool:
-    service = find_microneedling_service(treatment)
-
-    return bool(
-        service
-        and service.get("booking_mode") == "fixed_duration"
-        and service.get("fixed_duration_minutes")
     )
 
 
@@ -3181,18 +2583,6 @@ def needs_facial_variant(lead_data: dict) -> bool:
             lead_data.get("treatment")
         )
         == "facial"
-    )
-
-
-def is_dynamic_facial_fixed_duration(
-    treatment: str | None,
-) -> bool:
-    service = find_facial_service(treatment)
-
-    return bool(
-        service
-        and service.get("booking_mode") == "fixed_duration"
-        and service.get("fixed_duration_minutes")
     )
 
 
@@ -3798,18 +3188,6 @@ def needs_dermal_filler_variant(lead_data: dict) -> bool:
     )
 
 
-def is_dynamic_dermal_filler_fixed_duration(
-    treatment: str | None,
-) -> bool:
-    service = find_dermal_filler_service(treatment)
-
-    return bool(
-        service
-        and service.get("booking_mode") == "fixed_duration"
-        and service.get("fixed_duration_minutes")
-    )
-
-
 def format_live_dermal_filler_services_context() -> tuple[str, bool]:
     """
     Produce the dermal-filler catalogue block sent to the LLM.
@@ -4060,153 +3438,6 @@ def resolve_latest_structured_service(
     return None
 
 
-def duration_for_structured_service(
-    service_identity: dict | None,
-) -> str | None:
-    if not service_identity:
-        return None
-
-    return format_minutes_as_duration(
-        service_identity.get("fixed_duration_minutes")
-    )
-
-
-def apply_generic_service_switch_controller(
-    existing_lead: dict,
-    lead_data: dict,
-    latest_message: str,
-) -> tuple[dict, dict | None]:
-    """
-    Detect a customer changing service and clear only the details invalidated
-    by that switch.
-
-    Preserved:
-      - preferred date
-      - preferred time
-      - name
-      - phone
-      - notes
-
-    Recalculated:
-      - treatment
-      - duration
-      - calendar slot status
-      - next required detail
-    """
-    result = dict(lead_data)
-
-    previous_identity = structured_service_identity(
-        existing_lead.get("treatment")
-    )
-    selected_identity = resolve_latest_structured_service(
-        latest_message,
-        existing_treatment=existing_lead.get("treatment"),
-    )
-
-    if not selected_identity:
-        current_identity = structured_service_identity(
-            result.get("treatment")
-        )
-
-        if current_identity:
-            result["active_category"] = current_identity["category"]
-
-        return result, None
-
-    previous_name = (
-        previous_identity.get("service_name")
-        if previous_identity
-        else None
-    )
-    selected_name = selected_identity.get("service_name")
-
-    if not selected_name:
-        return result, None
-
-    result["treatment"] = selected_name
-    result["active_category"] = selected_identity.get("category")
-
-    fixed_duration = duration_for_structured_service(
-        selected_identity
-    )
-    explicit_duration = explicit_duration_minutes_from_reply(
-        latest_message,
-        treatment=selected_name,
-    )
-
-    switched = bool(
-        previous_name
-        and normalise_treatment_name(previous_name)
-        != normalise_treatment_name(selected_name)
-    )
-
-    if fixed_duration:
-        result["duration"] = fixed_duration
-    elif explicit_duration is not None:
-        # The customer selected a variable-duration service and its length in
-        # the same message, for example: "120 minutes deep tissue".
-        result["duration"] = format_minutes_as_duration(
-            explicit_duration
-        )
-    elif switched:
-        # Clear only a genuinely stale duration inherited from a different
-        # treatment. Do not erase a valid duration for the current service.
-        result["duration"] = None
-
-    if not switched:
-        result["status"] = calculate_lead_status(
-            result,
-            result.get("status"),
-        )
-
-        if result["status"] != "booking_request_complete":
-            result["notification_sent_at"] = None
-
-        return result, None
-
-    switched_at = datetime.now(timezone.utc).isoformat()
-
-    result["slot_status"] = "not_checked"
-    result["last_service_switch_at"] = switched_at
-    result["notification_sent_at"] = None
-    result["status"] = calculate_lead_status(
-        result,
-        "details_incomplete",
-    )
-
-    return result, {
-        "previous_service": previous_name,
-        "new_service": selected_name,
-        "active_category": selected_identity.get("category"),
-        "switched_at": switched_at,
-    }
-
-
-def calculate_next_required_detail(
-    lead_data: dict,
-) -> str | None:
-    """
-    Calculate one backend-controlled next step.
-
-    Variant selection always comes before duration, date, time, name, or phone.
-    """
-    if (
-        needs_massage_variant(lead_data)
-        or needs_vitamin_shot_variant(lead_data)
-        or needs_ultrasound_variant(lead_data)
-        or needs_microneedling_variant(lead_data)
-        or needs_facial_variant(lead_data)
-        or needs_dermal_filler_variant(lead_data)
-    ):
-        return "service_variant"
-
-    for field in REQUIRED_BOOKING_FIELDS:
-        if lead_data.get(field) in [None, ""]:
-            return field
-
-    return None
-
-
 def normalise_controller_slot_status(
     calendar_result: dict | None,
 ) -> str:
@@ -4237,56 +3468,6 @@ def normalise_controller_slot_status(
         return "provisional_free"
 
     return status
-
-
-def apply_conversation_controller_state(
-    lead_data: dict,
-    booking_flow_active: bool,
-    calendar_result: dict | None = None,
-) -> dict:
-    """
-    Store the current reusable workflow state in public.conversations.
-    """
-    result = dict(lead_data)
-    identity = structured_service_identity(
-        result.get("treatment")
-    )
-
-    result["conversation_mode"] = (
-        "booking_request"
-        if booking_flow_active
-        else "browsing"
-    )
-    result["active_category"] = (
-        identity.get("category")
-        if identity
-        else result.get("active_category")
-    )
-    result["slot_status"] = normalise_controller_slot_status(
-        calendar_result
-    )
-    result["next_required_detail"] = (
-        calculate_next_required_detail(result)
-        if booking_flow_active
-        else None
-    )
-
-    return result
-
-
-def format_service_switch_context(
-    service_switch: dict | None,
-) -> str:
-    if not service_switch:
-        return "No service switch detected."
-
-    return (
-        "Customer changed treatment. "
-        f"Previous service: {service_switch.get('previous_service')}. "
-        f"New service: {service_switch.get('new_service')}. "
-        "Acknowledge the change briefly and continue from the next missing "
-        "detail. Do not ask again for details that remain valid."
-    )
 
 
 def format_duration_options(durations: set[int]) -> str:
@@ -4507,61 +3688,6 @@ def find_service_from_short_variant_reply(
     return matches[0][1]
 
 
-def find_fixed_treatment_details(value: str | None) -> dict | None:
-    cleaned = normalise_service_match_text(value)
-
-    if not cleaned:
-        return None
-
-    padded_cleaned = f" {cleaned} "
-    candidates = []
-
-    for details in FIXED_TREATMENT_DETAILS:
-        aliases = [details["name"], *details["aliases"]]
-
-        for alias in aliases:
-            cleaned_alias = normalise_service_match_text(alias)
-
-            if cleaned_alias and f" {cleaned_alias} " in padded_cleaned:
-                candidates.append((len(cleaned_alias), details))
-
-    if not candidates:
-        return None
-
-    # Prefer the most specific match. For example, "stomach and love handles"
-    # must win over the shorter alias "stomach".
-    return max(candidates, key=lambda item: item[0])[1]
-
-
-def apply_fixed_treatment_details(
-    lead_data: dict,
-    latest_message: str,
-) -> dict:
-    result = dict(lead_data)
-
-    # The latest customer message wins when it clearly names a fixed service.
-    # Otherwise, use the extracted or previously saved treatment.
-    details = (
-        find_fixed_treatment_details(latest_message)
-        or find_fixed_treatment_details(result.get("treatment"))
-    )
-
-    if not details:
-        return result
-
-    result["treatment"] = details["name"]
-    result["duration"] = details["duration"]
-    result["status"] = calculate_lead_status(
-        result,
-        result.get("status"),
-    )
-
-    if result["status"] != "booking_request_complete":
-        result["notification_sent_at"] = None
-
-    return result
-
-
 def is_valid_customer_name(value: str | None) -> bool:
     if value in [None, ""]:
         return False
@@ -4612,123 +3738,6 @@ def is_valid_phone_number(value: str | None) -> bool:
     return 10 <= len(digits) <= 15
 
 
-def customer_message_interrupts_contact_collection(
-    latest_message: str,
-) -> bool:
-    """
-    Do not force name or phone validation when the customer is asking a side
-    question, changing treatment, or clarifying a treatment variant.
-    """
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    if not cleaned:
-        return False
-
-    if "?" in str(latest_message or ""):
-        return True
-
-    interruption_phrases = [
-        "actually",
-        "instead",
-        "change",
-        "switch",
-        "what",
-        "which",
-        "how much",
-        "do you",
-        "can i",
-        "could i",
-        "where",
-    ]
-
-    if any(
-        phrase in cleaned
-        for phrase in interruption_phrases
-    ):
-        return True
-
-    if resolve_latest_generic_or_partial_service(
-        latest_message
-    ):
-        return True
-
-    return False
-
-
-def validate_latest_customer_details(
-    lead_data: dict,
-    latest_message: str,
-    previous_assistant_message: str,
-    skip_contact_validation: bool = False,
-) -> tuple[dict, str | None]:
-    """
-    Reject obviously invalid booking details before they complete a lead.
-    """
-    result = dict(lead_data)
-    lower_previous = previous_assistant_message.lower()
-    latest_duration = explicit_duration_minutes_from_reply(
-        latest_message,
-        previous_assistant_message,
-        result.get("treatment"),
-    )
-    allowed_durations = allowed_durations_for_treatment(
-        result.get("treatment")
-    )
-
-    if latest_duration is not None and "long" in lower_previous:
-        if allowed_durations and latest_duration not in allowed_durations:
-            result["duration"] = None
-            result["status"] = "details_incomplete"
-            result["notification_sent_at"] = None
-
-            return (
-                result,
-                "invalid_duration:"
-                + format_duration_options(allowed_durations),
-            )
-
-    if (
-        not skip_contact_validation
-        and latest_message_attempts_name(
-            latest_message,
-            previous_assistant_message,
-        )
-        and not is_valid_customer_name(
-            result.get("name")
-        )
-    ):
-        result["name"] = None
-        result["status"] = "details_incomplete"
-        result["notification_sent_at"] = None
-        return result, "invalid_name"
-
-    if (
-        not skip_contact_validation
-        and latest_message_attempts_phone(
-            latest_message
-        )
-        and not is_valid_phone_number(
-            result.get("phone")
-        )
-    ):
-        result["phone"] = None
-        result["status"] = "details_incomplete"
-        result["notification_sent_at"] = None
-        return result, "invalid_phone"
-
-    result["status"] = calculate_lead_status(
-        result,
-        result.get("status"),
-    )
-
-    if result["status"] != "booking_request_complete":
-        result["notification_sent_at"] = None
-
-    return result, None
-
-
 def working_hours_for_date(
     requested_date,
 ) -> tuple[datetime, datetime] | None:
@@ -4768,50 +3777,6 @@ def working_hours_for_date(
     )
 
     return open_time, close_time
-
-
-def business_can_accept_more_bookings_today(
-    duration_minutes: int | None = None,
-) -> bool:
-    now = datetime.now(BUSINESS_TIMEZONE)
-    opening_window = working_hours_for_date(now.date())
-
-    if not opening_window:
-        return False
-
-    _, close_time = opening_window
-    required_minutes = duration_minutes or SLOT_STEP_MINUTES
-
-    return now + timedelta(minutes=required_minutes) <= close_time
-
-
-def clear_expired_same_day_preference(
-    lead_data: dict,
-) -> tuple[dict, bool]:
-    """
-    If the customer selects today after the business has effectively closed,
-    remove the unusable date and ask for another day instead of asking for a
-    time that cannot be fulfilled.
-    """
-    result = dict(lead_data)
-    today = datetime.now(BUSINESS_TIMEZONE).date().isoformat()
-
-    if result.get("preferred_date") != today:
-        return result, False
-
-    duration_minutes = parse_duration_minutes(
-        result.get("duration")
-    )
-
-    if business_can_accept_more_bookings_today(duration_minutes):
-        return result, False
-
-    result["preferred_date"] = None
-    result["preferred_time"] = None
-    result["notification_sent_at"] = None
-    result["status"] = "details_incomplete"
-
-    return result, True
 
 
 def validate_slot_against_working_hours(
@@ -4857,254 +3822,9 @@ def validate_slot_against_working_hours(
     return None
 
 
-def preserve_existing_booking_details(
-    existing: dict,
-    merged: dict,
-    latest_message: str,
-    previous_assistant_message: str,
-) -> dict:
-    """
-    Keep previously confirmed lead values stable unless the latest customer
-    message explicitly changes them. This prevents casual follow-up messages
-    such as "Fantastic" from accidentally changing the requested date or time.
-    """
-    result = dict(merged)
-    lower_latest = latest_message.lower()
-    lower_previous = previous_assistant_message.lower()
-
-    explicit_date = parse_relative_date_from_text(
-        latest_message,
-        reference_date=existing.get("preferred_date"),
-    )
-    explicit_time = parse_time_from_text(latest_message)
-    explicit_phone = parse_phone_from_text(latest_message)
-    explicit_duration = explicit_duration_minutes_from_reply(
-        latest_message,
-        previous_assistant_message,
-        result.get("treatment") or existing.get("treatment"),
-    )
-
-    if explicit_duration is not None:
-        result["duration"] = format_minutes_as_duration(
-            explicit_duration
-        )
-
-    if existing.get("preferred_date") not in [None, ""] and not explicit_date:
-        result["preferred_date"] = existing.get("preferred_date")
-
-    if existing.get("preferred_time") not in [None, ""] and not explicit_time:
-        result["preferred_time"] = existing.get("preferred_time")
-
-    duration_is_explicit_reply = (
-        explicit_duration is not None
-        and (
-            "long" in lower_previous
-            or "duration" in lower_previous
-            or re.search(r"\b(?:minute|minutes|min|mins|hour|hours|hr|hrs)\b", lower_latest)
-        )
-    )
-
-    if existing.get("duration") not in [None, ""] and not duration_is_explicit_reply:
-        result["duration"] = existing.get("duration")
-
-    if existing.get("phone") not in [None, ""] and not explicit_phone:
-        result["phone"] = existing.get("phone")
-
-    if existing.get("name") not in [None, ""]:
-        name_is_explicit_reply = (
-            "name" in lower_previous
-            and looks_like_customer_name(latest_message)
-        )
-
-        if not name_is_explicit_reply:
-            result["name"] = existing.get("name")
-
-    existing_treatment = existing.get("treatment")
-
-    if existing_treatment not in [None, ""]:
-        treatment_keywords = [
-            "massage",
-            "facial",
-            "b12",
-            "vitamin",
-            "filler",
-            "microneedling",
-            "hydrafacial",
-            "sculpting",
-            "ultrasound",
-            "ems",
-            "injection",
-        ]
-
-        if not any(keyword in lower_latest for keyword in treatment_keywords):
-            result["treatment"] = existing_treatment
-
-    result["status"] = calculate_lead_status(
-        result,
-        result.get("status"),
-    )
-
-    if result["status"] != "booking_request_complete":
-        result["notification_sent_at"] = None
-
-    return result
-
-
 def normalise_reply_line_breaks(reply: str) -> str:
     """Store and send real line breaks instead of visible backslash-n text."""
     return str(reply or "").replace("\\r\\n", "\n").replace("\\n", "\n")
-
-
-def remove_invalid_fixed_duration_questions(
-    reply: str,
-    lead_data: dict,
-) -> str:
-    """
-    A fixed-duration treatment must never ask the customer to choose a session
-    length. Remove any duration-selection question accidentally generated by
-    the language model. The deterministic booking flow will then append the
-    correct next missing question, such as the customer's name.
-    """
-    details = find_fixed_treatment_details(
-        lead_data.get("treatment")
-    )
-
-    if (
-        not details
-        and not is_dynamic_fixed_duration_treatment(
-            lead_data.get("treatment")
-        )
-        and not is_dynamic_ultrasound_fixed_duration(
-            lead_data.get("treatment")
-        )
-        and not is_dynamic_body_treatment_fixed_duration(
-            lead_data.get("treatment")
-        )
-        and not is_dynamic_microneedling_fixed_duration(
-            lead_data.get("treatment")
-        )
-        and not is_dynamic_facial_fixed_duration(
-            lead_data.get("treatment")
-        )
-        and not is_dynamic_dermal_filler_fixed_duration(
-            lead_data.get("treatment")
-        )
-    ) or lead_data.get("duration") in [None, ""]:
-        return reply
-
-    cleaned = str(reply or "")
-
-    patterns = [
-        (
-            r"(?is)(?:\s*\n\s*)?"
-            r"(?:how long|what duration|which duration)"
-            r"[^?]*\?"
-        ),
-        (
-            r"(?is)(?:\s*\n\s*)?"
-            r"how long would you like the session for"
-            r"[^?]*\?"
-        ),
-        (
-            r"(?is)(?:\s*\n\s*)?"
-            r"please choose (?:one of )?(?:the )?(?:available )?"
-            r"(?:durations?|session lengths?)[^?.]*[?.]"
-        ),
-    ]
-
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned)
-
-    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-
-    return cleaned.strip()
-
-
-def remove_premature_booking_questions(
-    reply: str,
-    booking_flow_active: bool,
-) -> str:
-    """
-    Informational enquiries must not immediately turn into a booking form.
-    Remove requests for personal details until the customer actually indicates
-    that they want to arrange an appointment.
-    """
-    if booking_flow_active:
-        return reply
-
-    cleaned = str(reply or "")
-
-    patterns = [
-        r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i have your name[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide) your (?:phone|contact|mobile) number[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date) would you prefer[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:which|what) time(?: today)? would you prefer[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?how long would you like the session for[^?]*\?",
-    ]
-
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned)
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-
-    return cleaned.strip()
-
-
-def remove_invalid_today_time_questions(
-    reply: str,
-    today_is_unavailable: bool,
-) -> str:
-    if not today_is_unavailable:
-        return reply
-
-    cleaned = str(reply or "")
-
-    patterns = [
-        r"(?is)(?:\s*\n\s*)?(?:which|what) time[^?]*\btoday\b[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?what time would you like today[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?what time today would you prefer[^?]*\?",
-    ]
-
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned)
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-
-    return cleaned.strip()
-
-
-def remove_redundant_confirmed_field_questions(
-    reply: str,
-    lead_data: dict,
-) -> str:
-    """
-    Do not ask for a date or time that the customer already supplied and the
-    backend accepted.
-    """
-    cleaned = str(reply or "")
-
-    if lead_data.get("preferred_time") not in [None, ""]:
-        cleaned = re.sub(
-            r"(?is)(?:\s*\n\s*)?(?:which|what) time[^?]*\?",
-            "",
-            cleaned,
-        )
-
-    if lead_data.get("preferred_date") not in [None, ""]:
-        cleaned = re.sub(
-            r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date)[^?]*\?",
-            "",
-            cleaned,
-        )
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-
-    return cleaned.strip()
 
 
 def sanitise_booking_claims(reply: str) -> str:
@@ -5126,152 +3846,6 @@ def sanitise_booking_claims(reply: str) -> str:
     return cleaned
 
 
-def canonical_missing_question(
-    field: str,
-    lead_data: dict | None = None,
-) -> str:
-    if field == "duration":
-        if needs_massage_variant(
-            lead_data or {}
-        ):
-            return build_massage_variant_prompt()
-
-        allowed_durations = allowed_durations_for_treatment(
-            (lead_data or {}).get("treatment")
-        )
-
-        if allowed_durations:
-            options = format_duration_options(allowed_durations)
-            return f"How long would you like the session for: {options}?"
-
-        return "Which treatment option would you like?"
-
-    if field == "preferred_date":
-        known_time = (lead_data or {}).get("preferred_time")
-
-        if known_time not in [None, ""]:
-            return (
-                f"Which day did you have in mind for "
-                f"{format_customer_time(known_time)}?"
-            )
-
-        if not business_can_accept_more_bookings_today(
-            parse_duration_minutes((lead_data or {}).get("duration"))
-        ):
-            return "Which day would you prefer? We're closed for today."
-
-        return "Which day would you prefer?"
-
-    if field == "preferred_time":
-        preferred_date = (lead_data or {}).get("preferred_date")
-        today = datetime.now(BUSINESS_TIMEZONE).date().isoformat()
-
-        if (
-            preferred_date == today
-            and not business_can_accept_more_bookings_today(
-                parse_duration_minutes((lead_data or {}).get("duration"))
-            )
-        ):
-            return "We're closed for today. Which other day would you prefer?"
-
-        return "What time would you prefer?"
-
-    questions = {
-        "treatment": "Which treatment would you like?",
-        "name": "What's your name?",
-        "phone": "What's your phone number?",
-    }
-
-    return questions.get(field, "Could you provide the next booking detail?")
-
-
-def reply_already_asks_for_field(reply: str, field: str) -> bool:
-    lower_reply = reply.lower()
-
-    markers = {
-        "treatment": ["which treatment", "what treatment", "which service"],
-        "duration": ["how long", "duration", "how many minutes"],
-        "name": ["your name", "what's your name", "what is your name"],
-        "phone": ["phone number", "contact number", "mobile number"],
-        "preferred_date": ["which day", "what day", "which date", "what date"],
-        "preferred_time": ["what time", "which time", "preferred time"],
-    }
-
-    return any(marker in lower_reply for marker in markers.get(field, []))
-
-
-def grouped_missing_question(
-    missing_fields: list[str],
-    lead_data: dict,
-) -> str:
-    """
-    Ask for up to two closely related details in one natural question.
-    This keeps the flow efficient without turning the chat into a long form.
-    """
-    missing = set(missing_fields)
-
-    if "duration" in missing and "preferred_date" in missing:
-        duration_question = canonical_missing_question(
-            "duration",
-            lead_data,
-        ).rstrip("?")
-
-        return f"{duration_question}, and which day would you prefer?"
-
-    if "duration" in missing and "preferred_time" in missing:
-        duration_question = canonical_missing_question(
-            "duration",
-            lead_data,
-        ).rstrip("?")
-
-        return f"{duration_question}, and what time would suit you?"
-
-    if (
-        "preferred_date" in missing
-        and "preferred_time" in missing
-        and "duration" not in missing
-    ):
-        return "Which day and time would you prefer?"
-
-    if "name" in missing and "phone" in missing:
-        return "Could I take your name and phone number, please?"
-
-    return canonical_missing_question(
-        missing_fields[0],
-        lead_data,
-    )
-
-
-def remove_false_handover_confirmation(
-    reply: str,
-    missing_fields: list[str],
-) -> str:
-    """
-    Never tell the customer that the therapist will confirm shortly while
-    required booking details are still missing.
-    """
-    if not missing_fields:
-        return reply
-
-    cleaned = str(reply or "")
-
-    patterns = [
-        r"(?is)(?:\s*\n\s*)?thanks[.!]?\s*the therapist will confirm the appointment shortly[.!]?",
-        r"(?is)(?:\s*\n\s*)?the therapist will confirm the appointment shortly[.!]?",
-        r"(?is)(?:\s*\n\s*)?your request has been noted[.!]?",
-        r"(?is)(?:\s*\n\s*)?the therapist still needs to confirm(?: the booking| the appointment)?[.!]?",
-        r"(?is)(?:\s*\n\s*)?i(?:'ve| have) noted your request[^.!?]*[.!]?",
-    ]
-
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned)
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-
-    return cleaned.strip()
-
-
 def format_natural_list(items: list[str]) -> str:
     cleaned = [str(item).strip() for item in items if str(item).strip()]
 
@@ -5285,66 +3859,6 @@ def format_natural_list(items: list[str]) -> str:
         return f"{cleaned[0]} or {cleaned[1]}"
 
     return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
-
-
-def build_duration_needed_for_alternatives_reply(
-    lead_data: dict,
-    calendar_result: dict,
-) -> str:
-    """
-    Ask for duration before listing availability. This prevents vague or
-    misleading statements such as "any time before closing could work".
-    """
-    allowed_durations = allowed_durations_for_treatment(
-        lead_data.get("treatment")
-    )
-
-    if allowed_durations:
-        options = format_duration_options(allowed_durations)
-        duration_question = (
-            f"How long would you like the session for: {options}?"
-        )
-    else:
-        duration_question = "How long would you like the session for?"
-
-    requested_slot = calendar_result.get("customer_slot")
-
-    if requested_slot:
-        opening = f"{requested_slot} is unavailable."
-    else:
-        opening = "I can check the available slots for you."
-
-    return (
-        f"{opening}\n\n"
-        f"{duration_question} Once you tell me, I can check the nearest "
-        "available times before and after your requested slot."
-    )
-
-
-def build_direct_calendar_suggestions_reply(
-    calendar_result: dict,
-) -> str:
-    """
-    Render direct availability suggestions in Python.
-
-    The LLM must not rewrite weekday/date combinations because that can create
-    impossible wording such as "Thursday 9 June".
-    """
-    suggestions = calendar_result.get(
-        "suggestions"
-    ) or []
-
-    if not suggestions:
-        return ""
-
-    options = format_natural_list(
-        suggestions
-    )
-
-    return (
-        f"The next available options are {options}.\n\n"
-        "Would any of those times work for you?"
-    )
 
 
 def build_calendar_alternative_reply(
@@ -5374,90 +3888,6 @@ def build_calendar_alternative_reply(
         f"{opening} The next available options are {options}.\n\n"
         "Would any of those times work for you?"
     )
-
-
-def ensure_calendar_alternative_question(
-    reply: str,
-    calendar_result: dict,
-) -> str:
-    """
-    If the backend supplied alternative free slots, ask the customer to pick
-    one rather than ending the conversation or asking unrelated questions.
-    """
-    if not calendar_result.get("suggestions"):
-        return reply
-
-    lower_reply = str(reply or "").lower()
-
-    if any(
-        phrase in lower_reply
-        for phrase in [
-            "would one of those suit",
-            "would any of those suit",
-            "would any of these suit",
-            "which of those",
-            "which option",
-        ]
-    ):
-        return reply
-
-    question = "Would any of those times work for you?"
-
-    if not str(reply or "").strip():
-        return question
-
-    return str(reply).rstrip() + "\n\n" + question
-
-
-def remove_generated_booking_detail_questions(reply: str) -> str:
-    """
-    Strip any booking-detail question produced by the model. The backend adds
-    one clean deterministic grouped question afterwards, preventing repeated
-    or out-of-order questions.
-    """
-    cleaned = str(reply or "")
-
-    patterns = [
-        r"(?is)(?:\s*\n\s*)?(?:which|what) treatment[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:which|what) massage(?: option)?(?: would you like)?[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:how long|what duration|which duration)[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i (?:have|take) your name[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide|could i take) your (?:phone|contact|mobile) number[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date)[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:could|can|may|would) i (?:have|take) your preferred (?:day|date|time)[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:which|what) time[^?]*\?",
-    ]
-
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned)
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-
-    return cleaned.strip()
-
-
-def remove_contact_detail_questions(reply: str) -> str:
-    """
-    Remove any personal-detail question generated before the schedule has been
-    settled. Contact details are collected only after an acceptable date and
-    time exist.
-    """
-    cleaned = str(reply or "")
-
-    patterns = [
-        r"(?is)(?:\s*\n\s*)?(?:may|can|could|would) i (?:have|take) your name(?: and (?:phone|contact|mobile) number)?[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?(?:what(?:'s| is)|may i have|can i have|could you provide|could i take) your (?:phone|contact|mobile) number[^?]*\?",
-        r"(?is)(?:\s*\n\s*)?could i take your name and (?:phone|contact|mobile) number[^?]*\?",
-    ]
-
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned)
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-
-    return cleaned.strip()
 
 
 def build_schedule_first_question(lead_data: dict) -> str:
@@ -5558,45 +3988,6 @@ def build_schedule_first_question(lead_data: dict) -> str:
         )
 
     return ""
-
-
-def enforce_schedule_before_contact(
-    reply: str,
-    lead_data: dict,
-    calendar_result: dict,
-) -> str:
-    """
-    Hard booking-order guardrail:
-    - do not ask for name or phone until date and time are settled;
-    - do not override a proper alternatives reply;
-    - append exactly one schedule question when needed.
-    """
-    if calendar_result.get("suggestions"):
-        return reply
-
-    schedule_question = build_schedule_first_question(
-        lead_data
-    )
-
-    if not schedule_question:
-        return reply
-
-    cleaned = remove_contact_detail_questions(
-        reply
-    )
-
-    cleaned = re.sub(
-        r"(?is)(?:\s*\n\s*)?(?:which|what) (?:day|date|time)[^?]*\?",
-        "",
-        cleaned,
-    )
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r" {2,}", " ", cleaned).strip()
-
-    if not cleaned:
-        return schedule_question
-
-    return cleaned.rstrip() + "\n\n" + schedule_question
 
 
 def strip_model_booking_questions(reply: str) -> str:
@@ -5707,861 +4098,6 @@ def collapse_repeated_reply_content(
     return cleaned.strip()
 
 
-def customer_asks_about_price(message: str) -> bool:
-    cleaned = normalise_service_match_text(message)
-
-    return any(
-        phrase in cleaned
-        for phrase in [
-            "how much",
-            "price",
-            "prices",
-            "cost",
-            "costs",
-            "what are they",
-        ]
-    )
-
-
-def format_service_price_sentence(service: dict | None) -> str:
-    if not service:
-        return ""
-
-    name = str(service.get("service_name") or "").strip()
-    price = format_price_pence(service.get("price_pence"))
-    duration = format_minutes_as_duration(
-        service.get("fixed_duration_minutes")
-    )
-    mode = service.get("booking_mode")
-
-    if not name or not price:
-        return ""
-
-    if mode == "package":
-        return (
-            f"The ultrasound package is {price} for 5 sessions. "
-            "Each session lasts 45 minutes."
-        )
-
-    if duration:
-        return f"{name} is {price} and takes {duration}."
-
-    return f"{name} is {price}."
-
-
-def build_structured_price_information(
-    latest_message: str,
-    lead_data: dict,
-) -> str:
-    """
-    Return a deterministic fixed-price answer when the customer asks about a
-    structured vitamin-shot or ultrasound service.
-    """
-    if not customer_asks_about_price(latest_message):
-        return ""
-
-    if needs_ultrasound_variant(lead_data):
-        return (
-            "A single ultrasound session is £50 for 45 minutes. "
-            "The package is £220 for 5 sessions, with each session lasting "
-            "45 minutes."
-        )
-
-    ultrasound_service = find_ultrasound_service(
-        lead_data.get("treatment")
-    )
-
-    if ultrasound_service:
-        return format_service_price_sentence(
-            ultrasound_service
-        )
-
-    if needs_vitamin_shot_variant(lead_data):
-        return (
-            "B12 and Vitamin C shots are both £20 and take 15 minutes."
-        )
-
-    vitamin_service = find_vitamin_shot_service(
-        lead_data.get("treatment")
-    )
-
-    if vitamin_service:
-        return format_service_price_sentence(
-            vitamin_service
-        )
-
-    return ""
-
-
-def prepend_information_once(reply: str, information: str) -> str:
-    information = str(information or "").strip()
-    reply = str(reply or "").strip()
-
-    if not information:
-        return reply
-
-    if information.lower() in reply.lower():
-        return reply
-
-    if not reply:
-        return information
-
-    return information + "\n\n" + reply
-
-
-def latest_message_selects_ultrasound_variant(
-    message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(message)
-
-    if find_ultrasound_service(message):
-        return True
-
-    return cleaned in {
-        "single",
-        "single session",
-        "one session",
-        "just one",
-        "package",
-        "the package",
-        "package deal",
-        "the package deal",
-        "course",
-    }
-
-
-def latest_message_selects_dermal_filler_service(
-    message: str,
-) -> bool:
-    return bool(
-        find_dermal_filler_service(message)
-    )
-
-
-def latest_message_selects_facial_service(
-    message: str,
-) -> bool:
-    return bool(
-        find_facial_service(message)
-    )
-
-
-def latest_message_selects_microneedling_variant(
-    message: str,
-) -> bool:
-    return bool(
-        find_microneedling_service(message)
-    )
-
-
-def latest_message_selects_body_treatment(
-    message: str,
-) -> bool:
-    return bool(
-        find_body_treatment_service(message)
-    )
-
-
-def latest_message_selects_vitamin_variant(
-    message: str,
-) -> bool:
-    service = find_vitamin_shot_service(message)
-
-    return bool(
-        service
-        and service.get("booking_mode") == "fixed_duration"
-    )
-
-
-def strip_structured_service_price_sentences(
-    reply: str,
-) -> str:
-    """
-    Remove only old LLM-written price sentences for dynamic categories.
-
-    A deterministic price sentence is inserted afterwards. This avoids
-    semantically duplicated wording such as:
-      "The package is £220 for five 45-minute sessions."
-      "The ultrasound package is £220 for 5 sessions."
-    """
-    segments = re.split(
-        r"(?<=[.!?])\s+|\n+",
-        str(reply or "").strip(),
-    )
-
-    kept = []
-
-    for segment in segments:
-        cleaned = segment.strip()
-
-        if not cleaned:
-            continue
-
-        lower_segment = cleaned.lower()
-
-        is_dynamic_service_price = (
-            "£" in cleaned
-            and any(
-                marker in lower_segment
-                for marker in [
-                    "ultrasound",
-                    "package",
-                    "vitamin",
-                    "b12",
-                    "shot",
-                    "body sculpting",
-                    "ems",
-                    "muscle stimulation",
-                    "microneedling",
-                    "stretch marks",
-                    "face and neck",
-                    "facial",
-                    "hydraface",
-                    "hydrafacial",
-                    "dermal filler",
-                    "lip filler",
-                    "marionette",
-                    "nasolabial",
-                ]
-            )
-        )
-
-        if not is_dynamic_service_price:
-            kept.append(cleaned)
-
-    return "\n\n".join(kept).strip()
-
-
-def finalise_dynamic_service_reply(
-    reply: str,
-    latest_message: str,
-    lead_data: dict,
-    missing_fields: list[str],
-    calendar_result: dict,
-) -> str:
-    """
-    Use one deterministic answer for migrated fixed-price categories.
-
-    This prevents the LLM and backend from both listing the same information
-    in slightly different wording.
-    """
-    if needs_ultrasound_variant(lead_data):
-        return build_schedule_first_question(
-            lead_data
-        )
-
-    if needs_vitamin_shot_variant(lead_data):
-        return build_schedule_first_question(
-            lead_data
-        )
-
-    if needs_microneedling_variant(lead_data):
-        return build_schedule_first_question(
-            lead_data
-        )
-
-    if needs_facial_variant(lead_data):
-        return build_schedule_first_question(
-            lead_data
-        )
-
-    if needs_dermal_filler_variant(lead_data):
-        return build_dermal_filler_variant_prompt(
-            lead_data,
-            latest_message,
-        )
-
-    ultrasound_service = find_ultrasound_service(
-        lead_data.get("treatment")
-    )
-    vitamin_service = find_vitamin_shot_service(
-        lead_data.get("treatment")
-    )
-    body_treatment_service = find_body_treatment_service(
-        lead_data.get("treatment")
-    )
-    microneedling_service = find_microneedling_service(
-        lead_data.get("treatment")
-    )
-    facial_service = find_facial_service(
-        lead_data.get("treatment")
-    )
-    dermal_filler_service = find_dermal_filler_service(
-        lead_data.get("treatment")
-    )
-
-    service = (
-        ultrasound_service
-        or vitamin_service
-        or body_treatment_service
-        or microneedling_service
-        or facial_service
-        or dermal_filler_service
-    )
-
-    if not service:
-        return reply
-
-    announce_price = (
-        customer_asks_about_price(latest_message)
-        or latest_message_selects_ultrasound_variant(
-            latest_message
-        )
-        or latest_message_selects_vitamin_variant(
-            latest_message
-        )
-        or latest_message_selects_body_treatment(
-            latest_message
-        )
-        or latest_message_selects_microneedling_variant(
-            latest_message
-        )
-        or latest_message_selects_facial_service(
-            latest_message
-        )
-        or latest_message_selects_dermal_filler_service(
-            latest_message
-        )
-    )
-
-    if not announce_price:
-        return reply
-
-    information = format_service_price_sentence(
-        service
-    )
-
-    if not information:
-        return reply
-
-    cleaned_reply = strip_structured_service_price_sentences(
-        reply
-    )
-
-    if calendar_result.get("status") in {
-        "not_checked",
-        "not_requested",
-        "provisional_free",
-    }:
-        question = build_deterministic_next_question(
-            lead_data,
-            missing_fields,
-        )
-
-        if question:
-            return information + "\n\n" + question
-
-        return information
-
-    if not cleaned_reply:
-        return information
-
-    return information + "\n\n" + cleaned_reply
-
-
-def format_service_switch_summary(
-    lead_data: dict,
-) -> str:
-    """
-    Build one clear customer-facing summary for the newly selected service.
-
-    Use the structured Supabase row so fixed-price services and
-    duration-specific services are both handled consistently.
-    """
-    service_row = load_service_row_for_booking_item(
-        lead_data.get("treatment")
-    )
-
-    if not service_row:
-        return str(
-            lead_data.get("treatment") or "the new treatment"
-        )
-
-    service_name = str(
-        service_row.get("service_name")
-        or lead_data.get("treatment")
-        or "the new treatment"
-    ).strip()
-
-    duration_minutes = booking_item_duration_minutes(
-        lead_data,
-        service_row,
-    )
-    price_pence = booking_item_price_pence(
-        service_row,
-        duration_minutes,
-    )
-
-    details = []
-
-    if price_pence is not None:
-        details.append(
-            format_price_pence(price_pence)
-        )
-
-    duration_label = format_minutes_as_duration(
-        duration_minutes
-    )
-
-    if duration_label:
-        details.append(duration_label)
-
-    if not details:
-        return service_name
-
-    return service_name + " — " + ", ".join(details)
-
-
-def build_service_switch_reply(
-    lead_data: dict,
-    missing_fields: list[str],
-    calendar_result: dict,
-) -> str:
-    """
-    Reply deterministically after a treatment switch.
-
-    The customer may change their mind at any point, including when the
-    previous chatbot message asked for a name or phone number. Confirm the new
-    request clearly, show updated service details, then continue from the next
-    genuinely missing field.
-    """
-    if is_partial_dermal_filler_treatment(
-        lead_data.get("treatment")
-    ):
-        area = dermal_filler_partial_area(
-            lead_data.get("treatment")
-        )
-        label = DERMAL_FILLER_AREA_LABELS.get(
-            area,
-            "dermal filler",
-        )
-        opening = (
-            "No problem. I've changed the request to "
-            f"{label.lower()}."
-        )
-    else:
-        summary = format_service_switch_summary(
-            lead_data
-        )
-        opening = (
-            "No problem. I've updated your request to "
-            f"{summary}."
-        )
-
-    status = str(
-        calendar_result.get("status") or "not_checked"
-    )
-
-    if status in {
-        "busy_needs_duration",
-        "needs_duration_for_alternatives",
-    }:
-        return (
-            opening
-            + "\n\n"
-            + build_duration_needed_for_alternatives_reply(
-                lead_data,
-                calendar_result,
-            )
-        )
-
-    if calendar_result.get("suggestions"):
-        return (
-            opening
-            + "\n\n"
-            + build_calendar_alternative_reply(
-                calendar_result,
-            )
-        )
-
-    if status == "free":
-        slot = format_customer_slot(
-            lead_data.get("preferred_date"),
-            lead_data.get("preferred_time"),
-        )
-
-        if missing_fields:
-            question = build_deterministic_next_question(
-                lead_data,
-                missing_fields,
-            )
-
-            return (
-                opening
-                + f"\n\n{slot} still appears free."
-                + (f"\n\n{question}" if question else "")
-            )
-
-        return (
-            opening
-            + f"\n\n{slot} still appears free."
-            + "\n\nYour updated request has been recorded. "
-            "The therapist will confirm it shortly."
-        )
-
-    if status == "unknown":
-        if missing_fields:
-            question = build_deterministic_next_question(
-                lead_data,
-                missing_fields,
-            )
-
-            return (
-                opening
-                + "\n\nThe therapist will need to check the availability."
-                + (f"\n\n{question}" if question else "")
-            )
-
-        return (
-            opening
-            + "\n\nThe therapist will check the availability and confirm "
-            "the updated request shortly."
-        )
-
-    question = build_deterministic_next_question(
-        lead_data,
-        missing_fields,
-    )
-
-    if question:
-        return opening + "\n\n" + question
-
-    return (
-        opening
-        + "\n\nYour updated request has been recorded. "
-        "The therapist will confirm it shortly."
-    )
-
-
-def build_deterministic_next_question(
-    lead_data: dict,
-    missing_fields: list[str],
-) -> str:
-    """
-    Booking order is controlled by Python:
-      duration -> date -> time -> name and phone.
-    """
-    schedule_question = build_schedule_first_question(
-        lead_data
-    )
-
-    if schedule_question:
-        return schedule_question
-
-    if not missing_fields:
-        return ""
-
-    return grouped_missing_question(
-        missing_fields,
-        lead_data,
-    )
-
-
-def append_single_deterministic_followup(
-    reply: str,
-    lead_data: dict,
-    missing_fields: list[str],
-) -> str:
-    """
-    Keep any useful factual prefix from the LLM, remove its workflow questions,
-    then append exactly one backend-controlled follow-up question.
-    """
-    question = build_deterministic_next_question(
-        lead_data,
-        missing_fields,
-    )
-
-    cleaned = strip_model_booking_questions(
-        reply
-    )
-
-    if not question:
-        return cleaned
-
-    if not cleaned:
-        return question
-
-    return cleaned.rstrip() + "\n\n" + question
-
-
-def ensure_next_booking_question(
-    reply: str,
-    missing_fields: list[str],
-    lead_data: dict,
-) -> str:
-    """
-    Add exactly one clean follow-up question after the model answers.
-    """
-    if not missing_fields:
-        return reply
-
-    question = grouped_missing_question(
-        missing_fields,
-        lead_data,
-    )
-
-    if not reply.strip():
-        return question
-
-    return reply.rstrip() + "\n\n" + question
-
-
-def load_service_row_for_booking_item(
-    treatment: str | None,
-) -> dict | None:
-    """
-    Load the structured public.services row used for a booking item.
-
-    Use the database row when available so the shadow booking item remains
-    linked to owner-editable Supabase configuration. If the lookup fails,
-    retain a safe minimal fallback from the structured identity.
-    """
-    identity = structured_service_identity(
-        treatment
-    )
-
-    if not identity:
-        return None
-
-    service_name = identity.get("service_name")
-
-    if not service_name:
-        return None
-
-    try:
-        response = (
-            supabase.table("services")
-            .select(
-                "id, category, service_name, booking_mode, "
-                "fixed_duration_minutes, allowed_durations_minutes, "
-                "price_pence, price_by_duration"
-            )
-            .eq("business_slug", BUSINESS_SLUG)
-            .eq("service_name", service_name)
-            .limit(1)
-            .execute()
-        )
-
-        if response.data:
-            return response.data[0]
-
-    except Exception as error:
-        print(f"Could not load service row for booking item: {error}")
-
-    return {
-        "id": None,
-        "category": identity.get("category"),
-        "service_name": service_name,
-        "booking_mode": identity.get("booking_mode"),
-        "fixed_duration_minutes": identity.get(
-            "fixed_duration_minutes"
-        ),
-        "allowed_durations_minutes": identity.get(
-            "allowed_durations_minutes"
-        ),
-        "price_pence": None,
-        "price_by_duration": None,
-    }
-
-
-def booking_item_duration_minutes(
-    lead_data: dict,
-    service_row: dict,
-) -> int | None:
-    """
-    Resolve one authoritative duration for the active booking item.
-
-    Fixed-duration services use their structured Supabase value. Services such
-    as massage use the customer's selected duration.
-    """
-    fixed_duration = service_row.get(
-        "fixed_duration_minutes"
-    )
-
-    if fixed_duration not in [None, ""]:
-        try:
-            return int(fixed_duration)
-        except (TypeError, ValueError):
-            pass
-
-    return parse_duration_minutes(
-        lead_data.get("duration")
-    )
-
-
-def booking_item_price_pence(
-    service_row: dict,
-    duration_minutes: int | None,
-) -> int | None:
-    """
-    Resolve the configured fixed price or duration-specific price.
-    """
-    fixed_price = service_row.get("price_pence")
-
-    if fixed_price not in [None, ""]:
-        try:
-            return int(fixed_price)
-        except (TypeError, ValueError):
-            return None
-
-    prices = service_row.get("price_by_duration") or {}
-
-    if duration_minutes is None:
-        return None
-
-    value = prices.get(
-        str(duration_minutes)
-    )
-
-    if value in [None, ""]:
-        return None
-
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def load_active_draft_booking_request(
-    session_id: str,
-) -> dict | None:
-    try:
-        response = (
-            supabase.table("booking_requests")
-            .select("*")
-            .eq("session_id", session_id)
-            .eq("request_status", "draft")
-            .limit(1)
-            .execute()
-        )
-
-        if response.data:
-            return response.data[0]
-
-    except Exception as error:
-        print(f"Could not load active draft booking request: {error}")
-
-    return None
-
-
-def next_booking_request_number(
-    session_id: str,
-) -> int:
-    try:
-        response = (
-            supabase.table("booking_requests")
-            .select("request_number")
-            .eq("session_id", session_id)
-            .order("request_number", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if response.data:
-            return int(
-                response.data[0].get("request_number") or 0
-            ) + 1
-
-    except Exception as error:
-        print(f"Could not calculate next booking request number: {error}")
-
-    return 1
-
-
-def update_conversation_active_booking_request(
-    session_id: str,
-    booking_request_id: int,
-):
-    try:
-        (
-            supabase.table("conversations")
-            .update({
-                "active_booking_request_id": booking_request_id,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
-            .eq("session_id", session_id)
-            .execute()
-        )
-
-    except Exception as error:
-        print(f"Could not save active booking request pointer: {error}")
-
-
-def load_booking_items(
-    booking_request_id: int,
-) -> list[dict]:
-    try:
-        response = (
-            supabase.table("booking_items")
-            .select("*")
-            .eq("booking_request_id", booking_request_id)
-            .order("item_order")
-            .execute()
-        )
-
-        return list(response.data or [])
-
-    except Exception as error:
-        print(f"Could not load booking items: {error}")
-        return []
-
-
-def latest_message_explicitly_adds_same_visit(
-    latest_message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    same_visit_phrases = [
-        "same visit",
-        "same appointment",
-        "back to back",
-        "one after another",
-        "straight after",
-        "after that",
-        "add it to",
-        "add this to",
-    ]
-
-    return any(
-        phrase in cleaned
-        for phrase in same_visit_phrases
-    )
-
-
-def latest_message_suggests_additional_treatment(
-    latest_message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    addition_phrases = [
-        "also",
-        "add",
-        "another treatment",
-        "as well",
-        "too",
-    ]
-
-    replacement_phrases = [
-        "instead",
-        "change",
-        "switch",
-        "replace",
-        "rather than",
-    ]
-
-    return (
-        any(phrase in cleaned for phrase in addition_phrases)
-        and not any(
-            phrase in cleaned
-            for phrase in replacement_phrases
-        )
-    )
-
-
 def load_pending_booking_actions(
     session_id: str,
 ) -> list[dict]:
@@ -6582,1284 +4118,12 @@ def load_pending_booking_actions(
         return []
 
 
-def save_pending_booking_action(
-    session_id: str,
-    selected_identity: dict,
-    source_message: str,
-) -> dict | None:
-    """
-    Save one unresolved cart question safely.
-
-    Do not use PostgREST upsert here. The database uniqueness rule is a
-    partial unique index that applies only while action_status='pending'.
-    PostgreSQL cannot infer that partial index from the generic
-    ON CONFLICT(session_id, service_name, action_type) clause generated by
-    Supabase upsert. Check for an existing pending row first, then update or
-    insert explicitly.
-    """
-    service_name = str(
-        selected_identity.get("service_name") or ""
-    ).strip()
-
-    if not service_name:
-        return None
-
-    service_row = load_service_row_for_booking_item(
-        service_name
-    )
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    payload = {
-        "session_id": session_id,
-        "service_id": (
-            service_row.get("id")
-            if service_row
-            else None
-        ),
-        "service_name": service_name,
-        "category": (
-            selected_identity.get("category")
-            or (
-                service_row.get("category")
-                if service_row
-                else None
-            )
-        ),
-        "action_type": "choose_appointment_structure",
-        "action_status": "pending",
-        "source_message": source_message,
-        "updated_at": now_iso,
-    }
-
-    try:
-        existing_response = (
-            supabase.table("pending_booking_actions")
-            .select("id")
-            .eq("session_id", session_id)
-            .eq("service_name", service_name)
-            .eq(
-                "action_type",
-                "choose_appointment_structure",
-            )
-            .eq("action_status", "pending")
-            .limit(1)
-            .execute()
-        )
-
-        if existing_response.data:
-            action_id = int(
-                existing_response.data[0]["id"]
-            )
-
-            response = (
-                supabase.table("pending_booking_actions")
-                .update(payload)
-                .eq("id", action_id)
-                .execute()
-            )
-        else:
-            response = (
-                supabase.table("pending_booking_actions")
-                .insert(payload)
-                .execute()
-            )
-
-        if response.data:
-            return response.data[0]
-
-    except Exception as error:
-        print(f"Could not save pending booking action: {error}")
-
-    return None
-
-
-def update_pending_booking_action_status(
-    action_id: int,
-    action_status: str,
-):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "action_status": action_status,
-        "updated_at": now_iso,
-    }
-
-    if action_status in {
-        "resolved",
-        "cancelled",
-        "superseded",
-    }:
-        payload["resolved_at"] = now_iso
-
-    try:
-        (
-            supabase.table("pending_booking_actions")
-            .update(payload)
-            .eq("id", action_id)
-            .execute()
-        )
-
-    except Exception as error:
-        print(f"Could not update pending booking action: {error}")
-
-
-
-def resolve_matching_pending_booking_actions(
-    session_id: str,
-    service_name: str | None,
-):
-    """
-    Resolve any unanswered appointment-structure question for a service that
-    has now been explicitly added to the same visit.
-    """
-    cleaned_name = str(service_name or "").strip()
-
-    if not cleaned_name:
-        return
-
-    try:
-        response = (
-            supabase.table("pending_booking_actions")
-            .select("id")
-            .eq("session_id", session_id)
-            .eq("service_name", cleaned_name)
-            .eq(
-                "action_type",
-                "choose_appointment_structure",
-            )
-            .eq("action_status", "pending")
-            .execute()
-        )
-
-        for row in response.data or []:
-            update_pending_booking_action_status(
-                int(row["id"]),
-                "resolved",
-            )
-
-    except Exception as error:
-        print(
-            "Could not resolve matching pending booking action: "
-            f"{error}"
-        )
-
-def latest_message_confirms_same_visit(
-    latest_message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    phrases = [
-        "same visit",
-        "same appointment",
-        "back to back",
-        "one after another",
-        "together",
-        "add it",
-        "add that",
-        "yes same",
-    ]
-
-    return any(
-        phrase in cleaned
-        for phrase in phrases
-    )
-
-
-def latest_message_requests_separate_appointment(
-    latest_message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    phrases = [
-        "separate",
-        "separately",
-        "different appointment",
-        "another appointment",
-        "another day",
-    ]
-
-    return any(
-        phrase in cleaned
-        for phrase in phrases
-    )
-
-
-def latest_message_cancels_pending_action(
-    latest_message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    phrases = [
-        "cancel that",
-        "forget that",
-        "dont add",
-        "do not add",
-        "leave it",
-        "never mind",
-        "nevermind",
-    ]
-
-    return any(
-        phrase in cleaned
-        for phrase in phrases
-    )
-
-
-def selected_identity_from_pending_action(
-    action: dict,
-) -> dict | None:
-    service_name = action.get("service_name")
-    identity = structured_service_identity(
-        service_name
-    )
-
-    if identity:
-        return identity
-
-    service_row = load_service_row_for_booking_item(
-        service_name
-    )
-
-    if not service_row:
-        return None
-
-    return {
-        "category": (
-            service_row.get("category")
-            or action.get("category")
-        ),
-        "service_name": service_row.get(
-            "service_name"
-        ),
-        "booking_mode": service_row.get(
-            "booking_mode"
-        ),
-        "fixed_duration_minutes": service_row.get(
-            "fixed_duration_minutes"
-        ),
-        "allowed_durations_minutes": service_row.get(
-            "allowed_durations_minutes"
-        ),
-    }
-
-
-def detect_pending_cart_action_resolution(
-    session_id: str,
-    latest_message: str,
-) -> dict | None:
-    """
-    Resolve the oldest unanswered appointment-structure question.
-
-    The same-visit branch is enabled now. Separate-request creation is kept as
-    a clearly stored pending decision until Stage 4C creates a second
-    booking_request safely.
-    """
-    actions = load_pending_booking_actions(
-        session_id
-    )
-
-    if not actions:
-        return None
-
-    action = actions[0]
-
-    if latest_message_confirms_same_visit(
-        latest_message
-    ):
-        selected_identity = (
-            selected_identity_from_pending_action(
-                action
-            )
-        )
-
-        if not selected_identity:
-            return None
-
-        draft_request = load_active_draft_booking_request(
-            session_id
-        )
-
-        if not draft_request:
-            return None
-
-        return {
-            "action": "add_same_visit",
-            "draft_request": draft_request,
-            "selected_identity": selected_identity,
-            "pending_action_id": action.get("id"),
-            "resolved_from_pending": True,
-        }
-
-    if latest_message_requests_separate_appointment(
-        latest_message
-    ):
-        return {
-            "action": "create_separate_request",
-            "pending_action": action,
-        }
-
-    if latest_message_cancels_pending_action(
-        latest_message
-    ):
-        return {
-            "action": "cancel_pending_action",
-            "pending_action": action,
-        }
-
-    return None
-
-
-def format_pending_action_reminder(
-    session_id: str,
-) -> str:
-    actions = load_pending_booking_actions(
-        session_id
-    )
-
-    if not actions:
-        return ""
-
-    names = [
-        str(action.get("service_name") or "").strip()
-        for action in actions
-        if str(action.get("service_name") or "").strip()
-    ]
-
-    if not names:
-        return ""
-
-    if len(names) == 1:
-        return (
-            f"{names[0]} is still waiting for your decision. "
-            "Would you like to add it to this same visit, or make it "
-            "a separate appointment request?"
-        )
-
-    return (
-        "These treatments are still waiting for your decision: "
-        + "; ".join(names)
-        + ". Would you like to add them to this same visit, or handle "
-        "them as separate appointment requests?"
-    )
-
-
 def has_pending_booking_actions(
     session_id: str,
 ) -> bool:
     return bool(
         load_pending_booking_actions(session_id)
     )
-
-
-def suppress_contact_collection_while_pending(
-    reply: str,
-    session_id: str,
-) -> str:
-    """
-    Pending cart decisions take priority over contact collection.
-
-    A customer should finish choosing treatments before the bot asks for a
-    name or phone number. This also prevents premature handover wording while
-    an unresolved add / separate-appointment decision still exists.
-    """
-    reminder = format_pending_action_reminder(
-        session_id
-    )
-
-    if not reminder:
-        return str(reply or "").strip()
-
-    cleaned = remove_contact_detail_questions(
-        str(reply or "")
-    )
-    cleaned = remove_false_handover_confirmation(
-        cleaned,
-        ["pending_cart_action"],
-    )
-    cleaned = cleaned.strip()
-
-    if not cleaned:
-        return reminder
-
-    return cleaned.rstrip() + "\n\n" + reminder
-
-
-def append_pending_action_reminder(
-    reply: str,
-    session_id: str,
-) -> str:
-    return suppress_contact_collection_while_pending(
-        reply,
-        session_id,
-    )
-
-
-def detect_treatment_cart_intent(
-    session_id: str,
-    latest_message: str,
-    existing_lead: dict,
-) -> dict | None:
-    """
-    Detect whether a newly mentioned service should be added to the current
-    appointment instead of replacing the existing treatment.
-
-    We add automatically only when the customer explicitly says the treatments
-    belong to the same visit. Ambiguous "also" messages trigger a clarification
-    question rather than guessing.
-    """
-    existing_treatment = existing_lead.get("treatment")
-
-    if not existing_treatment:
-        return None
-
-    draft_request = load_active_draft_booking_request(
-        session_id
-    )
-
-    if not draft_request:
-        return None
-
-    selected_identity = resolve_latest_structured_service(
-        latest_message,
-        existing_treatment=existing_treatment,
-    )
-
-    if not selected_identity:
-        return None
-
-    selected_name = selected_identity.get("service_name")
-    previous_identity = structured_service_identity(
-        existing_treatment
-    )
-    previous_name = (
-        previous_identity.get("service_name")
-        if previous_identity
-        else existing_treatment
-    )
-
-    if (
-        not selected_name
-        or normalise_treatment_name(selected_name)
-        == normalise_treatment_name(previous_name)
-    ):
-        return None
-
-    if latest_message_explicitly_adds_same_visit(
-        latest_message
-    ):
-        return {
-            "action": "add_same_visit",
-            "draft_request": draft_request,
-            "selected_identity": selected_identity,
-        }
-
-    if latest_message_suggests_additional_treatment(
-        latest_message
-    ):
-        return {
-            "action": "clarify_visit_structure",
-            "draft_request": draft_request,
-            "selected_identity": selected_identity,
-        }
-
-    return None
-
-
-def restore_existing_primary_treatment(
-    existing_lead: dict,
-    lead_data: dict,
-) -> dict:
-    """
-    During cart additions, keep the legacy overview pointed at its original
-    primary treatment. The new treatment is stored as an additional item.
-    """
-    result = dict(lead_data)
-
-    for field in [
-        "treatment",
-        "duration",
-        "active_category",
-    ]:
-        if existing_lead.get(field) not in [None, ""]:
-            result[field] = existing_lead.get(field)
-
-    return result
-
-
-def cart_item_from_selected_identity(
-    selected_identity: dict,
-) -> dict | None:
-    service_row = load_service_row_for_booking_item(
-        selected_identity.get("service_name")
-    )
-
-    if not service_row:
-        return None
-
-    fixed_duration = service_row.get(
-        "fixed_duration_minutes"
-    )
-
-    if fixed_duration in [None, ""]:
-        # Same-visit additions are enabled first for services with a resolved
-        # duration. A selectable-duration massage is handled after the client
-        # chooses its length.
-        return None
-
-    try:
-        duration_minutes = int(fixed_duration)
-    except (TypeError, ValueError):
-        return None
-
-    return {
-        "service_row": service_row,
-        "duration_minutes": duration_minutes,
-        "price_pence": booking_item_price_pence(
-            service_row,
-            duration_minutes,
-        ),
-    }
-
-
-def combined_duration_for_cart_action(
-    cart_intent: dict | None,
-) -> int | None:
-    if (
-        not cart_intent
-        or cart_intent.get("action") != "add_same_visit"
-    ):
-        return None
-
-    draft_request = cart_intent.get("draft_request") or {}
-    selected_identity = cart_intent.get("selected_identity") or {}
-    new_item = cart_item_from_selected_identity(
-        selected_identity
-    )
-
-    if not new_item:
-        return None
-
-    current_total = int(
-        draft_request.get("total_duration_minutes") or 0
-    )
-
-    return current_total + int(
-        new_item["duration_minutes"]
-    )
-
-
-def calendar_lead_for_cart_action(
-    lead_data: dict,
-    cart_intent: dict | None,
-) -> dict:
-    """
-    Calendar checks must use the full back-to-back duration while the legacy
-    lead overview remains unchanged.
-    """
-    result = dict(lead_data)
-    combined_minutes = combined_duration_for_cart_action(
-        cart_intent
-    )
-
-    if combined_minutes:
-        result["duration"] = format_minutes_as_duration(
-            combined_minutes
-        )
-
-    return result
-
-
-def active_lead_for_separate_request(
-    existing_lead: dict,
-    service_row: dict,
-    duration_minutes: int,
-) -> dict:
-    """
-    Build the conversations overview for the newly active separate draft.
-
-    Contact details remain attached to the conversation, but date and time are
-    cleared because they belong to the original appointment request.
-    """
-    result = dict(existing_lead)
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    result["treatment"] = service_row.get(
-        "service_name"
-    )
-    result["duration"] = format_minutes_as_duration(
-        duration_minutes
-    )
-    result["preferred_date"] = None
-    result["preferred_time"] = None
-    result["status"] = "details_incomplete"
-    result["notification_sent_at"] = None
-    result["conversation_mode"] = "booking_request"
-    result["active_category"] = service_row.get(
-        "category"
-    )
-    result["slot_status"] = "not_checked"
-    result["next_required_detail"] = "preferred_date"
-    result["last_service_switch_at"] = now_iso
-
-    return result
-
-
-def restore_parked_request_after_failure(
-    session_id: str,
-    original_request_id: int,
-):
-    """
-    Best-effort rollback so a failed second-request creation cannot strand the
-    customer's original appointment as parked.
-    """
-    try:
-        (
-            supabase.table("booking_requests")
-            .update({
-                "request_status": "draft",
-                "parked_at": None,
-                "updated_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-            })
-            .eq("id", original_request_id)
-            .execute()
-        )
-
-        update_conversation_active_booking_request(
-            session_id,
-            original_request_id,
-        )
-
-    except Exception as error:
-        print(
-            "Could not restore original draft after separate-request "
-            f"failure: {error}"
-        )
-
-
-def create_separate_draft_booking_request(
-    session_id: str,
-    pending_action: dict,
-    existing_lead: dict,
-) -> dict | None:
-    """
-    Park the current draft and create one new independent appointment request.
-
-    Only one request remains actively editable as request_status='draft'.
-    The original appointment remains stored as parked_draft and is never
-    overwritten by the new request.
-    """
-    original_request = load_active_draft_booking_request(
-        session_id
-    )
-
-    if not original_request:
-        return {
-            "status": "missing_original_draft",
-        }
-
-    selected_identity = selected_identity_from_pending_action(
-        pending_action
-    )
-
-    if not selected_identity:
-        return {
-            "status": "missing_service",
-        }
-
-    new_item = cart_item_from_selected_identity(
-        selected_identity
-    )
-
-    if not new_item:
-        return {
-            "status": "needs_duration",
-            "selected_service_name": selected_identity.get(
-                "service_name"
-            ),
-        }
-
-    service_row = new_item["service_row"]
-    duration_minutes = int(
-        new_item["duration_minutes"]
-    )
-    price_pence = new_item.get("price_pence")
-    now_iso = datetime.now(timezone.utc).isoformat()
-    original_request_id = int(
-        original_request["id"]
-    )
-    new_request_id = None
-
-    try:
-        # Park first: the database intentionally permits only one active
-        # request_status='draft' row for a session.
-        (
-            supabase.table("booking_requests")
-            .update({
-                "request_status": "parked_draft",
-                "parked_at": now_iso,
-                "updated_at": now_iso,
-            })
-            .eq("id", original_request_id)
-            .execute()
-        )
-
-        response = (
-            supabase.table("booking_requests")
-            .insert({
-                "session_id": session_id,
-                "request_number": next_booking_request_number(
-                    session_id
-                ),
-                "request_status": "draft",
-                "appointment_structure": "single_service",
-                "preferred_date": None,
-                "preferred_time": None,
-                "slot_status": "not_checked",
-                "item_count": 1,
-                "total_duration_minutes": duration_minutes,
-                "total_price_pence": price_pence or 0,
-                "missing_detail": "preferred_date",
-                "updated_at": now_iso,
-            })
-            .execute()
-        )
-
-        if not response.data:
-            raise RuntimeError(
-                "Supabase returned no new booking request row."
-            )
-
-        new_request_id = int(
-            response.data[0]["id"]
-        )
-
-        (
-            supabase.table("booking_items")
-            .insert({
-                "booking_request_id": new_request_id,
-                "service_id": service_row.get("id"),
-                "service_name": service_row.get(
-                    "service_name"
-                ),
-                "category": service_row.get("category"),
-                "duration_minutes": duration_minutes,
-                "price_pence": price_pence,
-                "item_order": 1,
-                "updated_at": now_iso,
-            })
-            .execute()
-        )
-
-        update_conversation_active_booking_request(
-            session_id,
-            new_request_id,
-        )
-
-        active_lead = active_lead_for_separate_request(
-            existing_lead,
-            service_row,
-            duration_minutes,
-        )
-
-        save_conversation_overview(
-            session_id=session_id,
-            lead_data=active_lead,
-            source=existing_lead.get("source") or "website",
-        )
-
-        if pending_action.get("id"):
-            update_pending_booking_action_status(
-                int(pending_action["id"]),
-                "resolved",
-            )
-
-        return {
-            "status": "created",
-            "original_request": original_request,
-            "new_request_id": new_request_id,
-            "service_row": service_row,
-            "duration_minutes": duration_minutes,
-            "price_pence": price_pence,
-        }
-
-    except Exception as error:
-        print(
-            "Could not create separate appointment request: "
-            f"{error}"
-        )
-
-        if new_request_id is not None:
-            try:
-                (
-                    supabase.table("booking_requests")
-                    .delete()
-                    .eq("id", new_request_id)
-                    .execute()
-                )
-            except Exception as cleanup_error:
-                print(
-                    "Could not remove failed second appointment draft: "
-                    f"{cleanup_error}"
-                )
-
-        restore_parked_request_after_failure(
-            session_id,
-            original_request_id,
-        )
-
-        return {
-            "status": "failed",
-        }
-
-
-def format_original_request_summary(
-    original_request: dict,
-) -> str:
-    items = load_booking_items(
-        int(original_request["id"])
-    )
-    names = [
-        str(item.get("service_name") or "Treatment")
-        for item in items
-    ]
-
-    if names:
-        treatment_text = "; ".join(names)
-    else:
-        treatment_text = "your original appointment"
-
-    preferred_date = original_request.get(
-        "preferred_date"
-    )
-    preferred_time = original_request.get(
-        "preferred_time"
-    )
-
-    if preferred_date and preferred_time:
-        return (
-            f"{treatment_text} for "
-            f"{format_customer_slot(preferred_date, preferred_time)}"
-        )
-
-    return treatment_text
-
-
-def build_separate_request_started_reply(
-    separate_result: dict,
-    session_id: str,
-) -> str:
-    original_summary = format_original_request_summary(
-        separate_result["original_request"]
-    )
-    service_row = separate_result["service_row"]
-    service_name = str(
-        service_row.get("service_name")
-        or "the new treatment"
-    )
-    price = format_price_pence(
-        separate_result.get("price_pence")
-    )
-    duration = format_minutes_as_duration(
-        separate_result.get("duration_minutes")
-    )
-    details = [
-        value
-        for value in [price, duration]
-        if value
-    ]
-    new_summary = service_name
-
-    if details:
-        new_summary += " — " + ", ".join(details)
-
-    reply = (
-        f"No problem. Your original request for {original_summary} "
-        "is still saved unchanged. "
-        f"I've started a separate appointment request for {new_summary}.\n\n"
-        "Which day and time would suit you for the separate appointment?"
-    )
-
-    return append_pending_action_reminder(
-        reply,
-        session_id,
-    )
-
-
-def sync_same_visit_treatment_item(
-    session_id: str,
-    lead_data: dict,
-    cart_intent: dict,
-) -> dict | None:
-    """
-    Append one treatment to the current request and recalculate cart totals.
-    Existing items are never overwritten.
-    """
-    draft_request = cart_intent.get("draft_request") or {}
-    selected_identity = cart_intent.get("selected_identity") or {}
-    booking_request_id = draft_request.get("id")
-
-    if not booking_request_id:
-        return None
-
-    new_item = cart_item_from_selected_identity(
-        selected_identity
-    )
-
-    if not new_item:
-        return {
-            "status": "needs_duration",
-            "selected_service_name": selected_identity.get(
-                "service_name"
-            ),
-        }
-
-    service_row = new_item["service_row"]
-    duration_minutes = int(
-        new_item["duration_minutes"]
-    )
-    price_pence = new_item.get("price_pence")
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    try:
-        existing_items = load_booking_items(
-            int(booking_request_id)
-        )
-
-        duplicate = next(
-            (
-                item
-                for item in existing_items
-                if normalise_treatment_name(
-                    item.get("service_name")
-                )
-                == normalise_treatment_name(
-                    service_row.get("service_name")
-                )
-            ),
-            None,
-        )
-
-        if not duplicate:
-            next_order = (
-                max(
-                    [
-                        int(item.get("item_order") or 0)
-                        for item in existing_items
-                    ]
-                    or [0]
-                )
-                + 1
-            )
-
-            (
-                supabase.table("booking_items")
-                .insert({
-                    "booking_request_id": int(
-                        booking_request_id
-                    ),
-                    "service_id": service_row.get("id"),
-                    "service_name": service_row.get(
-                        "service_name"
-                    ),
-                    "category": service_row.get("category"),
-                    "duration_minutes": duration_minutes,
-                    "price_pence": price_pence,
-                    "item_order": next_order,
-                    "updated_at": now_iso,
-                })
-                .execute()
-            )
-
-        items = load_booking_items(
-            int(booking_request_id)
-        )
-        total_duration = sum(
-            int(item.get("duration_minutes") or 0)
-            for item in items
-        )
-        total_price = sum(
-            int(item.get("price_pence") or 0)
-            for item in items
-        )
-
-        (
-            supabase.table("booking_requests")
-            .update({
-                "appointment_structure": (
-                    "back_to_back"
-                    if len(items) > 1
-                    else "single_service"
-                ),
-                "preferred_date": lead_data.get(
-                    "preferred_date"
-                ),
-                "preferred_time": lead_data.get(
-                    "preferred_time"
-                ),
-                "slot_status": lead_data.get(
-                    "slot_status"
-                ) or "not_checked",
-                "item_count": len(items),
-                "total_duration_minutes": total_duration,
-                "total_price_pence": total_price,
-                "missing_detail": lead_data.get(
-                    "next_required_detail"
-                ),
-                "updated_at": now_iso,
-            })
-            .eq("id", int(booking_request_id))
-            .execute()
-        )
-
-        update_conversation_active_booking_request(
-            session_id,
-            int(booking_request_id),
-        )
-
-        return {
-            "status": (
-                "already_present"
-                if duplicate
-                else "added"
-            ),
-            "booking_request_id": int(
-                booking_request_id
-            ),
-            "items": items,
-            "item_count": len(items),
-            "total_duration_minutes": total_duration,
-            "total_price_pence": total_price,
-        }
-
-    except Exception as error:
-        print(f"Could not add same-visit treatment item: {error}")
-        return None
-
-
-def format_cart_item_summary(
-    item: dict,
-) -> str:
-    name = str(
-        item.get("service_name") or "Treatment"
-    )
-    duration = format_minutes_as_duration(
-        item.get("duration_minutes")
-    )
-    price = format_price_pence(
-        item.get("price_pence")
-    )
-
-    details = [
-        value
-        for value in [price, duration]
-        if value
-    ]
-
-    if not details:
-        return name
-
-    return name + " — " + ", ".join(details)
-
-
-def build_same_visit_added_reply(
-    cart_result: dict,
-    lead_data: dict,
-    calendar_result: dict,
-    missing_fields: list[str],
-) -> str:
-    items = cart_result.get("items") or []
-    summaries = [
-        format_cart_item_summary(item)
-        for item in items
-    ]
-    item_list = "; ".join(summaries)
-    total_duration = format_minutes_as_duration(
-        cart_result.get("total_duration_minutes")
-    )
-    total_price = format_price_pence(
-        cart_result.get("total_price_pence")
-    )
-
-    opening = (
-        "I've added that to the same visit. "
-        f"Your request now includes: {item_list}. "
-        f"Total: {total_price}, {total_duration}."
-    )
-
-    if calendar_result.get("suggestions"):
-        return (
-            opening
-            + "\n\n"
-            + build_calendar_alternative_reply(
-                calendar_result
-            )
-        )
-
-    status = str(
-        calendar_result.get("status") or "not_checked"
-    )
-
-    if status == "free":
-        slot = format_customer_slot(
-            lead_data.get("preferred_date"),
-            lead_data.get("preferred_time"),
-        )
-        opening += (
-            f"\n\n{slot} still appears free for the "
-            "combined appointment."
-        )
-
-    question = build_deterministic_next_question(
-        lead_data,
-        missing_fields,
-    )
-
-    if question:
-        return opening + "\n\n" + question
-
-    return (
-        opening
-        + "\n\nYour updated request has been recorded. "
-        "The therapist will confirm it shortly."
-    )
-
-
-def build_visit_structure_clarification_reply(
-    selected_identity: dict,
-) -> str:
-    selected_name = str(
-        selected_identity.get("service_name")
-        or "that treatment"
-    )
-
-    return (
-        f"Would you like to add {selected_name} to the same visit, "
-        "or make it a separate appointment request?"
-    )
-
-
-def sync_single_treatment_draft_request(
-    session_id: str,
-    lead_data: dict,
-    booking_flow_active: bool,
-):
-    """
-    Shadow-write the active single-treatment booking flow into the new tables.
-
-    This does not alter replies or notifications yet. It gives us a safe way to
-    verify that:
-      conversation -> draft booking request -> booking item
-    is populated correctly before treatment-cart behaviour is enabled.
-    """
-    if not booking_flow_active:
-        return
-
-    service_row = load_service_row_for_booking_item(
-        lead_data.get("treatment")
-    )
-
-    if not service_row:
-        return
-
-    duration_minutes = booking_item_duration_minutes(
-        lead_data,
-        service_row,
-    )
-
-    # booking_items.duration_minutes is intentionally required. For selectable
-    # services such as massage, wait until the client has chosen a duration.
-    if duration_minutes is None or duration_minutes <= 0:
-        return
-
-    price_pence = booking_item_price_pence(
-        service_row,
-        duration_minutes,
-    )
-    now_iso = datetime.now(timezone.utc).isoformat()
-    request_row = load_active_draft_booking_request(
-        session_id
-    )
-
-    request_payload = {
-        "session_id": session_id,
-        "request_status": "draft",
-        "appointment_structure": "single_service",
-        "preferred_date": lead_data.get("preferred_date"),
-        "preferred_time": lead_data.get("preferred_time"),
-        "slot_status": lead_data.get("slot_status") or "not_checked",
-        "item_count": 1,
-        "total_duration_minutes": duration_minutes,
-        "total_price_pence": price_pence or 0,
-        "missing_detail": lead_data.get("next_required_detail"),
-        "updated_at": now_iso,
-    }
-
-    try:
-        if request_row:
-            booking_request_id = int(
-                request_row["id"]
-            )
-
-            (
-                supabase.table("booking_requests")
-                .update(request_payload)
-                .eq("id", booking_request_id)
-                .execute()
-            )
-
-        else:
-            request_payload["request_number"] = (
-                next_booking_request_number(session_id)
-            )
-
-            response = (
-                supabase.table("booking_requests")
-                .insert(request_payload)
-                .execute()
-            )
-
-            if not response.data:
-                return
-
-            booking_request_id = int(
-                response.data[0]["id"]
-            )
-
-        item_payload = {
-            "booking_request_id": booking_request_id,
-            "service_id": service_row.get("id"),
-            "service_name": service_row.get("service_name"),
-            "category": service_row.get("category"),
-            "duration_minutes": duration_minutes,
-            "price_pence": price_pence,
-            "item_order": 1,
-            "updated_at": now_iso,
-        }
-
-        (
-            supabase.table("booking_items")
-            .upsert(
-                item_payload,
-                on_conflict="booking_request_id,item_order",
-            )
-            .execute()
-        )
-
-        update_conversation_active_booking_request(
-            session_id,
-            booking_request_id,
-        )
-
-    except Exception as error:
-        # Shadow persistence must never break the working customer chat.
-        print(f"Could not sync draft booking request shadow data: {error}")
 
 
 def save_conversation_overview(
@@ -7882,63 +4146,6 @@ def save_conversation_overview(
 
     except Exception as error:
         print(f"Could not save conversation overview: {error}")
-
-
-def extract_lead_data(conversation_history: str) -> dict:
-    try:
-        current_leeds_date = datetime.now(BUSINESS_TIMEZONE).date().isoformat()
-
-        extraction_prompt = f"""
-Read the customer conversation below and extract useful lead details.
-
-Only save information the customer has actually provided or clearly confirmed.
-Do not treat suggestions made by the assistant as confirmed customer details.
-Do not invent missing information.
-Treat clear relative dates such as "today" and "tomorrow" as valid preferred dates.
-Convert relative dates into an ISO calendar date in YYYY-MM-DD format using the current Leeds date.
-
-Return valid JSON only, using exactly these fields:
-{{
-  "name": null,
-  "phone": null,
-  "treatment": null,
-  "duration": null,
-  "preferred_date": null,
-  "preferred_time": null,
-  "notes": null,
-  "status": "new_chat",
-  "summary": null
-}}
-
-Status rules:
-- Use "new_chat" if the customer has not shown a clear interest yet.
-- Use "interested" if the customer is asking about a treatment or price.
-- Use "details_incomplete" if they want an appointment but important details are missing.
-- Use "booking_request_complete" only if treatment, duration, name, phone number, preferred date, and preferred time are all present.
-
-Current Leeds date:
-{current_leeds_date}
-
-Keep the summary short and useful for the business owner.
-
-Conversation:
-{conversation_history}
-"""
-
-        completion = groq_client.chat.completions.create(
-            model=LEAD_EXTRACTION_MODEL,
-            messages=[
-                {"role": "user", "content": extraction_prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0
-        )
-
-        return json.loads(completion.choices[0].message.content)
-
-    except Exception as error:
-        print(f"Could not extract lead details: {error}")
-        return {}
 
 
 def format_customer_date(value: str | None) -> str:
@@ -8055,58 +4262,6 @@ def suggested_slot_is_within_live_hours(
     )
 
 
-def previous_reply_offered_calendar_alternatives(
-    previous_assistant_message: str,
-) -> bool:
-    lower_message = str(previous_assistant_message or "").lower()
-
-    return (
-        "the next available options are" in lower_message
-        or "would any of those times work" in lower_message
-        or "would one of those times work" in lower_message
-    )
-
-
-def is_negative_reply(message: str) -> bool:
-    cleaned = re.sub(
-        r"[^a-z]+",
-        " ",
-        str(message or "").lower(),
-    ).strip()
-
-    return cleaned in {
-        "no",
-        "nope",
-        "nah",
-        "no thanks",
-        "none",
-        "none of those",
-        "not really",
-        "they dont work",
-        "they do not work",
-        "those dont work",
-        "those do not work",
-    }
-
-
-def customer_rejected_calendar_alternatives(
-    latest_message: str,
-    previous_assistant_message: str,
-) -> bool:
-    """
-    A plain rejection of proposed slots means no schedule has been agreed.
-    Clear the old date and time before collecting any personal details.
-    """
-    return (
-        previous_reply_offered_calendar_alternatives(
-            previous_assistant_message
-        )
-        and is_negative_reply(latest_message)
-        and not parse_relative_date_from_text(latest_message)
-        and not parse_time_from_text(latest_message)
-    )
-
-
 def is_simple_acknowledgement(message: str) -> bool:
     cleaned = re.sub(r"[^a-z]+", " ", message.lower()).strip()
 
@@ -8129,45 +4284,6 @@ def is_simple_acknowledgement(message: str) -> bool:
     }
 
     return cleaned in acknowledgements
-
-
-def build_next_question_hint(
-    missing_fields: list[str],
-    lead_data: dict,
-) -> str:
-    if not missing_fields:
-        return (
-            "No booking details are missing. Do not ask another question. "
-            "If the customer is only acknowledging the previous message, "
-            "reply briefly: Thanks. The therapist will confirm the appointment shortly."
-        )
-
-    question = grouped_missing_question(
-        missing_fields,
-        lead_data,
-    )
-
-    return (
-        "Ask this concise follow-up question after answering any customer "
-        f"question: {question}"
-    )
-
-
-def format_confirmed_details(lead_data: dict) -> str:
-    lines = []
-
-    for field in REQUIRED_BOOKING_FIELDS:
-        value = lead_data.get(field)
-
-        if value not in [None, ""]:
-            label = field.replace("_", " ").title()
-
-            if field == "preferred_date":
-                value = format_customer_date(value)
-
-            lines.append(f"- {label}: {value}")
-
-    return "\n".join(lines) if lines else "- No confirmed booking details yet."
 
 
 def send_booking_notification(session_id: str):
@@ -8356,40 +4472,6 @@ def load_chatbot_settings() -> dict:
         print(f"Could not load chatbot settings: {error}")
 
     return defaults
-
-
-def build_style_instructions(settings: dict) -> str:
-    tone_instructions = {
-        "friendly": "Sound warm, approachable, and helpful.",
-        "professional": "Sound polished, professional, and clear.",
-        "relaxed": "Sound calm, relaxed, and conversational.",
-        "luxury": "Sound refined, reassuring, and premium without being over-the-top."
-    }
-
-    reply_length_instructions = {
-        "short": "Keep replies concise. Usually use 1 to 3 short sentences.",
-        "normal": "Use a natural amount of detail. Avoid long walls of text."
-    }
-
-    emoji_instructions = {
-        "none": "Do not use emojis.",
-        "light": "Use emojis rarely and only when they feel natural.",
-        "friendly": "Use 1 to 3 friendly emojis in most replies when it feels natural. Keep them relevant and do not overdo it."
-    }
-
-    personality_notes = settings.get("personality_notes", "").strip()
-
-    return f"""
-Owner-selected style settings:
-- Tone: {tone_instructions[settings["tone"]]}
-- Reply length: {reply_length_instructions[settings["reply_length"]]}
-- Emoji use: {emoji_instructions[settings["emoji_style"]]}
-- Extra personality note: {personality_notes if personality_notes else "No extra note."}
-
-Important:
-- These style settings affect wording and personality only.
-- They must never override the locked business, booking, privacy, or safety rules below.
-"""
 
 
 def google_oauth_is_configured() -> bool:
@@ -8598,47 +4680,6 @@ def load_business_hours() -> dict:
         print(f"Could not load live business hours: {error}")
 
     return hours
-
-
-def format_live_business_hours() -> str:
-    labels = [
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
-    ]
-
-    hours = load_business_hours()
-    lines = []
-
-    for day_number, label in enumerate(labels):
-        value = hours.get(day_number)
-
-        if not value:
-            lines.append(f"- {label}: Closed")
-            continue
-
-        open_value, close_value = value
-
-        if isinstance(open_value, tuple):
-            open_hour, open_minute = open_value
-        else:
-            open_hour, open_minute = open_value, 0
-
-        if isinstance(close_value, tuple):
-            close_hour, close_minute = close_value
-        else:
-            close_hour, close_minute = close_value, 0
-
-        lines.append(
-            f"- {label}: {open_hour:02d}:{open_minute:02d}–"
-            f"{close_hour:02d}:{close_minute:02d}"
-        )
-
-    return "\n".join(lines)
 
 
 def parse_duration_minutes(value: str | None) -> int | None:
@@ -8966,47 +5007,6 @@ def asks_for_next_available_time(message: str) -> bool:
     return any(phrase in lower_message for phrase in phrases)
 
 
-def asks_about_booking_or_availability(message: str) -> bool:
-    lower_message = message.lower()
-
-    keywords = [
-        "available",
-        "availability",
-        "free",
-        "book",
-        "booked",
-        "appointment",
-        "slot",
-        "come in",
-        "confirm",
-    ]
-
-    return any(keyword in lower_message for keyword in keywords)
-
-
-def should_surface_calendar_result(
-    latest_message: str,
-    existing_lead: dict,
-    merged_lead: dict,
-) -> bool:
-    date_changed = (
-        existing_lead.get("preferred_date")
-        != merged_lead.get("preferred_date")
-    )
-
-    time_changed = (
-        existing_lead.get("preferred_time")
-        != merged_lead.get("preferred_time")
-    )
-
-    return (
-        date_changed
-        or time_changed
-        or asks_about_booking_or_availability(latest_message)
-        or asks_for_next_available_time(latest_message)
-    )
-
-
 def add_calendar_alternatives(
     result: dict,
     duration_minutes: int | None,
@@ -9187,24 +5187,6 @@ def check_requested_calendar_slot(
             "to confirm the booking."
         ),
     }
-
-
-def format_calendar_result(
-    calendar_result: dict,
-    should_surface: bool,
-) -> str:
-    if not should_surface:
-        return (
-            "Visibility: silent\n"
-            "Instruction: Do not mention calendar availability in this reply "
-            "unless the customer directly asks about it."
-        )
-
-    return (
-        "Visibility: mention briefly\n"
-        f"Status: {calendar_result.get('status', 'unknown')}\n"
-        f"Instruction: {calendar_result.get('message', 'No calendar result available.')}"
-    )
 
 
 def instagram_is_configured() -> bool:
@@ -9792,1482 +5774,6 @@ async def google_calendar_status():
     }
 
 
-def customer_asks_for_booking_summary(
-    latest_message: str,
-) -> bool:
-    """
-    Detect a clear request to list or summarise the customer's appointment
-    requests. Keep this conservative so normal treatment questions do not
-    trigger a booking summary unexpectedly.
-    """
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    exact_phrases = {
-        "what have i requested",
-        "what have i booked",
-        "what bookings do i have",
-        "what appointments do i have",
-        "show my bookings",
-        "show my booking requests",
-        "show my appointments",
-        "summarise my bookings",
-        "summarize my bookings",
-        "summarise my appointments",
-        "summarize my appointments",
-        "list my bookings",
-        "list my appointments",
-        "what is currently booked",
-        "what is currently requested",
-    }
-
-    if cleaned in exact_phrases:
-        return True
-
-    has_summary_word = any(
-        word in cleaned
-        for word in [
-            "summarise",
-            "summarize",
-            "summary",
-            "list",
-            "show",
-            "what",
-        ]
-    )
-    has_booking_word = any(
-        phrase in cleaned
-        for phrase in [
-            "my booking",
-            "my bookings",
-            "my appointment",
-            "my appointments",
-            "my request",
-            "my requests",
-            "have i requested",
-            "have i booked",
-        ]
-    )
-
-    return has_summary_word and has_booking_word
-
-
-def load_booking_requests_for_summary(
-    session_id: str,
-) -> list[dict]:
-    try:
-        response = (
-            supabase.table("booking_requests")
-            .select("*")
-            .eq("session_id", session_id)
-            .order("request_number")
-            .execute()
-        )
-
-        return list(response.data or [])
-
-    except Exception as error:
-        print(f"Could not load booking requests for summary: {error}")
-        return []
-
-
-def booking_request_status_for_customer(
-    request_status: str | None,
-) -> str:
-    status = str(
-        request_status or "draft"
-    ).strip()
-
-    labels = {
-        "draft": "draft request — details may still be needed",
-        "parked_draft": "saved request — not confirmed yet",
-        "ready_for_review": "ready for therapist review — not confirmed yet",
-        "awaiting_owner_confirmation": "awaiting therapist confirmation",
-        "confirmed": "confirmed",
-        "declined": "declined",
-        "cancelled_by_customer": "cancelled",
-        "abandoned": "unfinished request",
-        "expired": "expired",
-    }
-
-    return labels.get(
-        status,
-        status.replace("_", " "),
-    )
-
-
-def booking_request_items_summary(
-    booking_request_id: int,
-) -> list[str]:
-    items = load_booking_items(
-        booking_request_id
-    )
-    summaries = []
-
-    for item in items:
-        summaries.append(
-            format_cart_item_summary(item)
-        )
-
-    return summaries
-
-
-def booking_request_schedule_summary(
-    booking_request: dict,
-) -> str:
-    preferred_date = booking_request.get(
-        "preferred_date"
-    )
-    preferred_time = booking_request.get(
-        "preferred_time"
-    )
-
-    if preferred_date and preferred_time:
-        return format_customer_slot(
-            preferred_date,
-            preferred_time,
-        )
-
-    if preferred_date:
-        return (
-            f"{format_customer_date(preferred_date)} "
-            "— time still needed"
-        )
-
-    if preferred_time:
-        return (
-            f"time requested: "
-            f"{format_customer_time(preferred_time)} "
-            "— day still needed"
-        )
-
-    return "day and time still needed"
-
-
-def format_single_booking_request_summary(
-    booking_request: dict,
-) -> str:
-    request_number = int(
-        booking_request.get("request_number") or 0
-    )
-    status_label = booking_request_status_for_customer(
-        booking_request.get("request_status")
-    )
-    schedule_label = booking_request_schedule_summary(
-        booking_request
-    )
-    item_summaries = booking_request_items_summary(
-        int(booking_request["id"])
-    )
-
-    lines = [
-        f"{request_number}. {status_label}",
-        f"   When: {schedule_label}",
-    ]
-
-    if item_summaries:
-        lines.append(
-            "   Treatments: "
-            + "; ".join(item_summaries)
-        )
-    else:
-        lines.append(
-            "   Treatments: details still needed"
-        )
-
-    item_count = int(
-        booking_request.get("item_count") or 0
-    )
-
-    if item_count > 1:
-        total_price = format_price_pence(
-            booking_request.get("total_price_pence")
-        )
-        total_duration = format_minutes_as_duration(
-            booking_request.get("total_duration_minutes")
-        )
-        total_details = [
-            value
-            for value in [
-                total_price,
-                total_duration,
-            ]
-            if value
-        ]
-
-        if total_details:
-            lines.append(
-                "   Combined total: "
-                + ", ".join(total_details)
-            )
-
-    return "\n".join(lines)
-
-
-def build_customer_booking_summary(
-    session_id: str,
-) -> str:
-    """
-    Build a clear summary from relational booking data.
-
-    Active requests are shown first. Cancelled, declined, abandoned, and
-    expired requests are shown separately so the customer can distinguish
-    what remains active from what is no longer proceeding.
-    """
-    booking_requests = load_booking_requests_for_summary(
-        session_id
-    )
-    pending_actions = load_pending_booking_actions(
-        session_id
-    )
-
-    if not booking_requests and not pending_actions:
-        return (
-            "You do not currently have any appointment requests recorded "
-            "in this chat. Which treatment would you like to arrange?"
-        )
-
-    inactive_statuses = {
-        "cancelled_by_customer",
-        "declined",
-        "abandoned",
-        "expired",
-    }
-    active_requests = [
-        request
-        for request in booking_requests
-        if request.get("request_status")
-        not in inactive_statuses
-    ]
-    inactive_requests = [
-        request
-        for request in booking_requests
-        if request.get("request_status")
-        in inactive_statuses
-    ]
-
-    sections = []
-
-    if active_requests:
-        active_lines = [
-            "You currently have:"
-        ]
-
-        for request in active_requests:
-            active_lines.append(
-                format_single_booking_request_summary(
-                    request
-                )
-            )
-
-        if not any(
-            request.get("request_status") == "confirmed"
-            for request in active_requests
-        ):
-            active_lines.append(
-                "These are appointment requests, not confirmed bookings. "
-                "The therapist still needs to confirm them."
-            )
-
-        sections.append(
-            "\n\n".join(active_lines)
-        )
-    else:
-        sections.append(
-            "You do not currently have any active appointment requests."
-        )
-
-    if pending_actions:
-        names = [
-            str(
-                action.get("service_name")
-                or "an additional treatment"
-            )
-            for action in pending_actions
-        ]
-
-        sections.append(
-            "Still waiting for your decision: "
-            + "; ".join(names)
-            + ". Please tell me whether you want "
-            + (
-                "it"
-                if len(names) == 1
-                else "them"
-            )
-            + " added to an existing visit or arranged as "
-            "a separate appointment request."
-        )
-
-    if inactive_requests:
-        inactive_lines = [
-            "No longer active:"
-        ]
-
-        for request in inactive_requests:
-            inactive_lines.append(
-                format_single_booking_request_summary(
-                    request
-                )
-            )
-
-        sections.append(
-            "\n\n".join(inactive_lines)
-        )
-
-    return "\n\n".join(sections)
-
-
-def identity_key(
-    identity: dict,
-) -> tuple[str, str]:
-    return (
-        str(identity.get("category") or "").strip(),
-        normalise_treatment_name(
-            identity.get("service_name")
-        ),
-    )
-
-
-def dedupe_service_identities(
-    identities: list[dict],
-) -> list[dict]:
-    seen = set()
-    result = []
-
-    for identity in identities:
-        key = identity_key(identity)
-
-        if not key[1] or key in seen:
-            continue
-
-        seen.add(key)
-        result.append(identity)
-
-    return result
-
-
-def generic_massage_identity() -> dict:
-    return {
-        "category": "massage",
-        "service_name": "Massage",
-        "booking_mode": "choose_variant",
-        "fixed_duration_minutes": None,
-        "allowed_durations_minutes": None,
-    }
-
-
-def message_explicitly_requests_same_visit(
-    latest_message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    phrases = [
-        "together",
-        "same visit",
-        "same appointment",
-        "back to back",
-        "one after another",
-        "straight after",
-        "during the same visit",
-    ]
-
-    return any(
-        phrase in cleaned
-        for phrase in phrases
-    )
-
-
-def split_multi_service_message(
-    latest_message: str,
-) -> list[str]:
-    """
-    Split only on clear service-list separators.
-
-    The full message is also scanned separately, so this helper does not need
-    to understand every sentence structure.
-    """
-    cleaned = str(latest_message or "")
-
-    pieces = re.split(
-        r"(?i)\s*(?:,|&|\+|\band\b|\bplus\b|\bwith\b|\btogether\b)\s*",
-        cleaned,
-    )
-
-    return [
-        piece.strip()
-        for piece in pieces
-        if piece.strip()
-    ]
-
-
-def detect_all_structured_services(
-    latest_message: str,
-) -> list[dict]:
-    """
-    Resolve every service explicitly mentioned in the newest customer message.
-
-    Existing single-service resolvers return only one result. This controller
-    scans each list segment and each structured category independently so
-    same-category combinations such as Body Sculpting + EMS are preserved.
-    """
-    identities = []
-
-    direct_lookups = [
-        ("massage", find_massage_service),
-        ("vitamin_shots", find_vitamin_shot_service),
-        ("ultrasound", find_ultrasound_service),
-        ("body_treatments", find_body_treatment_service),
-        ("microneedling", find_microneedling_service),
-        ("facials", find_facial_service),
-        ("dermal_fillers", find_dermal_filler_service),
-    ]
-
-    segments = split_multi_service_message(
-        latest_message
-    )
-
-    for segment in segments:
-        resolved = resolve_latest_structured_service(
-            segment
-        )
-
-        if resolved:
-            identities.append(resolved)
-            continue
-
-        cleaned_segment = normalise_service_match_text(
-            segment
-        )
-
-        if re.search(r"\bmassages?\b", cleaned_segment):
-            identities.append(
-                generic_massage_identity()
-            )
-
-    # Scan category finders against the full message as a second pass.
-    # This improves recall when the customer's grammar is less tidy.
-    for category, finder in direct_lookups:
-        service = finder(latest_message)
-
-        if service:
-            identities.append({
-                "category": category,
-                "service_name": service.get("service_name"),
-                "booking_mode": service.get("booking_mode"),
-                "fixed_duration_minutes": service.get(
-                    "fixed_duration_minutes"
-                ),
-                "allowed_durations_minutes": service.get(
-                    "allowed_durations_minutes"
-                ),
-            })
-
-    cleaned = normalise_service_match_text(
-        latest_message
-    )
-
-    if (
-        re.search(r"\bmassages?\b", cleaned)
-        and not any(
-            identity.get("category") == "massage"
-            for identity in identities
-        )
-    ):
-        identities.append(
-            generic_massage_identity()
-        )
-
-    # Preserve partial filler choices such as "lip filler" when amount is
-    # still missing.
-    generic_or_partial = resolve_latest_generic_or_partial_service(
-        latest_message
-    )
-
-    if generic_or_partial and not any(
-        identity.get("category")
-        == generic_or_partial.get("category")
-        for identity in identities
-    ):
-        identities.append(
-            generic_or_partial
-        )
-
-    return dedupe_service_identities(
-        identities
-    )
-
-
-def load_pending_service_detail_actions(
-    session_id: str,
-) -> list[dict]:
-    try:
-        response = (
-            supabase.table("pending_booking_actions")
-            .select("*")
-            .eq("session_id", session_id)
-            .eq("action_status", "pending")
-            .in_(
-                "action_type",
-                ["choose_variant", "choose_duration"],
-            )
-            .order("created_at")
-            .execute()
-        )
-
-        return list(response.data or [])
-
-    except Exception as error:
-        print(
-            "Could not load pending service-detail actions: "
-            f"{error}"
-        )
-        return []
-
-
-def save_pending_service_detail_action(
-    session_id: str,
-    identity: dict,
-    action_type: str,
-    source_message: str,
-) -> dict | None:
-    service_name = str(
-        identity.get("service_name") or ""
-    ).strip()
-
-    if (
-        not service_name
-        or action_type not in {
-            "choose_variant",
-            "choose_duration",
-        }
-    ):
-        return None
-
-    service_row = load_service_row_for_booking_item(
-        service_name
-    )
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    payload = {
-        "session_id": session_id,
-        "service_id": (
-            service_row.get("id")
-            if service_row
-            else None
-        ),
-        "service_name": service_name,
-        "category": (
-            identity.get("category")
-            or (
-                service_row.get("category")
-                if service_row
-                else None
-            )
-        ),
-        "action_type": action_type,
-        "action_status": "pending",
-        "source_message": source_message,
-        "updated_at": now_iso,
-    }
-
-    try:
-        existing_response = (
-            supabase.table("pending_booking_actions")
-            .select("id")
-            .eq("session_id", session_id)
-            .eq("service_name", service_name)
-            .eq("action_type", action_type)
-            .eq("action_status", "pending")
-            .limit(1)
-            .execute()
-        )
-
-        if existing_response.data:
-            action_id = int(
-                existing_response.data[0]["id"]
-            )
-
-            response = (
-                supabase.table("pending_booking_actions")
-                .update(payload)
-                .eq("id", action_id)
-                .execute()
-            )
-        else:
-            response = (
-                supabase.table("pending_booking_actions")
-                .insert(payload)
-                .execute()
-            )
-
-        if response.data:
-            return response.data[0]
-
-    except Exception as error:
-        print(
-            "Could not save pending service-detail action: "
-            f"{error}"
-        )
-
-    return None
-
-
-def update_pending_service_detail_action(
-    action_id: int,
-    identity: dict,
-    action_type: str,
-):
-    service_name = str(
-        identity.get("service_name") or ""
-    ).strip()
-    service_row = load_service_row_for_booking_item(
-        service_name
-    )
-
-    try:
-        (
-            supabase.table("pending_booking_actions")
-            .update({
-                "service_id": (
-                    service_row.get("id")
-                    if service_row
-                    else None
-                ),
-                "service_name": service_name,
-                "category": (
-                    identity.get("category")
-                    or (
-                        service_row.get("category")
-                        if service_row
-                        else None
-                    )
-                ),
-                "action_type": action_type,
-                "updated_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-            })
-            .eq("id", action_id)
-            .execute()
-        )
-
-    except Exception as error:
-        print(
-            "Could not update pending service-detail action: "
-            f"{error}"
-        )
-
-
-def pending_action_needs_variant(
-    identity: dict,
-) -> bool:
-    return (
-        identity.get("booking_mode") == "choose_variant"
-        or identity.get("service_name") in {
-            "Massage",
-            "Vitamin Shot",
-            "Ultrasound",
-            "Microneedling",
-            "Facial",
-            "Dermal Filler",
-        }
-        or is_partial_dermal_filler_treatment(
-            identity.get("service_name")
-        )
-    )
-
-
-def pending_action_needs_duration(
-    identity: dict,
-) -> bool:
-    allowed = identity.get(
-        "allowed_durations_minutes"
-    ) or []
-
-    return bool(
-        allowed
-        and not identity.get(
-            "fixed_duration_minutes"
-        )
-    )
-
-
-def build_pending_service_detail_question(
-    action: dict,
-) -> str:
-    service_name = str(
-        action.get("service_name") or ""
-    )
-    category = str(
-        action.get("category") or ""
-    )
-    action_type = str(
-        action.get("action_type") or ""
-    )
-
-    if action_type == "choose_duration":
-        service_row = load_service_row_for_booking_item(
-            service_name
-        ) or {}
-        durations = service_row.get(
-            "allowed_durations_minutes"
-        ) or []
-        options = format_duration_options(
-            {int(value) for value in durations}
-        ) if durations else ""
-
-        if options:
-            return (
-                f"How long would you like the {service_name} for: "
-                f"{options}?"
-            )
-
-        return (
-            f"How long would you like the {service_name} for?"
-        )
-
-    if category == "massage":
-        return (
-            "Which massage would you like: Relaxing Massage, Swedish "
-            "Massage, Deep Tissue Massage, or Hot Stone Massage?"
-        )
-
-    if category == "dermal_fillers":
-        return build_dermal_filler_variant_prompt({
-            "treatment": service_name,
-        })
-
-    if category == "vitamin_shots":
-        return (
-            "Would you like a B12 Vitamin Shot or a Vitamin C Shot? "
-            "Both cost £20 and take 15 minutes."
-        )
-
-    if category == "ultrasound":
-        return (
-            "Would you like a single ultrasound session (£50, 45 minutes) "
-            "or the package of 5 sessions (£220 total, 45 minutes each)?"
-        )
-
-    if category == "microneedling":
-        return (
-            "Would you like microneedling for stretch marks (£60, "
-            "1 hour 15 minutes) or for the face and neck (£70, "
-            "1 hour 15 minutes)?"
-        )
-
-    if category == "facials":
-        return (
-            "Which facial would you like: Deep Facial Cleanse (£60, "
-            "60 minutes), Radio Frequency Facial (£60, 60 minutes), "
-            "Facial Treatment for Young Skin (£45, 60 minutes), "
-            "Hydraface Facial Treatment (£60, 60 minutes), or "
-            "Hydrafacial (£80, 90 minutes)?"
-        )
-
-    return (
-        f"Which {service_name or 'treatment'} option would you like?"
-    )
-
-
-def append_booking_item_to_request(
-    booking_request_id: int,
-    service_row: dict,
-    duration_minutes: int,
-) -> dict | None:
-    price_pence = booking_item_price_pence(
-        service_row,
-        duration_minutes,
-    )
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    try:
-        items = load_booking_items(
-            booking_request_id
-        )
-
-        duplicate = next(
-            (
-                item
-                for item in items
-                if normalise_treatment_name(
-                    item.get("service_name")
-                )
-                == normalise_treatment_name(
-                    service_row.get("service_name")
-                )
-            ),
-            None,
-        )
-
-        if not duplicate:
-            next_order = (
-                max(
-                    [
-                        int(item.get("item_order") or 0)
-                        for item in items
-                    ]
-                    or [0]
-                )
-                + 1
-            )
-
-            (
-                supabase.table("booking_items")
-                .insert({
-                    "booking_request_id": booking_request_id,
-                    "service_id": service_row.get("id"),
-                    "service_name": service_row.get(
-                        "service_name"
-                    ),
-                    "category": service_row.get("category"),
-                    "duration_minutes": duration_minutes,
-                    "price_pence": price_pence,
-                    "item_order": next_order,
-                    "updated_at": now_iso,
-                })
-                .execute()
-            )
-
-        items = load_booking_items(
-            booking_request_id
-        )
-        total_duration = sum(
-            int(item.get("duration_minutes") or 0)
-            for item in items
-        )
-        total_price = sum(
-            int(item.get("price_pence") or 0)
-            for item in items
-        )
-
-        (
-            supabase.table("booking_requests")
-            .update({
-                "appointment_structure": (
-                    "back_to_back"
-                    if len(items) > 1
-                    else "single_service"
-                ),
-                "item_count": len(items),
-                "total_duration_minutes": total_duration,
-                "total_price_pence": total_price,
-                "updated_at": now_iso,
-            })
-            .eq("id", booking_request_id)
-            .execute()
-        )
-
-        return {
-            "items": items,
-            "item_count": len(items),
-            "total_duration_minutes": total_duration,
-            "total_price_pence": total_price,
-        }
-
-    except Exception as error:
-        print(
-            "Could not append booking item to request: "
-            f"{error}"
-        )
-        return None
-
-
-def create_initial_multi_service_request(
-    session_id: str,
-    identities: list[dict],
-    source_message: str,
-    source: str,
-) -> dict | None:
-    now_iso = datetime.now(timezone.utc).isoformat()
-    request_id = None
-
-    try:
-        response = (
-            supabase.table("booking_requests")
-            .insert({
-                "session_id": session_id,
-                "request_number": next_booking_request_number(
-                    session_id
-                ),
-                "request_status": "draft",
-                "appointment_structure": "back_to_back",
-                "preferred_date": parse_relative_date_from_text(
-                    source_message
-                ),
-                "preferred_time": parse_time_from_text(
-                    source_message
-                ),
-                "slot_status": "not_checked",
-                "item_count": 0,
-                "total_duration_minutes": 0,
-                "total_price_pence": 0,
-                "missing_detail": "service_variant",
-                "updated_at": now_iso,
-            })
-            .execute()
-        )
-
-        if not response.data:
-            return None
-
-        request_id = int(
-            response.data[0]["id"]
-        )
-
-        update_conversation_active_booking_request(
-            session_id,
-            request_id,
-        )
-
-        first_resolved_service = None
-
-        for identity in identities:
-            if pending_action_needs_variant(
-                identity
-            ):
-                save_pending_service_detail_action(
-                    session_id,
-                    identity,
-                    "choose_variant",
-                    source_message,
-                )
-                continue
-
-            service_row = load_service_row_for_booking_item(
-                identity.get("service_name")
-            )
-
-            if not service_row:
-                continue
-
-            fixed_duration = service_row.get(
-                "fixed_duration_minutes"
-            )
-
-            if fixed_duration not in [None, ""]:
-                duration_minutes = int(
-                    fixed_duration
-                )
-                append_booking_item_to_request(
-                    request_id,
-                    service_row,
-                    duration_minutes,
-                )
-
-                if not first_resolved_service:
-                    first_resolved_service = service_row
-
-                continue
-
-            if pending_action_needs_duration(
-                identity
-            ):
-                save_pending_service_detail_action(
-                    session_id,
-                    identity,
-                    "choose_duration",
-                    source_message,
-                )
-
-        items = load_booking_items(
-            request_id
-        )
-        pending_actions = load_pending_service_detail_actions(
-            session_id
-        )
-        request_row = load_active_draft_booking_request(
-            session_id
-        ) or {}
-
-        primary_item = (
-            items[0]
-            if items
-            else None
-        )
-        primary_name = (
-            primary_item.get("service_name")
-            if primary_item
-            else (
-                identities[0].get("service_name")
-                if identities
-                else "Multiple treatments"
-            )
-        )
-        primary_duration = (
-            format_minutes_as_duration(
-                primary_item.get("duration_minutes")
-            )
-            if primary_item
-            else None
-        )
-
-        lead_data = {
-            "treatment": primary_name,
-            "duration": primary_duration,
-            "preferred_date": request_row.get(
-                "preferred_date"
-            ),
-            "preferred_time": request_row.get(
-                "preferred_time"
-            ),
-            "status": "details_incomplete",
-            "summary": (
-                "Customer requested multiple treatments in one visit."
-            ),
-            "conversation_mode": "booking_request",
-            "active_category": (
-                primary_item.get("category")
-                if primary_item
-                else identities[0].get("category")
-            ),
-            "slot_status": "not_checked",
-            "next_required_detail": (
-                "service_variant"
-                if pending_actions
-                else (
-                    "preferred_date"
-                    if not request_row.get("preferred_date")
-                    else (
-                        "preferred_time"
-                        if not request_row.get("preferred_time")
-                        else "name"
-                    )
-                )
-            ),
-            "notification_sent_at": None,
-        }
-
-        save_conversation_overview(
-            session_id=session_id,
-            lead_data=lead_data,
-            source=source,
-        )
-
-        return {
-            "request_id": request_id,
-            "items": items,
-            "pending_actions": pending_actions,
-            "request": request_row,
-        }
-
-    except Exception as error:
-        print(
-            "Could not create initial multi-service request: "
-            f"{error}"
-        )
-
-        if request_id is not None:
-            try:
-                (
-                    supabase.table("booking_requests")
-                    .delete()
-                    .eq("id", request_id)
-                    .execute()
-                )
-            except Exception as cleanup_error:
-                print(
-                    "Could not clean failed initial multi-service request: "
-                    f"{cleanup_error}"
-                )
-
-        return None
-
-
-def format_multi_service_cart_summary(
-    request_id: int,
-) -> str:
-    items = load_booking_items(
-        request_id
-    )
-
-    if not items:
-        return ""
-
-    item_text = "; ".join(
-        format_cart_item_summary(item)
-        for item in items
-    )
-    total_duration = sum(
-        int(item.get("duration_minutes") or 0)
-        for item in items
-    )
-    total_price = sum(
-        int(item.get("price_pence") or 0)
-        for item in items
-    )
-
-    return (
-        f"Your same-visit request currently includes: {item_text}. "
-        f"Total so far: {format_price_pence(total_price)}, "
-        f"{format_minutes_as_duration(total_duration)}."
-    )
-
-
-def next_multi_service_question(
-    session_id: str,
-    request_id: int,
-) -> str:
-    pending_actions = load_pending_service_detail_actions(
-        session_id
-    )
-
-    if pending_actions:
-        return build_pending_service_detail_question(
-            pending_actions[0]
-        )
-
-    request_row = load_active_draft_booking_request(
-        session_id
-    ) or {}
-    preferred_date = request_row.get(
-        "preferred_date"
-    )
-    preferred_time = request_row.get(
-        "preferred_time"
-    )
-
-    if not preferred_date and not preferred_time:
-        return "Which day and time would suit you?"
-
-    if not preferred_date:
-        return (
-            f"Which day did you have in mind for "
-            f"{format_customer_time(preferred_time)}?"
-        )
-
-    if not preferred_time:
-        return (
-            f"What time would suit you on "
-            f"{format_customer_date(preferred_date)}?"
-        )
-
-    return (
-        "Could I take your name and phone number, please?"
-    )
-
-
-def build_initial_multi_service_reply(
-    session_id: str,
-    request_id: int,
-) -> str:
-    summary = format_multi_service_cart_summary(
-        request_id
-    )
-    question = next_multi_service_question(
-        session_id,
-        request_id,
-    )
-
-    if summary:
-        return summary + "\n\n" + question
-
-    return (
-        "I can help arrange those treatments together.\n\n"
-        + question
-    )
-
-
-def resolve_pending_variant_identity(
-    action: dict,
-    latest_message: str,
-) -> dict | None:
-    category = str(
-        action.get("category") or ""
-    )
-    service_name = str(
-        action.get("service_name") or ""
-    )
-
-    if category == "massage":
-        service = find_massage_service(
-            latest_message
-        )
-
-        if service:
-            return {
-                "category": "massage",
-                "service_name": service.get("service_name"),
-                "booking_mode": service.get("booking_mode"),
-                "fixed_duration_minutes": service.get(
-                    "fixed_duration_minutes"
-                ),
-                "allowed_durations_minutes": service.get(
-                    "allowed_durations_minutes"
-                ),
-            }
-
-    if category == "dermal_fillers":
-        service = (
-            find_dermal_filler_service(latest_message)
-            or find_dermal_filler_service_for_partial_reply(
-                service_name,
-                latest_message,
-            )
-        )
-
-        if service:
-            return {
-                "category": "dermal_fillers",
-                "service_name": service.get("service_name"),
-                "booking_mode": service.get("booking_mode"),
-                "fixed_duration_minutes": service.get(
-                    "fixed_duration_minutes"
-                ),
-                "allowed_durations_minutes": service.get(
-                    "allowed_durations_minutes"
-                ),
-            }
-
-    category_configs = {
-        "vitamin_shots": (
-            load_vitamin_shot_services,
-            {"vitamin", "shot", "shots"},
-        ),
-        "ultrasound": (
-            load_ultrasound_services,
-            {"ultrasound"},
-        ),
-        "microneedling": (
-            load_microneedling_services,
-            {"microneedling"},
-        ),
-        "facials": (
-            load_facial_services,
-            {"facial", "facials"},
-        ),
-    }
-
-    if category in category_configs:
-        loader, tokens = category_configs[category]
-        service = find_service_from_short_variant_reply(
-            latest_message,
-            loader()[0],
-            category_tokens=tokens,
-        )
-
-        if service:
-            return {
-                "category": category,
-                "service_name": service.get("service_name"),
-                "booking_mode": service.get("booking_mode"),
-                "fixed_duration_minutes": service.get(
-                    "fixed_duration_minutes"
-                ),
-                "allowed_durations_minutes": service.get(
-                    "allowed_durations_minutes"
-                ),
-            }
-
-    return None
-
-
-def handle_pending_multi_service_detail_reply(
-    session_id: str,
-    latest_message: str,
-) -> str | None:
-    actions = load_pending_service_detail_actions(
-        session_id
-    )
-
-    if not actions:
-        return None
-
-    action = actions[0]
-    request_row = load_active_draft_booking_request(
-        session_id
-    )
-
-    if not request_row:
-        return None
-
-    request_id = int(
-        request_row["id"]
-    )
-    action_type = action.get(
-        "action_type"
-    )
-
-    if action_type == "choose_variant":
-        identity = resolve_pending_variant_identity(
-            action,
-            latest_message,
-        )
-
-        if not identity:
-            return None
-
-        if pending_action_needs_duration(
-            identity
-        ):
-            update_pending_service_detail_action(
-                int(action["id"]),
-                identity,
-                "choose_duration",
-            )
-
-            summary = format_multi_service_cart_summary(
-                request_id
-            )
-            question = build_pending_service_detail_question({
-                **action,
-                "service_name": identity.get("service_name"),
-                "category": identity.get("category"),
-                "action_type": "choose_duration",
-            })
-
-            return (
-                (summary + "\n\n" if summary else "")
-                + question
-            )
-
-        service_row = load_service_row_for_booking_item(
-            identity.get("service_name")
-        )
-
-        if not service_row:
-            return None
-
-        duration_minutes = service_row.get(
-            "fixed_duration_minutes"
-        )
-
-        if duration_minutes in [None, ""]:
-            return None
-
-        append_booking_item_to_request(
-            request_id,
-            service_row,
-            int(duration_minutes),
-        )
-        update_pending_booking_action_status(
-            int(action["id"]),
-            "resolved",
-        )
-
-        return build_initial_multi_service_reply(
-            session_id,
-            request_id,
-        )
-
-    if action_type == "choose_duration":
-        service_row = load_service_row_for_booking_item(
-            action.get("service_name")
-        )
-
-        if not service_row:
-            return None
-
-        chosen_duration = parse_duration_minutes(
-            latest_message
-        )
-        allowed = {
-            int(value)
-            for value in (
-                service_row.get(
-                    "allowed_durations_minutes"
-                ) or []
-            )
-        }
-
-        if (
-            not chosen_duration
-            or (
-                allowed
-                and chosen_duration not in allowed
-            )
-        ):
-            options = format_duration_options(
-                allowed
-            ) if allowed else ""
-
-            if options:
-                return (
-                    f"Please choose one of the available durations "
-                    f"for {service_row.get('service_name')}: "
-                    f"{options}."
-                )
-
-            return (
-                f"Please tell me how long you would like "
-                f"{service_row.get('service_name')} for."
-            )
-
-        append_booking_item_to_request(
-            request_id,
-            service_row,
-            chosen_duration,
-        )
-        update_pending_booking_action_status(
-            int(action["id"]),
-            "resolved",
-        )
-
-        return build_initial_multi_service_reply(
-            session_id,
-            request_id,
-        )
-
-    return None
-
-
-def handle_initial_multi_service_intake(
-    session_id: str,
-    latest_message: str,
-    source: str,
-) -> str | None:
-    """
-    Intercept explicit same-visit multi-service requests before the old
-    single-treatment extractor can discard one of the treatments.
-    """
-    if load_active_draft_booking_request(
-        session_id
-    ):
-        return None
-
-    identities = detect_all_structured_services(
-        latest_message
-    )
-
-    if len(identities) < 2:
-        return None
-
-    if not message_explicitly_requests_same_visit(
-        latest_message
-    ):
-        names = "; ".join(
-            identity.get("service_name") or "treatment"
-            for identity in identities
-        )
-
-        return (
-            f"I can help with {names}. Would you like those treatments "
-            "during the same visit, or as separate appointment requests?"
-        )
-
-    result = create_initial_multi_service_request(
-        session_id=session_id,
-        identities=identities,
-        source_message=latest_message,
-        source=source,
-    )
-
-    if not result:
-        return (
-            "I could not start that combined treatment request just now. "
-            "Please try again shortly or call 07943319617."
-        )
-
-    return build_initial_multi_service_reply(
-        session_id,
-        int(result["request_id"]),
-    )
-
-
 def advanced_multi_booking_enabled() -> bool:
     """
     Business-level feature flag.
@@ -11283,228 +5789,899 @@ def advanced_multi_booking_enabled() -> bool:
     )
 
 
-def format_manual_multi_treatment_names(
-    identities: list[dict],
-) -> str:
-    names = []
+# ============================================================================
+# STATE-FIRST TWO-PASS RECEPTIONIST CONTROLLER
+#
+# Pass 1: AI extracts a hidden JSON patch from the newest customer message.
+# Python validates and merges that patch into Supabase-backed canonical state.
+# Python then checks services, opening hours, and Google Calendar.
+# Pass 2: AI writes a natural reply using the refreshed verified state.
+# The customer never sees the hidden extractor JSON.
+# ============================================================================
 
-    for identity in identities:
-        name = str(
-            identity.get("service_name")
-            or "treatment"
-        ).strip()
+CORE_STATE_FIELDS = [
+    "name",
+    "phone",
+    "treatment",
+    "duration",
+    "preferred_date",
+    "preferred_time",
+    "notes",
+    "summary",
+]
 
-        if name and name not in names:
-            names.append(name)
+PATCHABLE_FIELDS = {
+    "name",
+    "phone",
+    "treatment",
+    "duration",
+    "preferred_date_expression",
+    "preferred_time",
+    "notes_append",
+}
 
-    if not names:
-        return "multiple treatments"
-
-    if len(names) == 1:
-        return names[0]
-
-    if len(names) == 2:
-        return f"{names[0]} and {names[1]}"
-
-    return (
-        ", ".join(names[:-1])
-        + f", and {names[-1]}"
-    )
-
-
-def append_manual_multi_treatment_note(
-    existing_notes: str | None,
-    treatment_names: str,
-) -> str:
-    note = (
-        "Customer mentioned multiple treatments: "
-        f"{treatment_names}. "
-        "Exact arrangement should be confirmed manually by Veronika."
-    )
-    current = str(
-        existing_notes or ""
-    ).strip()
-
-    if not current:
-        return note
-
-    if note.lower() in current.lower():
-        return current
-
-    return current + " " + note
+BOOKING_INTENTS = {
+    "booking_request",
+    "change_request",
+    "booking_detail",
+    "availability_request",
+}
 
 
-def handle_simple_multi_treatment_handoff(
-    session_id: str,
-    latest_message: str,
-    source: str,
-) -> str | None:
-    """
-    Default receptionist-mode behaviour for rare multi-treatment enquiries.
-
-    Do not start the advanced cart controller. Record the customer's request
-    as a lead note and hand the exact arrangement to Veronika for manual
-    confirmation.
-    """
-    identities = detect_all_structured_services(
-        latest_message
-    )
-
-    if len(identities) < 2:
-        return None
-
-    treatment_names = format_manual_multi_treatment_names(
-        identities
-    )
-    existing = get_existing_conversation(
-        session_id
-    )
-    existing_summary = str(
-        existing.get("summary") or ""
-    ).strip()
-    summary = (
-        f"Customer is interested in {treatment_names}. "
-        "Exact multi-treatment arrangement requires manual follow-up."
-    )
-
-    if existing_summary and summary.lower() not in existing_summary.lower():
-        summary = existing_summary + " " + summary
-
-    lead_data = {
-        "treatment": (
-            existing.get("treatment")
-            or identities[0].get("service_name")
-            or "Multiple treatments"
-        ),
-        "duration": existing.get("duration"),
-        "preferred_date": (
-            parse_relative_date_from_text(
-                latest_message,
-                reference_date=existing.get(
-                    "preferred_date"
-                ),
-            )
-            or existing.get("preferred_date")
-        ),
-        "preferred_time": (
-            parse_time_from_text(latest_message)
-            or existing.get("preferred_time")
-        ),
-        "name": existing.get("name"),
-        "phone": existing.get("phone"),
-        "notes": append_manual_multi_treatment_note(
-            existing.get("notes"),
-            treatment_names,
-        ),
-        "summary": summary,
-        "status": "details_incomplete",
-        "conversation_mode": "booking_request",
-        "slot_status": "not_checked",
-        "next_required_detail": "preferred_date",
-        "notification_sent_at": None,
+def serialisable_saved_state(state: dict) -> dict:
+    return {
+        field: state.get(field)
+        for field in [
+            *CORE_STATE_FIELDS,
+            "status",
+            "conversation_mode",
+            "active_category",
+            "slot_status",
+            "next_required_detail",
+        ]
     }
 
-    save_conversation_overview(
-        session_id=session_id,
-        lead_data=lead_data,
-        source=source,
-    )
 
-    missing_fields = [
-        field
-        for field in REQUIRED_BOOKING_FIELDS
-        if lead_data.get(field) in [None, ""]
+def build_authoritative_services_context() -> str:
+    blocks = [
+        format_live_massage_services_context()[0],
+        format_live_vitamin_shot_services_context()[0],
+        format_live_ultrasound_services_context()[0],
+        format_live_body_treatment_services_context()[0],
+        format_live_microneedling_services_context()[0],
+        format_live_facial_services_context()[0],
+        format_live_dermal_filler_services_context()[0],
     ]
-    next_question = build_deterministic_next_question(
-        lead_data,
-        missing_fields,
-    )
 
-    opening = (
-        f"Of course. I have noted that you are interested in "
-        f"{treatment_names}. Veronika will confirm the exact arrangement "
-        "with you manually."
-    )
-
-    return (
-        opening
-        + (f"\n\n{next_question}" if next_question else "")
+    return "\n\n".join(
+        block for block in blocks if block
     )
 
 
-def customer_asks_for_service_menu(
-    message: str,
-) -> bool:
-    cleaned = normalise_service_match_text(
-        message
+def load_business_documents_context() -> str:
+    try:
+        response = (
+            supabase.table("documents")
+            .select("content")
+            .execute()
+        )
+
+        rows = []
+
+        for item in response.data or []:
+            content = str(item.get("content") or "").strip()
+
+            if not content:
+                continue
+
+            # Structured services and live dashboard hours are authoritative.
+            # Ignore old rows that could conflict with current configuration.
+            if re.match(r"(?i)^\s*opening\s+hours\s*:", content):
+                continue
+
+            rows.append(content)
+
+        return "\n".join(rows)
+
+    except Exception as error:
+        print(f"Could not load business documents: {error}")
+        return ""
+
+
+def compact_recent_history(history: list[ChatMessage], limit: int = 12) -> str:
+    lines = []
+
+    for message in history[-limit:]:
+        role = "Customer" if message.role == "user" else "Receptionist"
+        lines.append(f"{role}: {message.content}")
+
+    return "\n".join(lines)
+
+
+def empty_extractor_result() -> dict:
+    return {
+        "intent": "unclear",
+        "state_patch": {},
+        "mentioned_treatments": [],
+        "customer_question": None,
+        "is_correction": False,
+    }
+
+
+def normalise_extractor_result(raw: dict | None) -> dict:
+    result = empty_extractor_result()
+
+    if not isinstance(raw, dict):
+        return result
+
+    intent = str(raw.get("intent") or "unclear").strip().lower()
+    result["intent"] = intent
+
+    patch = raw.get("state_patch") or {}
+
+    if isinstance(patch, dict):
+        result["state_patch"] = {
+            key: value
+            for key, value in patch.items()
+            if key in PATCHABLE_FIELDS
+            and value not in [None, ""]
+        }
+
+    mentioned = raw.get("mentioned_treatments") or []
+
+    if isinstance(mentioned, list):
+        result["mentioned_treatments"] = [
+            str(value).strip()
+            for value in mentioned
+            if str(value).strip()
+        ][:6]
+
+    question = raw.get("customer_question")
+
+    if isinstance(question, dict):
+        result["customer_question"] = {
+            "topic": str(question.get("topic") or "").strip() or None,
+            "type": str(question.get("type") or "").strip() or None,
+        }
+    elif isinstance(question, str) and question.strip():
+        result["customer_question"] = {
+            "topic": question.strip(),
+            "type": "general",
+        }
+
+    result["is_correction"] = bool(
+        raw.get("is_correction")
     )
 
-    return any(
-        phrase in cleaned
-        for phrase in [
-            "what do you offer",
-            "what treatments do you have",
-            "which treatments do you have",
-            "what services do you have",
-            "which services do you have",
-            "what can you do",
-        ]
-    )
+    return result
 
 
-def customer_mentions_unknown_treatment(
-    message: str,
-    existing_lead: dict,
-) -> bool:
+def extract_hidden_state_patch(
+    current_state: dict,
+    latest_message: str,
+    history: list[ChatMessage],
+    services_context: str,
+) -> dict:
     """
-    Clarify an unrecognised requested treatment instead of advancing a form.
-    """
-    if existing_lead.get("treatment"):
-        return False
+    Pass 1: return hidden structured data only.
 
-    if customer_asks_for_service_menu(
-        message
-    ):
-        return False
+    The extractor suggests a patch. It never writes to Supabase and never
+    decides calendar availability. Python validates every accepted value.
+    """
+    prompt = f"""
+You are the hidden structured-data extractor for a salon receptionist chatbot.
+The customer never sees your output.
+
+Read the CURRENT SAVED STATE, recent conversation, and newest customer message.
+Return JSON only.
+
+Your job:
+- extract only NEW or CHANGED facts supplied by the customer;
+- preserve previously saved facts by omitting unchanged fields;
+- identify corrections and treatment switches;
+- identify customer questions separately from booking-state changes;
+- never invent a date, time, treatment, name, phone number, price, duration, or availability;
+- never claim that a slot is free or unavailable;
+- preserve relative date language such as "today", "tomorrow", or "next Thursday" in preferred_date_expression;
+- use a 24-hour HH:MM value for preferred_time only when the customer clearly provided a time;
+- use the configured treatment names where possible;
+- when a customer answers a pending variant naturally, resolve it where possible. Example: active Lip Filler + "the 0.5 will be great" means Lip Filler 0.5 ml.
+
+Allowed intent values:
+information_question, service_menu, booking_request, booking_detail,
+change_request, acknowledgement, unclear.
+
+Return exactly this shape:
+{{
+  "intent": "unclear",
+  "state_patch": {{
+    "treatment": null,
+    "duration": null,
+    "preferred_date_expression": null,
+    "preferred_time": null,
+    "name": null,
+    "phone": null,
+    "notes_append": null
+  }},
+  "mentioned_treatments": [],
+  "customer_question": {{"topic": null, "type": null}},
+  "is_correction": false
+}}
+
+CURRENT SAVED STATE:
+{json.dumps(serialisable_saved_state(current_state), ensure_ascii=False, indent=2)}
+
+AUTHORITATIVE STRUCTURED SERVICES:
+{services_context}
+
+RECENT CONVERSATION:
+{compact_recent_history(history)}
+
+NEWEST CUSTOMER MESSAGE:
+{latest_message}
+"""
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=LEAD_EXTRACTION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+
+        raw = json.loads(
+            completion.choices[0].message.content
+        )
+
+        return normalise_extractor_result(raw)
+
+    except Exception as error:
+        print(f"Hidden state extraction failed: {error}")
+        return empty_extractor_result()
+
+
+def merge_notes(existing_notes: str | None, addition: str | None) -> str | None:
+    current = str(existing_notes or "").strip()
+    new_note = str(addition or "").strip()
+
+    if not new_note:
+        return current or None
+
+    if new_note.lower() in current.lower():
+        return current or new_note
+
+    return (current + " " + new_note).strip()
+
+
+def canonical_treatment_from_text(
+    candidate: str | None,
+    latest_message: str,
+    existing_treatment: str | None,
+) -> str | None:
+    """Resolve a real configured service or a safe unresolved category."""
+    texts = [candidate, latest_message]
+
+    for text_value in texts:
+        if not text_value:
+            continue
+
+        identity = resolve_latest_structured_service(
+            str(text_value),
+            existing_treatment=existing_treatment,
+        )
+
+        if identity and identity.get("service_name"):
+            return str(identity["service_name"])
+
+    for text_value in texts:
+        if not text_value:
+            continue
+
+        partial = resolve_latest_generic_or_partial_service(
+            str(text_value)
+        )
+
+        if partial and partial.get("service_name"):
+            return str(partial["service_name"])
+
+    return None
+
+
+def apply_structured_service_resolution(
+    state: dict,
+    latest_message: str,
+) -> dict:
+    """
+    Resolve configured variants and defaults in one controlled stage.
+    Existing category-specific helpers are reused only as canonicalisers.
+    """
+    result = dict(state)
+
+    result = apply_dynamic_massage_details(result, latest_message)
+    result = apply_dynamic_vitamin_shot_details(result, latest_message)
+    result = apply_dynamic_ultrasound_details(result, latest_message)
+    result = apply_dynamic_body_treatment_details(result, latest_message)
+    result = apply_dynamic_microneedling_details(result, latest_message)
+    result = apply_dynamic_facial_details(result, latest_message)
+    result = apply_dynamic_dermal_filler_details(result, latest_message)
+
+    return result
+
+
+def duration_is_valid_for_treatment(
+    treatment: str | None,
+    duration_value: str | None,
+) -> bool:
+    minutes = parse_duration_minutes(duration_value)
+
+    if minutes is None:
+        return True
+
+    allowed = allowed_durations_for_treatment(
+        treatment
+    )
+
+    return not allowed or minutes in allowed
+
+
+def apply_validated_state_patch(
+    existing_state: dict,
+    extractor_result: dict,
+    latest_message: str,
+    history: list[ChatMessage],
+) -> dict:
+    """
+    Validate and merge the hidden extractor patch into canonical state.
+
+    Explicit newest facts win. Existing facts remain unless a validated
+    customer correction replaces them.
+    """
+    result = {
+        field: existing_state.get(field)
+        for field in CORE_STATE_FIELDS
+    }
+    result.update({
+        "status": existing_state.get("status"),
+        "conversation_mode": existing_state.get("conversation_mode"),
+        "active_category": existing_state.get("active_category"),
+        "slot_status": existing_state.get("slot_status"),
+        "next_required_detail": existing_state.get("next_required_detail"),
+        "notification_sent_at": existing_state.get("notification_sent_at"),
+    })
+
+    patch = extractor_result.get("state_patch") or {}
+
+    # Deterministic parsers are a backup and validator for the extractor.
+    date_expression = (
+        patch.get("preferred_date_expression")
+        or latest_message
+    )
+    parsed_date = parse_relative_date_from_text(
+        str(date_expression),
+        reference_date=result.get("preferred_date"),
+    )
+    parsed_time = parse_time_from_text(
+        str(patch.get("preferred_time") or latest_message)
+    )
+    parsed_phone = parse_phone_from_text(
+        str(patch.get("phone") or latest_message)
+    )
+    parsed_duration = explicit_duration_minutes_from_reply(
+        str(patch.get("duration") or latest_message),
+        treatment=result.get("treatment"),
+    )
+
+    if parsed_date:
+        result["preferred_date"] = parsed_date
+
+    if parsed_time:
+        result["preferred_time"] = parsed_time
+
+    if parsed_phone and is_valid_phone_number(parsed_phone):
+        result["phone"] = parsed_phone
+
+    name_candidate = str(patch.get("name") or "").strip()
 
     if (
-        resolve_latest_structured_service(
-            message
+        name_candidate
+        and is_valid_customer_name(name_candidate)
+        and not message_looks_like_schedule_input(name_candidate)
+    ):
+        result["name"] = name_candidate
+
+    candidate_treatment = canonical_treatment_from_text(
+        patch.get("treatment"),
+        latest_message,
+        result.get("treatment"),
+    )
+
+    previous_treatment = result.get("treatment")
+
+    if candidate_treatment:
+        result["treatment"] = candidate_treatment
+
+    # Service helpers resolve short replies such as "B12", "Relaxing", and
+    # natural filler amount replies using the active category.
+    result = apply_structured_service_resolution(
+        result,
+        latest_message,
+    )
+
+    if parsed_duration is not None:
+        candidate_duration = format_minutes_as_duration(
+            parsed_duration
         )
-        or resolve_latest_generic_or_partial_service(
-            message
+
+        if duration_is_valid_for_treatment(
+            result.get("treatment"),
+            candidate_duration,
+        ):
+            result["duration"] = candidate_duration
+
+    if (
+        previous_treatment
+        and result.get("treatment")
+        and normalise_treatment_name(previous_treatment)
+        != normalise_treatment_name(result.get("treatment"))
+        and not duration_is_valid_for_treatment(
+            result.get("treatment"),
+            result.get("duration"),
         )
     ):
-        return False
+        result["duration"] = None
 
-    cleaned = normalise_service_match_text(
-        message
+    # Fixed-duration structured services always use configured durations.
+    identity = structured_service_identity(
+        result.get("treatment")
     )
 
-    return bool(
-        re.search(
-            r"\b(?:treatment|therapy|massage|facial|filler|injection|"
-            r"appointment|book)\b",
-            cleaned,
+    if identity:
+        fixed_minutes = identity.get(
+            "fixed_duration_minutes"
         )
+
+        if fixed_minutes not in [None, ""]:
+            result["duration"] = format_minutes_as_duration(
+                int(fixed_minutes)
+            )
+
+        result["active_category"] = identity.get(
+            "category"
+        )
+
+    result["notes"] = merge_notes(
+        result.get("notes"),
+        patch.get("notes_append"),
+    )
+
+    # Recover previously supplied customer schedule details after a later
+    # variant choice. Assistant suggestions are never used as saved facts.
+    result = recover_schedule_from_customer_history(
+        result,
+        compact_recent_history(history),
+        latest_message,
+    )
+
+    return result
+
+
+def has_booking_intent_state(
+    existing_state: dict,
+    extractor_result: dict,
+    latest_message: str,
+) -> bool:
+    intent = str(
+        extractor_result.get("intent") or ""
+    ).strip().lower()
+
+    if existing_state.get("conversation_mode") == "booking_request":
+        return True
+
+    if intent in BOOKING_INTENTS:
+        return True
+
+    if any(
+        re.search(pattern, latest_message.lower())
+        for pattern in BOOKING_INTENT_PATTERNS
+    ):
+        return True
+
+    return False
+
+
+def compute_next_required_detail(
+    state: dict,
+    booking_flow_active: bool,
+) -> str | None:
+    if not booking_flow_active:
+        return None
+
+    if state.get("treatment") in [None, ""]:
+        return "treatment"
+
+    if (
+        needs_massage_variant(state)
+        or needs_vitamin_shot_variant(state)
+        or needs_ultrasound_variant(state)
+        or needs_microneedling_variant(state)
+        or needs_facial_variant(state)
+        or needs_dermal_filler_variant(state)
+    ):
+        return "service_variant"
+
+    if state.get("duration") in [None, ""]:
+        return "duration"
+
+    if state.get("preferred_date") in [None, ""]:
+        return "preferred_date"
+
+    if state.get("preferred_time") in [None, ""]:
+        return "preferred_time"
+
+    if (
+        state.get("name") in [None, ""]
+        and state.get("phone") in [None, ""]
+    ):
+        return "name_and_phone"
+
+    if state.get("name") in [None, ""]:
+        return "name"
+
+    if state.get("phone") in [None, ""]:
+        return "phone"
+
+    return "handoff"
+
+
+def render_next_question(
+    state: dict,
+    next_required_detail: str | None,
+) -> str:
+    if not next_required_detail or next_required_detail == "handoff":
+        return ""
+
+    if next_required_detail == "treatment":
+        return "Which treatment are you interested in?"
+
+    if next_required_detail == "service_variant":
+        return build_schedule_first_question(state)
+
+    if next_required_detail == "duration":
+        allowed = allowed_durations_for_treatment(
+            state.get("treatment")
+        )
+
+        if allowed:
+            return (
+                "How long would you like the session for: "
+                + format_duration_options(allowed)
+                + "?"
+            )
+
+        return "How long would you like the session for?"
+
+    if next_required_detail == "preferred_date":
+        return "Which day would you prefer?"
+
+    if next_required_detail == "preferred_time":
+        return (
+            "What time would suit you on "
+            + format_customer_date(
+                state.get("preferred_date")
+            )
+            + "?"
+        )
+
+    if next_required_detail == "name_and_phone":
+        return "Could I take your name and phone number, please?"
+
+    if next_required_detail == "name":
+        return "Could I take your name, please?"
+
+    if next_required_detail == "phone":
+        return "Could I take your phone number, please?"
+
+    return ""
+
+
+def apply_canonical_controller_state(
+    state: dict,
+    booking_flow_active: bool,
+    calendar_result: dict | None = None,
+) -> dict:
+    result = dict(state)
+    next_detail = compute_next_required_detail(
+        result,
+        booking_flow_active,
+    )
+
+    result["conversation_mode"] = (
+        "booking_request"
+        if booking_flow_active
+        else "browsing"
+    )
+    result["next_required_detail"] = next_detail
+    result["slot_status"] = normalise_controller_slot_status(
+        calendar_result or {"status": "not_checked"}
+    )
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
+
+
+def verified_calendar_result_for_state(
+    state: dict,
+    booking_flow_active: bool,
+    latest_message: str,
+) -> dict:
+    if not booking_flow_active:
+        return {
+            "status": "not_requested",
+            "message": "No booking slot check is required.",
+        }
+
+    if (
+        state.get("preferred_date") in [None, ""]
+        or state.get("preferred_time") in [None, ""]
+    ):
+        return {
+            "status": "not_checked",
+            "message": "A date and time are not both saved yet.",
+        }
+
+    return check_requested_calendar_slot(
+        state,
+        latest_message,
     )
 
 
-def build_unknown_treatment_reply() -> str:
-    return (
-        "Sorry, I am not sure which treatment you mean. "
-        "Could you tell me a little more about what you are looking for?"
+def safe_calendar_customer_text(
+    state: dict,
+    calendar_result: dict,
+) -> str:
+    status = str(
+        calendar_result.get("status") or "not_checked"
     )
+
+    if calendar_result.get("suggestions"):
+        return build_calendar_alternative_reply(
+            calendar_result
+        )
+
+    if status == "free":
+        return (
+            format_customer_slot(
+                state.get("preferred_date"),
+                state.get("preferred_time"),
+            )
+            + " currently appears free."
+        )
+
+    if status == "unknown":
+        return (
+            "The therapist will need to check the availability manually."
+        )
+
+    return ""
+
+
+def build_responder_context(
+    state: dict,
+    extractor_result: dict,
+    calendar_result: dict,
+    next_question: str,
+    business_context: str,
+    services_context: str,
+    latest_message: str,
+    history: list[ChatMessage],
+) -> str:
+    return f"""
+You are Veronika's human-sounding receptionist assistant.
+Write a short, warm and natural reply to the customer's newest message.
+
+IMPORTANT LOCKED RULES:
+- The saved state below is authoritative.
+- Never invent, infer, rewrite, or calculate a date, weekday, time, price, duration, or calendar slot.
+- Never mention availability unless it is explicitly supplied in VERIFIED CALENDAR CUSTOMER TEXT.
+- Never claim that an appointment is confirmed. Veronika confirms manually.
+- Do not ask workflow questions. Python appends the one allowed next question separately.
+- Answer a customer's side question briefly when possible.
+- Do not repeat information unnecessarily.
+- If the customer asks what services are offered, answer using the supplied business information and service catalogue.
+
+NEWEST CUSTOMER MESSAGE:
+{latest_message}
+
+HIDDEN EXTRACTOR RESULT:
+{json.dumps(extractor_result, ensure_ascii=False, indent=2)}
+
+CURRENT SAVED STATE AFTER VALIDATION:
+{json.dumps(serialisable_saved_state(state), ensure_ascii=False, indent=2)}
+
+VERIFIED CALENDAR CUSTOMER TEXT:
+{safe_calendar_customer_text(state, calendar_result) or "None"}
+
+ONE ALLOWED NEXT QUESTION APPENDED BY PYTHON:
+{next_question or "None"}
+
+RECENT CONVERSATION:
+{compact_recent_history(history)}
+
+AUTHORITATIVE STRUCTURED SERVICES:
+{services_context}
+
+BUSINESS INFORMATION:
+{business_context}
+
+Return only the natural reply body. Do not append a workflow question.
+"""
+
+
+def generate_natural_reply_body(
+    state: dict,
+    extractor_result: dict,
+    calendar_result: dict,
+    next_question: str,
+    business_context: str,
+    services_context: str,
+    latest_message: str,
+    history: list[ChatMessage],
+) -> str:
+    prompt = build_responder_context(
+        state,
+        extractor_result,
+        calendar_result,
+        next_question,
+        business_context,
+        services_context,
+        latest_message,
+        history,
+    )
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=LIVE_CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            reasoning_effort=LIVE_CHAT_REASONING_EFFORT,
+            include_reasoning=False,
+            temperature=0.35,
+            max_completion_tokens=LIVE_CHAT_MAX_COMPLETION_TOKENS,
+        )
+
+        reply = normalise_reply_line_breaks(
+            completion.choices[0].message.content
+        )
+        reply = sanitise_booking_claims(reply)
+        reply = strip_model_booking_questions(reply)
+        reply = collapse_repeated_reply_content(reply)
+        return reply.strip()
+
+    except Exception as error:
+        print(f"Natural responder failed: {error}")
+        return ""
+
+
+def compose_verified_customer_reply(
+    state: dict,
+    extractor_result: dict,
+    calendar_result: dict,
+    next_required_detail: str | None,
+    business_context: str,
+    services_context: str,
+    latest_message: str,
+    history: list[ChatMessage],
+) -> str:
+    next_question = render_next_question(
+        state,
+        next_required_detail,
+    )
+
+    # Suggested slots are fully deterministic because the model must never
+    # invent alternatives or rewrite date labels.
+    if calendar_result.get("suggestions"):
+        return collapse_repeated_reply_content(
+            build_calendar_alternative_reply(
+                calendar_result
+            )
+        )
+
+    body = generate_natural_reply_body(
+        state,
+        extractor_result,
+        calendar_result,
+        next_question,
+        business_context,
+        services_context,
+        latest_message,
+        history,
+    )
+    calendar_text = safe_calendar_customer_text(
+        state,
+        calendar_result,
+    )
+
+    parts = []
+
+    if body:
+        parts.append(body)
+
+    if calendar_text and calendar_text.lower() not in body.lower():
+        parts.append(calendar_text)
+
+    if next_required_detail == "handoff":
+        handoff = (
+            "Veronika will confirm the appointment with you shortly."
+        )
+
+        if handoff.lower() not in "\n\n".join(parts).lower():
+            parts.append(handoff)
+
+    elif next_question:
+        combined = "\n\n".join(parts).lower()
+
+        if next_question.lower() not in combined:
+            parts.append(next_question)
+
+    if not parts:
+        parts.append(
+            next_question
+            or "Thanks. Veronika will follow up with you shortly."
+        )
+
+    return collapse_repeated_reply_content(
+        "\n\n".join(parts)
+    )
+
+
+def add_manual_multi_treatment_note(
+    state: dict,
+    extractor_result: dict,
+) -> dict:
+    result = dict(state)
+    mentioned = []
+
+    for value in extractor_result.get("mentioned_treatments") or []:
+        cleaned = str(value).strip()
+
+        if cleaned and cleaned not in mentioned:
+            mentioned.append(cleaned)
+
+    if len(mentioned) < 2:
+        return result
+
+    note = (
+        "Customer mentioned multiple treatments: "
+        + ", ".join(mentioned)
+        + ". Exact arrangement should be confirmed manually by Veronika."
+    )
+    result["notes"] = merge_notes(
+        result.get("notes"),
+        note,
+    )
+
+    return result
 
 
 @app.post("/chat")
 async def chat(
     request: ChatRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
 ):
-    request_source = normalise_source(request.source)
-    multi_booking_enabled = (
-        advanced_multi_booking_enabled()
+    """
+    State-first two-pass receptionist flow.
+
+    Supabase is the source of truth. The extractor proposes a hidden patch.
+    Python validates, saves, checks the calendar, and calculates one next
+    action. The responder then writes a natural reply using verified state.
+    """
+    request_source = normalise_source(
+        request.source
     )
 
     save_message(
@@ -11514,999 +6691,84 @@ async def chat(
         source=request_source,
     )
 
-    existing_before_processing = get_existing_conversation(
+    current_state = get_existing_conversation(
         request.session_id
     )
+    services_context = build_authoritative_services_context()
+    business_context = load_business_documents_context()
 
-    if customer_mentions_unknown_treatment(
-        request.message,
-        existing_before_processing,
-    ):
-        reply = build_unknown_treatment_reply()
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if (
-        needs_massage_variant(existing_before_processing)
-        and customer_asks_for_treatment_options(
-            request.message
-        )
-    ):
-        reply = build_massage_variant_prompt()
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if (
-        multi_booking_enabled
-        and customer_asks_for_booking_summary(
-            request.message
-        )
-    ):
-        reply = build_customer_booking_summary(
-            request.session_id
-        )
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if (
-        booking_request_is_complete(existing_before_processing)
-        and (
-            not multi_booking_enabled
-            or not has_pending_booking_actions(
-                request.session_id
-            )
-        )
-        and is_simple_acknowledgement(request.message)
-    ):
-        reply = "Thanks. The therapist will confirm the appointment shortly."
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    response = supabase.table("documents").select("content").execute()
-
-    live_massage_context, massage_from_supabase = (
-        format_live_massage_services_context()
-    )
-    live_vitamin_context, vitamin_shots_from_supabase = (
-        format_live_vitamin_shot_services_context()
-    )
-    live_ultrasound_context, ultrasound_from_supabase = (
-        format_live_ultrasound_services_context()
-    )
-    live_body_treatment_context, body_treatments_from_supabase = (
-        format_live_body_treatment_services_context()
-    )
-    live_microneedling_context, microneedling_from_supabase = (
-        format_live_microneedling_services_context()
-    )
-    live_facial_context, facials_from_supabase = (
-        format_live_facial_services_context()
-    )
-    live_dermal_filler_context, dermal_fillers_from_supabase = (
-        format_live_dermal_filler_services_context()
+    extractor_result = extract_hidden_state_patch(
+        current_state=current_state,
+        latest_message=request.message,
+        history=request.history,
+        services_context=services_context,
     )
 
-    context_rows = []
-
-    for item in response.data or []:
-        content = str(item.get("content") or "")
-
-        # Dashboard hours are authoritative. Ignore old free-text opening-hours
-        # rows so they cannot override live owner settings.
-        if re.match(r"(?i)^\s*opening\s+hours\s*:", content):
-            continue
-
-        # The structured public.services table is authoritative for massage.
-        # Prevent older free-text massage rows from conflicting with live rows.
-        if (
-            massage_from_supabase
-            and re.match(
-                r"(?i)^\s*(?:relaxing|swedish|hot\s+stone|deep\s+tissue)\s+massage\s*:",
-                content,
-            )
-        ):
-            continue
-
-        if (
-            vitamin_shots_from_supabase
-            and re.match(
-                r"(?i)^\s*(?:b12\s+vitamin\s+shot|vitamin\s+c\s+shot)\s*:",
-                content,
-            )
-        ):
-            continue
-
-        if (
-            ultrasound_from_supabase
-            and re.match(
-                r"(?i)^\s*ultrasound\s*:",
-                content,
-            )
-        ):
-            continue
-
-        if (
-            body_treatments_from_supabase
-            and re.match(
-                r"(?i)^\s*(?:body\s+sculpting\s+treatment|"
-                r"electronic\s+muscle\s+stimulation\s*\(ems\))\s*:",
-                content,
-            )
-        ):
-            continue
-
-        if (
-            microneedling_from_supabase
-            and re.match(
-                r"(?i)^\s*microneedling\s+for\s+1\s+area",
-                content,
-            )
-        ):
-            continue
-
-        if (
-            facials_from_supabase
-            and re.match(
-                r"(?i)^\s*(?:deep\s+facial\s+cleanse|"
-                r"radio\s+frequency\s+facial|"
-                r"facial\s+treatment\s+for\s+young\s+skin|"
-                r"hydraface\s+facial\s+treatment|"
-                r"hydrafacial(?:\s+for\s+90\s+minutes)?)\s*:",
-                content,
-            )
-        ):
-            continue
-
-        if (
-            dermal_fillers_from_supabase
-            and re.match(
-                r"(?i)^\s*dermal\s+filler",
-                content,
-            )
-        ):
-            continue
-
-        context_rows.append(content)
-
-    context_rows.append(live_massage_context)
-    context_rows.append(live_vitamin_context)
-    context_rows.append(live_ultrasound_context)
-    context_rows.append(live_body_treatment_context)
-    context_rows.append(live_microneedling_context)
-    context_rows.append(live_facial_context)
-    context_rows.append(live_dermal_filler_context)
-
-    context = "\n".join(context_rows) if context_rows else "No information available."
-
-    history_lines = [
-        f"{msg.role}: {msg.content}"
-        for msg in request.history[-20:]
-    ]
-
-    latest_already_present = (
-        bool(request.history)
-        and request.history[-1].content.strip() == request.message.strip()
+    merged_state = apply_validated_state_patch(
+        existing_state=current_state,
+        extractor_result=extractor_result,
+        latest_message=request.message,
+        history=request.history,
+    )
+    merged_state = add_manual_multi_treatment_note(
+        merged_state,
+        extractor_result,
     )
 
-    if not latest_already_present:
-        history_lines.append(f"customer: {request.message}")
-
-    conversation_history = "\n".join(history_lines[-20:])
-
-    if multi_booking_enabled:
-        pending_multi_service_reply = (
-            handle_pending_multi_service_detail_reply(
-                session_id=request.session_id,
-                latest_message=request.message,
-            )
-        )
-
-        if pending_multi_service_reply:
-            save_message(
-                session_id=request.session_id,
-                role="assistant",
-                content=pending_multi_service_reply,
-                source=request_source,
-            )
-
-            return {"reply": pending_multi_service_reply}
-
-        initial_multi_service_reply = (
-            handle_initial_multi_service_intake(
-                session_id=request.session_id,
-                latest_message=request.message,
-                source=request_source,
-            )
-        )
-
-        if initial_multi_service_reply:
-            save_message(
-                session_id=request.session_id,
-                role="assistant",
-                content=initial_multi_service_reply,
-                source=request_source,
-            )
-
-            return {"reply": initial_multi_service_reply}
-
-    else:
-        manual_multi_treatment_reply = (
-            handle_simple_multi_treatment_handoff(
-                session_id=request.session_id,
-                latest_message=request.message,
-                source=request_source,
-            )
-        )
-
-        if manual_multi_treatment_reply:
-            save_message(
-                session_id=request.session_id,
-                role="assistant",
-                content=manual_multi_treatment_reply,
-                source=request_source,
-            )
-
-            return {"reply": manual_multi_treatment_reply}
-
-    extracted_lead = extract_lead_data(conversation_history)
-    existing_lead = get_existing_conversation(request.session_id)
-    explicit_cart_intent = (
-        detect_treatment_cart_intent(
-            session_id=request.session_id,
-            latest_message=request.message,
-            existing_lead=existing_lead,
-        )
-        if multi_booking_enabled
-        else None
-    )
-    pending_cart_resolution = (
-        (
-            None
-            if explicit_cart_intent
-            else detect_pending_cart_action_resolution(
-                session_id=request.session_id,
-                latest_message=request.message,
-            )
-        )
-        if multi_booking_enabled
-        else None
-    )
-    cart_intent = (
-        explicit_cart_intent
-        or pending_cart_resolution
-    )
-    merged_lead = merge_lead_data(existing_lead, extracted_lead)
-
-    previous_assistant_message = next(
-        (
-            msg.content
-            for msg in reversed(request.history)
-            if msg.role == "assistant"
-        ),
-        "",
-    )
-
-    if customer_rejected_calendar_alternatives(
-        request.message,
-        previous_assistant_message,
-    ):
-        merged_lead["preferred_date"] = None
-        merged_lead["preferred_time"] = None
-        merged_lead["status"] = "details_incomplete"
-        merged_lead["notification_sent_at"] = None
-
-        save_conversation_overview(
-            session_id=request.session_id,
-            lead_data=merged_lead,
-            source=request_source,
-        )
-
-        reply = (
-            "No problem. Which day and time would suit you instead? "
-            "I can check the available slots."
-        )
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    merged_lead = apply_latest_message_fallbacks(
-        merged_lead,
-        request.message,
-        previous_assistant_message,
-    )
-
-    merged_lead = preserve_existing_booking_details(
-        existing_lead,
-        merged_lead,
-        request.message,
-        previous_assistant_message,
-    )
-
-    merged_lead = apply_fixed_treatment_details(
-        merged_lead,
+    booking_flow_active = has_booking_intent_state(
+        current_state,
+        extractor_result,
         request.message,
     )
 
-    merged_lead = apply_dynamic_massage_details(
-        merged_lead,
-        request.message,
-    )
-
-    merged_lead = apply_dynamic_vitamin_shot_details(
-        merged_lead,
-        request.message,
-    )
-
-    merged_lead = apply_dynamic_ultrasound_details(
-        merged_lead,
-        request.message,
-    )
-
-    merged_lead = apply_dynamic_body_treatment_details(
-        merged_lead,
-        request.message,
-    )
-
-    merged_lead = apply_dynamic_microneedling_details(
-        merged_lead,
-        request.message,
-    )
-
-    merged_lead = apply_dynamic_facial_details(
-        merged_lead,
-        request.message,
-    )
-
-    merged_lead = apply_dynamic_dermal_filler_details(
-        merged_lead,
-        request.message,
-    )
-
-    if cart_intent:
-        merged_lead = restore_existing_primary_treatment(
-            existing_lead,
-            merged_lead,
-        )
-        service_switch = None
-    else:
-        merged_lead, service_switch = apply_generic_service_switch_controller(
-            existing_lead=existing_lead,
-            lead_data=merged_lead,
-            latest_message=request.message,
-        )
-
-    merged_lead = normalise_misplaced_preferred_fields(
-        merged_lead,
-        request.message,
-    )
-
-    merged_lead = apply_authoritative_schedule_fields(
-        merged_lead,
-        existing_lead,
-        request.message,
-    )
-
-    merged_lead = recover_schedule_from_customer_history(
-        merged_lead,
-        conversation_history,
-        request.message,
-    )
-
-    merged_lead = apply_core_latest_message_state(
-        merged_lead,
-        request.message,
-        previous_assistant_message,
-    )
-
-    booking_flow_active = conversation_has_booking_intent(
-        conversation_history,
-        request.message,
-        previous_assistant_message,
-        merged_lead,
-    )
-
-    merged_lead, today_is_unavailable = clear_expired_same_day_preference(
-        merged_lead,
-    )
-
-    merged_lead = align_status_with_booking_intent(
-        merged_lead,
+    merged_state = apply_canonical_controller_state(
+        merged_state,
         booking_flow_active,
+        {"status": "not_checked"},
     )
 
-    merged_lead = apply_conversation_controller_state(
-        merged_lead,
-        booking_flow_active=booking_flow_active,
-        calendar_result={"status": "not_checked"},
-    )
-
-    merged_lead, validation_issue = validate_latest_customer_details(
-        merged_lead,
+    calendar_result = verified_calendar_result_for_state(
+        merged_state,
+        booking_flow_active,
         request.message,
-        previous_assistant_message,
-        skip_contact_validation=(
-            bool(service_switch)
-            or bool(cart_intent)
-            or customer_message_interrupts_contact_collection(
-                request.message
-            )
-        ),
     )
 
-    save_conversation_overview(
-        session_id=request.session_id,
-        lead_data=merged_lead,
-        source=request_source,
-    )
-
-    if validation_issue:
-        if validation_issue.startswith("invalid_duration:"):
-            options = validation_issue.split(":", 1)[1]
-            reply = f"Please choose one of the available durations: {options}."
-        elif validation_issue == "invalid_name":
-            reply = "Please enter your name."
-        else:
-            reply = "Please enter a valid phone number, including the area code."
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if booking_flow_active:
-        calendar_lead = calendar_lead_for_cart_action(
-            merged_lead,
-            cart_intent,
-        )
-        calendar_result = check_requested_calendar_slot(
-            calendar_lead,
-            request.message,
-        )
-
-        calendar_should_be_visible = should_surface_calendar_result(
-            request.message,
-            existing_lead,
-            merged_lead,
-        )
-    else:
-        calendar_result = {
-            "status": "not_requested",
-            "message": (
-                "The customer is asking for information only. "
-                "Do not start collecting booking details yet."
-            ),
-        }
-        calendar_should_be_visible = False
-
-    calendar_context = format_calendar_result(
-        calendar_result,
-        calendar_should_be_visible,
-    )
-
+    # Clear an unusable slot before calculating the next question. The
+    # suggested alternatives remain available in calendar_result.
     if calendar_result.get("status") in {
         "outside_hours",
         "closed_day",
         "past",
         "busy",
     }:
-        merged_lead["preferred_time"] = None
+        merged_state["preferred_time"] = None
 
         if calendar_result.get("clear_date"):
-            merged_lead["preferred_date"] = None
+            merged_state["preferred_date"] = None
 
-        merged_lead["status"] = "details_incomplete"
-        merged_lead["notification_sent_at"] = None
-
-        save_conversation_overview(
-            session_id=request.session_id,
-            lead_data=merged_lead,
-            source=request_source,
-        )
-
-    merged_lead = apply_conversation_controller_state(
-        merged_lead,
-        booking_flow_active=booking_flow_active,
-        calendar_result=calendar_result,
+    merged_state = apply_canonical_controller_state(
+        merged_state,
+        booking_flow_active,
+        calendar_result,
     )
 
     save_conversation_overview(
         session_id=request.session_id,
-        lead_data=merged_lead,
+        lead_data=merged_state,
         source=request_source,
     )
 
-    cart_result = None
-
-    if (
-        cart_intent
-        and cart_intent.get("action") == "add_same_visit"
-    ):
-        cart_result = sync_same_visit_treatment_item(
-            session_id=request.session_id,
-            lead_data=merged_lead,
-            cart_intent=cart_intent,
-        )
-
-        if (
-            cart_result
-            and cart_result.get("status") in {
-                "added",
-                "already_present",
-            }
-        ):
-            if cart_intent.get("pending_action_id"):
-                update_pending_booking_action_status(
-                    int(cart_intent["pending_action_id"]),
-                    "resolved",
-                )
-
-            selected_identity = (
-                cart_intent.get("selected_identity")
-                or {}
-            )
-            resolve_matching_pending_booking_actions(
-                request.session_id,
-                selected_identity.get("service_name"),
-            )
-    elif not cart_intent:
-        sync_single_treatment_draft_request(
-            session_id=request.session_id,
-            lead_data=merged_lead,
-            booking_flow_active=booking_flow_active,
-        )
-
-    missing_fields = (
-        [
-            field
-            for field in REQUIRED_BOOKING_FIELDS
-            if merged_lead.get(field) in [None, ""]
-        ]
-        if booking_flow_active
-        else []
-    )
-
-    confirmed_details = format_confirmed_details(merged_lead)
-    missing_details = (
-        ", ".join(field.replace("_", " ") for field in missing_fields)
-        if missing_fields
-        else "None"
-    )
-
-    next_question_hint = build_next_question_hint(
-        missing_fields,
-        merged_lead,
-    )
-    customer_date_label = format_customer_date(
-        merged_lead.get("preferred_date")
-    )
-    live_business_hours = format_live_business_hours()
-    service_switch_context = format_service_switch_context(
-        service_switch
-    )
-
-    if (
-        cart_intent
-        and cart_intent.get("action")
-        == "clarify_visit_structure"
-    ):
-        save_pending_booking_action(
-            session_id=request.session_id,
-            selected_identity=(
-                cart_intent.get("selected_identity")
-                or {}
-            ),
-            source_message=request.message,
-        )
-
-        reply = build_visit_structure_clarification_reply(
-            cart_intent.get("selected_identity") or {}
-        )
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if (
-        cart_intent
-        and cart_intent.get("action")
-        == "cancel_pending_action"
-    ):
-        pending_action = (
-            cart_intent.get("pending_action") or {}
-        )
-
-        if pending_action.get("id"):
-            update_pending_booking_action_status(
-                int(pending_action["id"]),
-                "cancelled",
-            )
-
-        reply = (
-            "No problem. I have removed that unfinished treatment "
-            "request. Your existing appointment request is unchanged."
-        )
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if (
-        cart_intent
-        and cart_intent.get("action")
-        == "create_separate_request"
-    ):
-        separate_result = create_separate_draft_booking_request(
-            session_id=request.session_id,
-            pending_action=(
-                cart_intent.get("pending_action")
-                or {}
-            ),
-            existing_lead=existing_lead,
-        )
-
-        if (
-            separate_result
-            and separate_result.get("status") == "created"
-        ):
-            reply = build_separate_request_started_reply(
-                separate_result,
-                request.session_id,
-            )
-        elif (
-            separate_result
-            and separate_result.get("status") == "needs_duration"
-        ):
-            service_name = str(
-                separate_result.get("selected_service_name")
-                or "the additional treatment"
-            )
-            reply = (
-                f"Before I start a separate request for {service_name}, "
-                "how long would you like the session for?"
-            )
-        else:
-            reply = (
-                "I could not start the separate appointment request just "
-                "now. Your original request is still saved unchanged. "
-                "Please try again shortly or call 07943319617."
-            )
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if cart_result:
-        if cart_result.get("status") == "needs_duration":
-            reply = (
-                "How long would you like the additional treatment for? "
-                "Once you tell me, I can add it to the same visit and "
-                "recheck the full appointment time."
-            )
-        else:
-            reply = build_same_visit_added_reply(
-                cart_result=cart_result,
-                lead_data=merged_lead,
-                calendar_result=calendar_result,
-                missing_fields=missing_fields,
-            )
-            reply = append_pending_action_reminder(
-                reply,
-                request.session_id,
-            )
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    if (
-        is_simple_acknowledgement(request.message)
-        and booking_request_is_complete(merged_lead)
-        and (
-            not multi_booking_enabled
-            or not has_pending_booking_actions(
-                request.session_id
-            )
-        )
-    ):
-        reply = "Thanks. The therapist will confirm the appointment shortly."
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        background_tasks.add_task(
-            send_booking_notification,
-            request.session_id
-        )
-
-        return {"reply": reply}
-
-    if (
-        not booking_flow_active
-        and is_simple_acknowledgement(request.message)
-    ):
-        reply = "You're welcome."
-
-        save_message(
-            session_id=request.session_id,
-            role="assistant",
-            content=reply,
-            source=request_source,
-        )
-
-        return {"reply": reply}
-
-    settings = load_chatbot_settings()
-    style_instructions = build_style_instructions(settings)
-
-    prompt = f"""
-You are Receptionist, the virtual receptionist for Veronika Wellness & Aesthetics in Leeds.
-
-Your job is to answer like a real human receptionist, not like a database.
-Never present yourself as Veronika. If you need to refer to the person providing the treatment, say "the therapist".
-
-{style_instructions}
-
-Locked rules:
-- Keep replies extremely concise and natural. Usually use one short sentence. Use two only when necessary.
-- Answer the customer's question first.
-- If BOOKING FLOW ACTIVE says No, treat the message as an informational enquiry. Do not ask for the customer's name, phone number, preferred date, preferred time, or duration. You may briefly ask whether they would like to book only when it feels natural.
-- If BOOKING FLOW ACTIVE says Yes, follow NEXT QUESTION TARGET. It may combine up to two closely related missing details in one concise question when sensible.
-- Follow NEXT QUESTION TARGET closely.
-- If SERVICE SWITCH CONTEXT says the customer changed treatment, acknowledge the change briefly, use the new treatment only, and do not reuse an old duration that no longer applies.
-- Do not repeat a treatment name immediately after the customer has just chosen it unless clarification is genuinely needed.
-- Do not repeat prices, dates, times, durations, or availability unless the customer asks or the information has changed.
-- Do not list duration options unless duration is the next missing detail.
-- If duration is the next missing detail, use NEXT QUESTION TARGET. Never offer massage durations for a non-massage treatment.
-- If a treatment has one fixed duration listed under CONFIRMED CUSTOMER DETAILS, do not ask the customer to choose a session length. Continue directly to the next missing booking detail.
-- For a generic vitamin-shot enquiry, ask whether the customer wants B12 or Vitamin C. Both are fixed 15-minute treatments. Do not ask the customer to choose a duration.
-- Do not repeat hello twice.
-- Avoid filler such as "I've noted that down", "just to confirm", "we offer", "to proceed", and "the requested time currently looks available" unless genuinely needed.
-- Use the conversation history to understand short replies.
-- Do not ask the customer to repeat information they already gave.
-- Never ask again for any detail listed under CONFIRMED CUSTOMER DETAILS.
-- Ask naturally for only the missing details. Asking for two closely related details together is encouraged when NEXT QUESTION TARGET combines them.
-- Follow the CALENDAR AVAILABILITY RESULT exactly.
-- LIVE DASHBOARD WORKING HOURS are the only authoritative opening hours. Ignore any older opening-hours text elsewhere in the business information.
-- The "Massage services (authoritative live catalogue)" block is the only authoritative source for massage names, durations, and prices. Ignore older conflicting massage text elsewhere.
-- The "Vitamin-shot services (authoritative live catalogue)" block is the only authoritative source for vitamin-shot variants, durations, and prices. Ignore older conflicting vitamin-shot text elsewhere.
-- The "Ultrasound services (authoritative live catalogue)" block is the only authoritative source for ultrasound options, durations, and prices. For the package, check availability for the first 45-minute session only; the therapist arranges the remaining sessions manually.
-- The "Body-treatment services (authoritative live catalogue)" block is the only authoritative source for Body Sculpting and EMS durations and prices. Ignore older conflicting body-treatment text elsewhere.
-- The "Microneedling services (authoritative live catalogue)" block is the only authoritative source for microneedling variants, durations, and prices. Ignore older conflicting microneedling text elsewhere.
-- The "Facial services (authoritative live catalogue)" block is the only authoritative source for facial names, durations, and prices. Ignore older conflicting facial text elsewhere.
-- The "Dermal-filler services (authoritative live catalogue)" block is the only authoritative source for dermal-filler variants, durations, and prices. Ignore older conflicting dermal-filler text elsewhere.
-- When listing fixed-price service options or when the customer asks how much a structured fixed-price service costs, state the price clearly before continuing the booking flow.
-- If the requested day is closed or the requested slot is unavailable, do not collect contact details yet. If duration is missing, ask for duration first so the backend can calculate valid alternatives. If alternatives are supplied, ask the customer to choose one first.
-- If a valid date and time are already confirmed, never ask "What time would you prefer?" again.
-- If CALENDAR AVAILABILITY RESULT says Visibility: silent, do not mention calendar availability.
-- When speaking to the customer, use CUSTOMER-FACING DATE LABEL. Say "today" or "tomorrow" where appropriate. Never show an ISO date such as 2026-06-01 to the customer unless they explicitly ask for the exact date.
-- If a requested slot is busy, outside working hours, or in the past, say it once briefly and ask for another preferred time. Never treat that time as accepted.
-- If a requested slot appears free, say it once briefly and clearly state that the therapist still needs to confirm.
-- Never accept an unsupported session duration. Massage durations must match the allowed options.
-- Never suggest, infer, default, or invent a specific date or time unless it comes from the customer's message or from calendar alternatives. If the customer has not supplied a date, ask for it.
-- Treat explicit customer dates such as "14th of June", "14 June", "June 14th", and "14/06" as valid dates. Do not ask for the day again after one of these has been supplied.
-- If the calendar cannot be checked, do not guess. Say the therapist will check and confirm.
-- Never reveal private calendar event details.
-- Never say a booking is confirmed, reserved, or completed.
-- Never say the therapist will confirm shortly while any required booking detail is still missing.
-- Settle an acceptable preferred date and time before asking for the customer's name or phone number. This order is mandatory.
-- If the customer rejects proposed alternative slots, ask for a different preferred day and time. Do not collect contact details yet.
-- A complete booking request requires: treatment, duration, name, phone number, preferred date, and preferred time.
-- If asked "am I booked?", answer clearly: "Not yet. The therapist still needs to confirm the appointment."
-- If the customer only says "ok", "thanks", "fantastic", or a similar acknowledgement after giving all details, do not reinterpret it as booking information and do not alter the date or time. Reply briefly: "Thanks. The therapist will confirm the appointment shortly."
-- When the customer asks a side question while also providing a booking detail, answer the side question briefly and then ask for the next missing booking detail.
-- Never list every service at once unless the customer asks for a full price list.
-- If asked what services are offered, give the main categories first.
-- Then ask what they are interested in.
-- If the client asks which treatment would suit them, recommend only a suitable treatment based on what they said.
-- Use the business information below only.
-- Do not invent prices, times, treatments, availability, or policies.
-- Stay focused only on Veronika Wellness & Aesthetics.
-- Only answer questions about treatments, prices, booking requests, availability, location, opening hours, preparation, aftercare, and the customer's treatment needs.
-- If the customer asks about an unrelated topic, politely redirect them back to Veronika's services.
-- Relaxing massage is a style of normal massage, not a separate specialist treatment.
-- Never ask for a deposit.
-- Never take payment.
-- Never confirm that an appointment is booked.
-- Put the handover confirmation on a new line so the message is easy to read.
-- If unsure, suggest calling 07943319617.
-- Authoritative contact details: phone 07943319617; address 25 Albion Place, Leeds, LS1 6JS.
-- If the business information below contains a conflicting phone number or address, ignore the older conflicting value and use the authoritative contact details above.
-
-CONFIRMED CUSTOMER DETAILS:
-{confirmed_details}
-
-MISSING REQUIRED DETAILS:
-{missing_details}
-
-NEXT QUESTION TARGET:
-{next_question_hint}
-
-BOOKING FLOW ACTIVE:
-{"Yes" if booking_flow_active else "No"}
-
-SERVICE SWITCH CONTEXT:
-{service_switch_context}
-
-TODAY BOOKING CONTEXT:
-{"The business cannot accept any more appointments today. Never suggest today and never ask what time today." if today_is_unavailable or not business_can_accept_more_bookings_today(parse_duration_minutes(merged_lead.get("duration"))) else "The business may still have time remaining today, but never assume the customer wants today unless they explicitly say so."}
-
-CUSTOMER-FACING DATE LABEL:
-{customer_date_label}
-
-CALENDAR AVAILABILITY RESULT:
-{calendar_context}
-
-LIVE DASHBOARD WORKING HOURS:
-{live_business_hours}
-
-Business information:
-{context}
-
-Conversation history:
-{conversation_history}
-
-Reply as Receptionist:
-"""
-
-    completion = groq_client.chat.completions.create(
-        model=LIVE_CHAT_MODEL,
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        reasoning_effort=LIVE_CHAT_REASONING_EFFORT,
-        include_reasoning=False,
-        temperature=0.5,
-        max_completion_tokens=LIVE_CHAT_MAX_COMPLETION_TOKENS,
-    )
-
-    reply = completion.choices[0].message.content
-    reply = normalise_reply_line_breaks(reply)
-    reply = sanitise_booking_claims(reply)
-    reply = remove_invalid_fixed_duration_questions(
-        reply,
-        merged_lead,
-    )
-    reply = remove_premature_booking_questions(
-        reply,
-        booking_flow_active,
-    )
-    reply = remove_invalid_today_time_questions(
-        reply,
-        today_is_unavailable,
-    )
-    reply = remove_redundant_confirmed_field_questions(
-        reply,
-        merged_lead,
-    )
-
-    if booking_flow_active:
-        reply = remove_false_handover_confirmation(
-            reply,
-            missing_fields,
-        )
-
-        if calendar_result.get("status") in {
-            "busy_needs_duration",
-            "needs_duration_for_alternatives",
-        }:
-            reply = build_duration_needed_for_alternatives_reply(
-                merged_lead,
-                calendar_result,
-            )
-        elif calendar_result.get("suggestions"):
-            if calendar_result.get("status") == "suggestions":
-                reply = build_direct_calendar_suggestions_reply(
-                    calendar_result,
-                )
-            else:
-                reply = build_calendar_alternative_reply(
-                    calendar_result,
-                )
-        else:
-            reply = append_single_deterministic_followup(
-                reply,
-                merged_lead,
-                missing_fields,
-            )
-
-    reply = finalise_dynamic_service_reply(
-        reply=reply,
-        latest_message=request.message,
-        lead_data=merged_lead,
-        missing_fields=missing_fields,
+    reply = compose_verified_customer_reply(
+        state=merged_state,
+        extractor_result=extractor_result,
         calendar_result=calendar_result,
-    )
-
-    if service_switch:
-        reply = build_service_switch_reply(
-            lead_data=merged_lead,
-            missing_fields=missing_fields,
-            calendar_result=calendar_result,
-        )
-
-    if (
-        booking_flow_active
-        and calendar_result.get("suggestions")
-    ):
-        if calendar_result.get("status") == "suggestions":
-            reply = build_direct_calendar_suggestions_reply(
-                calendar_result
-            )
-        else:
-            reply = build_calendar_alternative_reply(
-                calendar_result
-            )
-
-    if multi_booking_enabled:
-        reply = suppress_contact_collection_while_pending(
-            reply,
-            request.session_id,
-        )
-
-    reply = collapse_repeated_reply_content(
-        reply
+        next_required_detail=merged_state.get(
+            "next_required_detail"
+        ),
+        business_context=business_context,
+        services_context=services_context,
+        latest_message=request.message,
+        history=request.history,
     )
 
     save_message(
@@ -12518,7 +6780,8 @@ Reply as Receptionist:
 
     background_tasks.add_task(
         send_booking_notification,
-        request.session_id
+        request.session_id,
     )
 
     return {"reply": reply}
+
