@@ -93,6 +93,7 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+GOOGLE_CALENDAR_LAST_DIAGNOSTIC = "not_checked"
 
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
 INSTAGRAM_ACCOUNT_ID = os.getenv("INSTAGRAM_ACCOUNT_ID")
@@ -4942,6 +4943,12 @@ def google_oauth_is_configured() -> bool:
     ])
 
 
+def set_google_calendar_diagnostic(code: str):
+    global GOOGLE_CALENDAR_LAST_DIAGNOSTIC
+    GOOGLE_CALENDAR_LAST_DIAGNOSTIC = code
+    print(f"google_calendar_diagnostic={code}")
+
+
 def create_google_oauth_state() -> str:
     if not GOOGLE_OAUTH_STATE_SECRET:
         raise RuntimeError("GOOGLE_OAUTH_STATE_SECRET is missing.")
@@ -5006,8 +5013,8 @@ def get_google_refresh_token() -> str | None:
         if response.data:
             return response.data[0].get("refresh_token")
 
-    except Exception as error:
-        print(f"Could not load Google refresh token: {error}")
+    except Exception:
+        set_google_calendar_diagnostic("refresh_token_load_failed")
 
     return None
 
@@ -5042,10 +5049,11 @@ def refresh_google_access_token() -> str | None:
     refresh_token = get_google_refresh_token()
 
     if not refresh_token:
+        set_google_calendar_diagnostic("missing_stored_refresh_token")
         return None
 
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        print("Could not refresh Google access token: missing OAuth credentials.")
+        set_google_calendar_diagnostic("oauth_credentials_missing")
         return None
 
     try:
@@ -5069,14 +5077,32 @@ def refresh_google_access_token() -> str | None:
         with urllib_request.urlopen(token_request, timeout=15) as response:
             token_data = json.loads(response.read().decode("utf-8"))
 
-        return token_data.get("access_token")
+        access_token = token_data.get("access_token")
 
-    except urllib_error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        print(f"Could not refresh Google access token: HTTP {error.code} {body}")
+        if not access_token:
+            set_google_calendar_diagnostic(
+                "access_token_missing_from_refresh_response"
+            )
+            return None
 
-    except Exception as error:
-        print(f"Could not refresh Google access token: {error}")
+        set_google_calendar_diagnostic("access_token_refreshed")
+        return access_token
+
+    except urllib_error.HTTPError:
+        set_google_calendar_diagnostic("refresh_token_request_failed")
+
+    except TimeoutError:
+        set_google_calendar_diagnostic("network_timeout")
+
+    except urllib_error.URLError as error:
+        set_google_calendar_diagnostic(
+            "network_timeout"
+            if isinstance(error.reason, TimeoutError)
+            else "refresh_token_request_failed"
+        )
+
+    except Exception:
+        set_google_calendar_diagnostic("unexpected_exception")
 
     return None
 
@@ -5202,6 +5228,10 @@ def query_google_freebusy(
     start_time: datetime,
     end_time: datetime,
 ) -> list[dict] | None:
+    if not GOOGLE_CALENDAR_ID:
+        set_google_calendar_diagnostic("calendar_id_missing")
+        return None
+
     access_token = refresh_google_access_token()
 
     if not access_token:
@@ -5231,24 +5261,53 @@ def query_google_freebusy(
         with urllib_request.urlopen(freebusy_request, timeout=15) as response:
             freebusy_data = json.loads(response.read().decode("utf-8"))
 
-        calendar_data = (
-            freebusy_data
-            .get("calendars", {})
-            .get(GOOGLE_CALENDAR_ID, {})
-        )
-
-        if calendar_data.get("errors"):
-            print(f"Google Calendar freeBusy returned errors: {calendar_data['errors']}")
+        if not isinstance(freebusy_data, dict):
+            set_google_calendar_diagnostic("malformed_api_response")
             return None
 
-        return calendar_data.get("busy", [])
+        calendars = freebusy_data.get("calendars")
 
-    except urllib_error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        print(f"Google Calendar freeBusy failed: HTTP {error.code} {body}")
+        if not isinstance(calendars, dict):
+            set_google_calendar_diagnostic("malformed_api_response")
+            return None
 
-    except Exception as error:
-        print(f"Google Calendar freeBusy failed: {error}")
+        calendar_data = calendars.get(GOOGLE_CALENDAR_ID)
+
+        if not isinstance(calendar_data, dict):
+            set_google_calendar_diagnostic("malformed_api_response")
+            return None
+
+        if calendar_data.get("errors"):
+            set_google_calendar_diagnostic("freebusy_api_failure")
+            return None
+
+        busy = calendar_data.get("busy")
+
+        if not isinstance(busy, list):
+            set_google_calendar_diagnostic("malformed_api_response")
+            return None
+
+        set_google_calendar_diagnostic("freebusy_success")
+        return busy
+
+    except urllib_error.HTTPError:
+        set_google_calendar_diagnostic("freebusy_http_error")
+
+    except TimeoutError:
+        set_google_calendar_diagnostic("network_timeout")
+
+    except urllib_error.URLError as error:
+        set_google_calendar_diagnostic(
+            "network_timeout"
+            if isinstance(error.reason, TimeoutError)
+            else "unexpected_exception"
+        )
+
+    except json.JSONDecodeError:
+        set_google_calendar_diagnostic("malformed_api_response")
+
+    except Exception:
+        set_google_calendar_diagnostic("unexpected_exception")
 
     return None
 
@@ -6235,8 +6294,7 @@ async def google_calendar_callback(
 async def google_calendar_status():
     return {
         "connected": bool(get_google_refresh_token()),
-        "calendar_id": GOOGLE_CALENDAR_ID,
-        "scope": GOOGLE_CALENDAR_SCOPE,
+        "last_diagnostic_code": GOOGLE_CALENDAR_LAST_DIAGNOSTIC,
     }
 
 
@@ -6358,10 +6416,36 @@ def compact_recent_history(history: list[ChatMessage], limit: int = 12) -> str:
     lines = []
 
     for message in history[-limit:]:
-        role = "Customer" if message.role == "user" else "Receptionist"
+        role = (
+            "Customer"
+            if message.role in {"user", "customer"}
+            else "Receptionist"
+        )
         lines.append(f"{role}: {message.content}")
 
     return "\n".join(lines)
+
+
+def merge_recent_history(
+    client_history: list[ChatMessage],
+    persisted_history: list[ChatMessage],
+    limit: int = 20,
+) -> list[ChatMessage]:
+    """Prefer persisted messages while retaining unsaved client context."""
+    merged = []
+    seen = set()
+
+    for message in [*persisted_history, *client_history]:
+        role = "user" if message.role in {"user", "customer"} else "assistant"
+        key = (role, str(message.content or "").strip())
+
+        if not key[1] or key in seen:
+            continue
+
+        seen.add(key)
+        merged.append(ChatMessage(role=role, content=key[1]))
+
+    return merged[-limit:]
 
 
 def empty_extractor_result() -> dict:
@@ -7046,6 +7130,9 @@ def sanitise_natural_responder_body(reply: str) -> str:
         r"(?i)\b(?:at|around)\s+\d{1,2}\b",
         r"(?i)\b(?:which|what|when|how long|would you like|do you prefer|could you|can you)\b",
         r"(?i)\b(?:tell|send|share|provide|give|need|let me know)\b[^.!?\n]*\b(?:name|phone|number|date|day|time|duration|treatment|service)\b",
+        r"(?i)\bveronika will (?:review|be in touch|get back to you)\b",
+        r"(?i)\blooking forward to welcoming you\b",
+        r"(?i)\bif there is anything else you would like to know\b",
     ]
     safe_sentences = []
 
@@ -7062,6 +7149,31 @@ def sanitise_natural_responder_body(reply: str) -> str:
 
     return collapse_repeated_reply_content(
         " ".join(safe_sentences)
+    )
+
+
+def latest_assistant_reply(history: list[ChatMessage]) -> str:
+    for message in reversed(history):
+        if message.role not in {"user", "customer"}:
+            return str(message.content or "")
+
+    return ""
+
+
+def customer_explicitly_asks_availability(message: str) -> bool:
+    cleaned = str(message or "").lower()
+    return (
+        asks_for_next_available_time(cleaned)
+        or any(
+            phrase in cleaned
+            for phrase in [
+                "availability",
+                "available",
+                "is it free",
+                "is that free",
+                "is the slot free",
+            ]
+        )
     )
 
 
@@ -7155,11 +7267,20 @@ def compose_verified_customer_reply(
     # Suggested slots are fully deterministic because the model must never
     # invent alternatives or rewrite date labels.
     if calendar_result.get("suggestions"):
-        return collapse_repeated_reply_content(
+        alternative_reply = collapse_repeated_reply_content(
             build_calendar_alternative_reply(
                 calendar_result
             )
         )
+
+        if (
+            alternative_reply
+            and alternative_reply in latest_assistant_reply(history)
+            and not customer_explicitly_asks_availability(latest_message)
+        ):
+            return "Thanks."
+
+        return alternative_reply
 
     body = generate_natural_reply_body(
         state,
@@ -7173,6 +7294,14 @@ def compose_verified_customer_reply(
         state,
         calendar_result,
     )
+    previous_reply = latest_assistant_reply(history)
+
+    if (
+        calendar_text
+        and calendar_text in previous_reply
+        and not customer_explicitly_asks_availability(latest_message)
+    ):
+        calendar_text = ""
 
     parts = []
 
@@ -7193,7 +7322,10 @@ def compose_verified_customer_reply(
             "Veronika will confirm the appointment with you shortly."
         )
 
-        if handoff.lower() not in "\n\n".join(parts).lower():
+        if (
+            handoff.lower() not in "\n\n".join(parts).lower()
+            and handoff.lower() not in previous_reply.lower()
+        ):
             parts.append(handoff)
 
     elif next_question:
@@ -7205,7 +7337,7 @@ def compose_verified_customer_reply(
     if not parts:
         parts.append(
             next_question
-            or "Thanks. Veronika will follow up with you shortly."
+            or "Thanks."
         )
 
     return collapse_repeated_reply_content(
@@ -7286,11 +7418,8 @@ def load_simple_draft_request(
         if response.data:
             return response.data[0]
 
-    except Exception as error:
-        print(
-            "Could not load simple draft request: "
-            f"{error}"
-        )
+    except Exception:
+        print("projection_draft_load_failed")
 
     return None
 
@@ -7315,11 +7444,8 @@ def next_simple_request_number(
                 ) or 0
             ) + 1
 
-    except Exception as error:
-        print(
-            "Could not calculate simple request number: "
-            f"{error}"
-        )
+    except Exception:
+        print("projection_request_number_failed")
 
     return 1
 
@@ -7328,7 +7454,7 @@ def sync_simple_single_request_projection(
     session_id: str,
     state: dict,
     booking_flow_active: bool,
-):
+) -> bool:
     """
     Mirror the canonical single-treatment lead into the relational dashboard.
 
@@ -7336,21 +7462,24 @@ def sync_simple_single_request_projection(
     separate appointment drafts, or multi-booking workflow logic.
     """
     if not booking_flow_active:
-        return
+        print("projection_skipped_inactive_booking_flow")
+        return False
 
     metadata = authoritative_service_metadata(
         state.get("treatment")
     )
 
     if not metadata:
-        return
+        print("projection_skipped_missing_metadata")
+        return False
 
     duration_minutes = parse_duration_minutes(
         state.get("duration")
     )
 
     if duration_minutes is None:
-        return
+        print("projection_skipped_missing_duration")
+        return False
 
     price_pence = simple_request_price_pence(
         metadata,
@@ -7380,26 +7509,35 @@ def sync_simple_single_request_projection(
             request_id = int(
                 request_row["id"]
             )
-            (
+            response = (
                 supabase.table("booking_requests")
                 .update(request_payload)
                 .eq("id", request_id)
                 .execute()
             )
+
+            if not response.data:
+                print("projection_request_update_failed")
+                return False
         else:
             request_payload["request_number"] = (
                 next_simple_request_number(
                     session_id
                 )
             )
-            response = (
-                supabase.table("booking_requests")
-                .insert(request_payload)
-                .execute()
-            )
+            try:
+                response = (
+                    supabase.table("booking_requests")
+                    .insert(request_payload)
+                    .execute()
+                )
+            except Exception:
+                print("projection_request_insert_failed")
+                return False
 
             if not response.data:
-                return
+                print("projection_request_insert_failed")
+                return False
 
             request_id = int(
                 response.data[0]["id"]
@@ -7425,25 +7563,33 @@ def sync_simple_single_request_projection(
             .execute()
         )
 
-        if existing_item_response.data:
-            (
-                supabase.table("booking_items")
-                .update(item_payload)
-                .eq(
-                    "id",
-                    existing_item_response.data[0]["id"],
+        try:
+            if existing_item_response.data:
+                item_response = (
+                    supabase.table("booking_items")
+                    .update(item_payload)
+                    .eq(
+                        "id",
+                        existing_item_response.data[0]["id"],
+                    )
+                    .execute()
                 )
-                .execute()
-            )
-        else:
-            (
-                supabase.table("booking_items")
-                .insert(item_payload)
-                .execute()
-            )
+            else:
+                item_response = (
+                    supabase.table("booking_items")
+                    .insert(item_payload)
+                    .execute()
+                )
+
+            if not item_response.data:
+                print("projection_item_update_failed")
+                return False
+        except Exception:
+            print("projection_item_update_failed")
+            return False
 
         try:
-            (
+            link_response = (
                 supabase.table("conversations")
                 .update({
                     "active_booking_request_id": request_id,
@@ -7451,17 +7597,19 @@ def sync_simple_single_request_projection(
                 .eq("session_id", session_id)
                 .execute()
             )
-        except Exception as error:
-            print(
-                "Could not link simple request projection: "
-                f"{error}"
-            )
 
-    except Exception as error:
-        print(
-            "Could not sync simple request projection: "
-            f"{error}"
-        )
+            if not link_response.data:
+                print("projection_conversation_link_failed")
+                return False
+        except Exception:
+            print("projection_conversation_link_failed")
+            return False
+
+        return True
+
+    except Exception:
+        print("projection_request_update_failed")
+        return False
 
 
 CANONICAL_SAVE_FAILURE_REPLY = (
@@ -7496,13 +7644,17 @@ async def chat(
     current_state = get_existing_conversation(
         request.session_id
     )
+    effective_history = merge_recent_history(
+        request.history,
+        load_recent_messages(request.session_id),
+    )
     services_context = build_authoritative_services_context()
     business_context = load_business_documents_context()
 
     extractor_result = extract_hidden_state_patch(
         current_state=current_state,
         latest_message=request.message,
-        history=request.history,
+        history=effective_history,
         services_context=services_context,
     )
 
@@ -7510,7 +7662,7 @@ async def chat(
         existing_state=current_state,
         extractor_result=extractor_result,
         latest_message=request.message,
-        history=request.history,
+        history=effective_history,
     )
     merged_state = add_manual_multi_treatment_note(
         merged_state,
@@ -7542,19 +7694,6 @@ async def chat(
         request.message,
     )
 
-    # Clear an unusable slot before calculating the next question. The
-    # suggested alternatives remain available in calendar_result.
-    if calendar_result.get("status") in {
-        "outside_hours",
-        "closed_day",
-        "past",
-        "busy",
-    }:
-        merged_state["preferred_time"] = None
-
-        if calendar_result.get("clear_date"):
-            merged_state["preferred_date"] = None
-
     merged_state = apply_canonical_controller_state(
         merged_state,
         booking_flow_active,
@@ -7584,7 +7723,7 @@ async def chat(
         business_context=business_context,
         services_context=services_context,
         latest_message=request.message,
-        history=request.history,
+        history=effective_history,
     )
 
     save_message(
