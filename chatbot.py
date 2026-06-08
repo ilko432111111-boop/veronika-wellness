@@ -319,6 +319,15 @@ def parse_relative_date_from_text(
     reference_date: str | None = None,
 ) -> str | None:
     lower_message = str(message or "").lower()
+
+    # Common mobile typing variations. Keep this intentionally conservative:
+    # only normalise phrases that clearly mean "tomorrow".
+    lower_message = re.sub(
+        r"\btom\s+more\b|\btomorow\b|\btommorow\b|\btomorroww+\b",
+        "tomorrow",
+        lower_message,
+    )
+
     today = datetime.now(BUSINESS_TIMEZONE).date()
 
     reference = None
@@ -496,6 +505,45 @@ def parse_time_from_text(message: str) -> str | None:
 
         return f"{hour:02d}:{minute}"
 
+    descriptive_time_match = re.search(
+        r"\b(?:at\s*|around\s*)?"
+        r"(1[0-2]|0?[1-9])"
+        r"(?:[:.]([0-5]\d))?\s*"
+        r"(?:o['’]?clock\s*)?"
+        r"(?:in\s+the\s+)?"
+        r"(morning|afternoon|evening)\b",
+        lower_message,
+    )
+
+    if descriptive_time_match:
+        hour = int(descriptive_time_match.group(1))
+        minute = descriptive_time_match.group(2) or "00"
+        period = descriptive_time_match.group(3)
+
+        if period in {"afternoon", "evening"} and hour != 12:
+            hour += 12
+        elif period == "morning" and hour == 12:
+            hour = 0
+
+        return f"{hour:02d}:{minute}"
+
+    oclock_match = re.search(
+        r"\b(?:at\s*|around\s*)?"
+        r"(1[0-2]|0?[1-9])\s*"
+        r"o['’]?clock\b",
+        lower_message,
+    )
+
+    if oclock_match:
+        hour = int(oclock_match.group(1))
+
+        # Salon appointments are daytime appointments. With no am/pm marker,
+        # interpret 1-7 o'clock as afternoon.
+        if 1 <= hour <= 7:
+            hour += 12
+
+        return f"{hour:02d}:00"
+
     twenty_four_hour_match = re.search(
         r"\b(?:at\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b",
         lower_message,
@@ -511,6 +559,19 @@ def parse_time_from_text(message: str) -> str | None:
             hour += 12
 
         return f"{hour:02d}:{minute}"
+
+    bare_hour_match = re.search(
+        r"\b(?:at|around)\s+(1[0-2]|0?[1-9])\b",
+        lower_message,
+    )
+
+    if bare_hour_match:
+        hour = int(bare_hour_match.group(1))
+
+        if 1 <= hour <= 7:
+            hour += 12
+
+        return f"{hour:02d}:00"
 
     return None
 
@@ -822,6 +883,9 @@ def looks_like_customer_name(message: str) -> bool:
     if lower_message in rejected:
         return False
 
+    if message_looks_like_schedule_input(cleaned):
+        return False
+
     if any(char.isdigit() for char in cleaned):
         return False
 
@@ -880,6 +944,193 @@ def explicit_duration_minutes_from_reply(
             return value
 
     return None
+
+
+def message_looks_like_schedule_input(
+    message: str,
+) -> bool:
+    """
+    Detect customer replies that are probably schedule details or corrections,
+    not names.
+    """
+    cleaned = normalise_service_match_text(
+        message
+    )
+
+    return bool(
+        parse_relative_date_from_text(message)
+        or parse_time_from_text(message)
+        or re.search(
+            r"\b(?:today|tomorrow|tom\s+more|morning|afternoon|evening|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            cleaned,
+        )
+    )
+
+
+def parse_name_from_contact_message(
+    message: str,
+) -> str | None:
+    """
+    Extract a simple name from a combined reply such as:
+      "Ilko 07123456789"
+    """
+    phone = parse_phone_from_text(
+        message
+    )
+
+    if not phone:
+        return None
+
+    index = str(message).find(phone)
+
+    if index <= 0:
+        return None
+
+    possible_name = str(message)[:index].strip(" ,.-")
+
+    if looks_like_customer_name(
+        possible_name
+    ):
+        return possible_name
+
+    return None
+
+
+def latest_message_attempts_phone(
+    message: str,
+) -> bool:
+    """
+    A schedule answer such as "Thursday 2pm" must not be rejected merely
+    because the previous bot question also requested a phone number.
+    """
+    digit_runs = re.findall(
+        r"\d",
+        str(message or ""),
+    )
+
+    return len(digit_runs) >= 6
+
+
+def latest_message_attempts_name(
+    message: str,
+    previous_assistant_message: str,
+) -> bool:
+    lower_previous = str(
+        previous_assistant_message or ""
+    ).lower()
+
+    if "name" not in lower_previous:
+        return False
+
+    if message_looks_like_schedule_input(
+        message
+    ):
+        return False
+
+    if parse_phone_from_text(message):
+        return bool(
+            parse_name_from_contact_message(message)
+        )
+
+    return looks_like_customer_name(
+        message
+    )
+
+
+def extract_latest_customer_facts(
+    latest_message: str,
+    previous_assistant_message: str,
+    current_lead: dict,
+) -> dict:
+    """
+    Parse each supported field independently from the newest customer message.
+
+    The order of details does not matter. A customer may provide treatment,
+    duration, date, time and contact information in one natural sentence.
+    """
+    facts = {}
+
+    preferred_date = parse_relative_date_from_text(
+        latest_message,
+        reference_date=current_lead.get(
+            "preferred_date"
+        ),
+    )
+    preferred_time = parse_time_from_text(
+        latest_message
+    )
+    phone = parse_phone_from_text(
+        latest_message
+    )
+    duration = explicit_duration_minutes_from_reply(
+        latest_message,
+        previous_assistant_message,
+        current_lead.get("treatment"),
+    )
+    name = parse_name_from_contact_message(
+        latest_message
+    )
+
+    if (
+        not name
+        and "name" in str(previous_assistant_message or "").lower()
+        and looks_like_customer_name(latest_message)
+        and not message_looks_like_schedule_input(latest_message)
+    ):
+        name = str(latest_message).strip()
+
+    if preferred_date:
+        facts["preferred_date"] = preferred_date
+
+    if preferred_time:
+        facts["preferred_time"] = preferred_time
+
+    if phone:
+        facts["phone"] = phone
+
+    if duration is not None:
+        facts["duration"] = format_minutes_as_duration(
+            duration
+        )
+
+    if name:
+        facts["name"] = name
+
+    return facts
+
+
+def apply_core_latest_message_state(
+    lead_data: dict,
+    latest_message: str,
+    previous_assistant_message: str,
+) -> dict:
+    """
+    Merge valid newest-message facts into the saved lead state.
+
+    Never clear an existing value merely because the customer answered a
+    different question. Explicit newer details win.
+    """
+    result = dict(lead_data)
+    facts = extract_latest_customer_facts(
+        latest_message,
+        previous_assistant_message,
+        result,
+    )
+
+    for field, value in facts.items():
+        if value not in [None, ""]:
+            result[field] = value
+
+    result["status"] = calculate_lead_status(
+        result,
+        result.get("status"),
+    )
+
+    if result["status"] != "booking_request_complete":
+        result["notification_sent_at"] = None
+
+    return result
 
 
 def apply_latest_message_fallbacks(
@@ -4335,6 +4586,9 @@ def is_valid_customer_name(value: str | None) -> bool:
     if lower_value in rejected_phrases:
         return False
 
+    if message_looks_like_schedule_input(cleaned):
+        return False
+
     if any(char.isdigit() for char in cleaned):
         return False
 
@@ -4435,22 +4689,34 @@ def validate_latest_customer_details(
                 + format_duration_options(allowed_durations),
             )
 
-    if not skip_contact_validation and "name" in lower_previous:
-        if not is_valid_customer_name(result.get("name")):
-            result["name"] = None
-            result["status"] = "details_incomplete"
-            result["notification_sent_at"] = None
-            return result, "invalid_name"
+    if (
+        not skip_contact_validation
+        and latest_message_attempts_name(
+            latest_message,
+            previous_assistant_message,
+        )
+        and not is_valid_customer_name(
+            result.get("name")
+        )
+    ):
+        result["name"] = None
+        result["status"] = "details_incomplete"
+        result["notification_sent_at"] = None
+        return result, "invalid_name"
 
     if (
         not skip_contact_validation
-        and ("phone" in lower_previous or "number" in lower_previous)
+        and latest_message_attempts_phone(
+            latest_message
+        )
+        and not is_valid_phone_number(
+            result.get("phone")
+        )
     ):
-        if not is_valid_phone_number(result.get("phone")):
-            result["phone"] = None
-            result["status"] = "details_incomplete"
-            result["notification_sent_at"] = None
-            return result, "invalid_phone"
+        result["phone"] = None
+        result["status"] = "details_incomplete"
+        result["notification_sent_at"] = None
+        return result, "invalid_phone"
 
     result["status"] = calculate_lead_status(
         result,
@@ -5199,9 +5465,13 @@ def build_schedule_first_question(lead_data: dict) -> str:
     Ask only for the unsettled schedule detail. This is deliberately separate
     from the LLM so the booking order cannot drift.
     """
+    treatment = lead_data.get("treatment")
     duration = lead_data.get("duration")
     preferred_date = lead_data.get("preferred_date")
     preferred_time = lead_data.get("preferred_time")
+
+    if treatment in [None, ""]:
+        return ""
 
     if needs_massage_variant(lead_data):
         return build_massage_variant_prompt()
@@ -11140,11 +11410,90 @@ def handle_simple_multi_treatment_handoff(
         source=source,
     )
 
-    return (
+    missing_fields = [
+        field
+        for field in REQUIRED_BOOKING_FIELDS
+        if lead_data.get(field) in [None, ""]
+    ]
+    next_question = build_deterministic_next_question(
+        lead_data,
+        missing_fields,
+    )
+
+    opening = (
         f"Of course. I have noted that you are interested in "
         f"{treatment_names}. Veronika will confirm the exact arrangement "
-        "with you manually. Which day and time would suit you, and could "
-        "I take your name and phone number?"
+        "with you manually."
+    )
+
+    return (
+        opening
+        + (f"\n\n{next_question}" if next_question else "")
+    )
+
+
+def customer_asks_for_service_menu(
+    message: str,
+) -> bool:
+    cleaned = normalise_service_match_text(
+        message
+    )
+
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "what do you offer",
+            "what treatments do you have",
+            "which treatments do you have",
+            "what services do you have",
+            "which services do you have",
+            "what can you do",
+        ]
+    )
+
+
+def customer_mentions_unknown_treatment(
+    message: str,
+    existing_lead: dict,
+) -> bool:
+    """
+    Clarify an unrecognised requested treatment instead of advancing a form.
+    """
+    if existing_lead.get("treatment"):
+        return False
+
+    if customer_asks_for_service_menu(
+        message
+    ):
+        return False
+
+    if (
+        resolve_latest_structured_service(
+            message
+        )
+        or resolve_latest_generic_or_partial_service(
+            message
+        )
+    ):
+        return False
+
+    cleaned = normalise_service_match_text(
+        message
+    )
+
+    return bool(
+        re.search(
+            r"\b(?:treatment|therapy|massage|facial|filler|injection|"
+            r"appointment|book)\b",
+            cleaned,
+        )
+    )
+
+
+def build_unknown_treatment_reply() -> str:
+    return (
+        "Sorry, I am not sure which treatment you mean. "
+        "Could you tell me a little more about what you are looking for?"
     )
 
 
@@ -11168,6 +11517,21 @@ async def chat(
     existing_before_processing = get_existing_conversation(
         request.session_id
     )
+
+    if customer_mentions_unknown_treatment(
+        request.message,
+        existing_before_processing,
+    ):
+        reply = build_unknown_treatment_reply()
+
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+
+        return {"reply": reply}
 
     if (
         needs_massage_variant(existing_before_processing)
@@ -11560,6 +11924,12 @@ async def chat(
         merged_lead,
         conversation_history,
         request.message,
+    )
+
+    merged_lead = apply_core_latest_message_state(
+        merged_lead,
+        request.message,
+        previous_assistant_message,
     )
 
     booking_flow_active = conversation_has_booking_intent(
@@ -12115,6 +12485,19 @@ Reply as Receptionist:
             missing_fields=missing_fields,
             calendar_result=calendar_result,
         )
+
+    if (
+        booking_flow_active
+        and calendar_result.get("suggestions")
+    ):
+        if calendar_result.get("status") == "suggestions":
+            reply = build_direct_calendar_suggestions_reply(
+                calendar_result
+            )
+        else:
+            reply = build_calendar_alternative_reply(
+                calendar_result
+            )
 
     if multi_booking_enabled:
         reply = suppress_contact_collection_while_pending(
