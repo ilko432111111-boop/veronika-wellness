@@ -1,0 +1,6 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+Codex Installer.exe
+Microsoft.Services.Store.winmd
