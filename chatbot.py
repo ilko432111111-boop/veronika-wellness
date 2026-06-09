@@ -631,6 +631,22 @@ def explicit_duration_minutes_from_reply(
     if direct is not None:
         return direct
 
+    word_hour_match = re.search(
+        r"\b(?:an|one|two)\s+hours?\b",
+        str(latest_message or "").lower(),
+    )
+
+    if word_hour_match:
+        word_hour_minutes = (
+            120
+            if word_hour_match.group(0).startswith("two")
+            else 60
+        )
+        allowed = allowed_durations_for_treatment(treatment)
+
+        if not allowed or word_hour_minutes in allowed:
+            return word_hour_minutes
+
     lower_previous = str(
         previous_assistant_message or ""
     ).lower()
@@ -7064,6 +7080,7 @@ def apply_validated_state_patch(
     # customer message explicitly supplies it; never trust an extractor guess.
     parsed_duration = explicit_duration_minutes_from_reply(
         latest_message,
+        previous_assistant_message=latest_assistant_reply(history),
         treatment=result.get("treatment"),
     )
 
@@ -7473,6 +7490,7 @@ IMPORTANT LOCKED RULES:
 - Do not ask any question or request any missing booking detail.
 - Answer a customer's side question briefly when possible.
 - Do not repeat information unnecessarily.
+- Return clean plain text only. Do not use Markdown emphasis, headings, tables, backticks, or Markdown bullets.
 - If the customer asks what services are offered, answer using the supplied business information and service catalogue.
 
 NEWEST CUSTOMER MESSAGE:
@@ -7507,7 +7525,9 @@ def sanitise_natural_responder_body(reply: str) -> str:
     addresses, prices, durations, opening hours, or phone numbers survive.
     """
     cleaned = strip_model_booking_questions(
-        normalise_reply_line_breaks(reply)
+        strip_customer_markdown(
+            normalise_reply_line_breaks(reply)
+        )
     )
     safe_sentences = []
 
@@ -7525,6 +7545,29 @@ def sanitise_natural_responder_body(reply: str) -> str:
     return collapse_repeated_reply_content(
         " ".join(safe_sentences)
     )
+
+
+def strip_customer_markdown(reply: str) -> str:
+    """Render model-written customer replies as clean, safe plain text."""
+    cleaned = normalise_reply_line_breaks(reply)
+    cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*[-*+]\s+", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$", "", cleaned)
+    cleaned = re.sub(
+        r"(?m)^\s*\|(.+)\|\s*$",
+        lambda match: " - ".join(
+            cell.strip()
+            for cell in match.group(1).split("|")
+            if cell.strip()
+        ),
+        cleaned,
+    )
+    cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.+?)__", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`\n]+)`", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def sentence_contains_forbidden_booking_claim(sentence: str) -> bool:
@@ -7940,8 +7983,10 @@ def compose_verified_customer_reply(
         else:
             parts.append("Thanks.")
 
-    return collapse_repeated_reply_content(
-        "\n\n".join(parts)
+    return strip_customer_markdown(
+        collapse_repeated_reply_content(
+            "\n\n".join(parts)
+        )
     )
 
 

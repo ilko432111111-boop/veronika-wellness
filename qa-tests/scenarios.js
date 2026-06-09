@@ -119,5 +119,24 @@ module.exports = [
       { text: "Ilko" },
       { text: "07700900116" }
     ]
+  },
+  {
+    name: "hot-stone-short-duration-and-plain-text",
+    messages: [
+      {
+        text: "Do you offer massages?",
+        expectAnswerAny: ["massage", "hot stone"]
+      },
+      {
+        text: "How much is hot stone 30 minutes?",
+        expectAnswerAny: ["hot stone", "60", "55"],
+        expectQuestionTypes: ["duration"]
+      },
+      {
+        text: "60 then",
+        forbidQuestionTypes: ["duration"],
+        expectQuestionTypes: ["date"]
+      }
+    ]
   }
 ];

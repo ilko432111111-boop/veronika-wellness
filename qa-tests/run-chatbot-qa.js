@@ -151,6 +151,7 @@ function updateStateFromUser(state, message) {
     ["lip filler", "Lip Filler", false],
     ["deep tissue", "Deep Tissue Massage", true],
     ["relaxing massage", "Relaxing Massage", true],
+    ["hot stone", "Hot Stone Massage", true],
     ["ems", "EMS", true],
     ["ultrasound", "Ultrasound", false],
     ["massage", "Massage", false],
@@ -179,8 +180,14 @@ function updateStateFromUser(state, message) {
   }
 
   const duration = lower.match(/\b(30|45|60|90|120)\s*minutes?\b|\b(one|1|two|2)\s*hours?\b/);
-  if (duration) {
+  if (duration && durationAllowedForTrackedTreatment(state.treatment, duration[0])) {
     state.duration = duration[0];
+    state.availabilityVerified = false;
+  } else if (
+    asksQuestionType(state.lastBotReply, "duration") &&
+    /^\s*(30|45|60|90|120)(?:\s+then)?\s*[.!]?\s*$/i.test(text)
+  ) {
+    state.duration = text.match(/(30|45|60|90|120)/)[1] + " minutes";
     state.availabilityVerified = false;
   }
 
@@ -221,6 +228,18 @@ function updateStateFromUser(state, message) {
   ) {
     state.name = text.match(/^([a-z][a-z'-]+)/i)[1];
   }
+}
+
+function durationAllowedForTrackedTreatment(treatment, duration) {
+  const minutes = /\b(?:one|1)\s*hours?\b/i.test(duration)
+    ? 60
+    : /\b(?:two|2)\s*hours?\b/i.test(duration)
+      ? 120
+      : Number(String(duration).match(/\d+/)?.[0]);
+  const allowedByTreatment = {
+    "Hot Stone Massage": [60, 90, 120]
+  };
+  return !allowedByTreatment[treatment] || allowedByTreatment[treatment].includes(minutes);
 }
 
 function contactDetailsProvided(message) {
@@ -522,6 +541,23 @@ function detectIssues({ state, reply, step, turnContext = {} }) {
   const issues = [];
   const handoffDetected = HANDOFF_PATTERNS.some((pattern) => pattern.test(reply));
   const softHandoffDetected = SOFT_HANDOFF_PATTERNS.some((pattern) => pattern.test(reply));
+  const rawMarkdownDetected = (
+    /\*\*[^*\n]+\*\*/.test(reply) ||
+    /(?:^|\n)\s{0,3}#{1,6}\s+\S/m.test(reply) ||
+    /(?:^|\n)\s*\|.+\|\s*(?:\n|$)/m.test(reply) &&
+      /(?:^|\n)\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*(?:\n|$)/m.test(reply)
+  );
+
+  if (rawMarkdownDetected) {
+    issues.push(createIssue({
+      confidence: "definite failure",
+      category: "State Persistence",
+      message: "Customer-facing reply contains raw Markdown formatting.",
+      expected: "Return clean plain text without Markdown emphasis, headings, or tables.",
+      actual: reply,
+      reason: "The reply contains visible Markdown syntax that the plain-text chat UI does not render."
+    }));
+  }
 
   if (handoffDetected && !handoffEligibleForVisibleConversation(state)) {
     issues.push(createIssue({

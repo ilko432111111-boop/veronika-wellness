@@ -144,6 +144,58 @@ class Phase3ERemainingWorkflowTests(unittest.TestCase):
             "duration",
         )
 
+    def test_hot_stone_short_duration_replies_move_to_date(self):
+        history = [
+            self.chatbot.ChatMessage(
+                role="assistant",
+                content=(
+                    "How long would you like the session for: "
+                    "60, 90, or 120 minutes?"
+                ),
+            ),
+        ]
+
+        for message in ["60", "60 then", "60 minutes", "one hour", "1 hour"]:
+            with self.subTest(message=message), patch.object(
+                self.chatbot,
+                "apply_structured_service_resolution",
+                side_effect=lambda state, value: state,
+            ), patch.object(
+                self.chatbot,
+                "hydrate_configured_service_defaults",
+                side_effect=lambda state: state,
+            ):
+                state = self.chatbot.apply_validated_state_patch(
+                    existing_state={"treatment": "Hot Stone Massage"},
+                    extractor_result=self.chatbot.empty_extractor_result(),
+                    latest_message=message,
+                    history=history,
+                )
+
+            self.assertEqual(state["duration"], "1 hour")
+            self.assertEqual(
+                self.chatbot.compute_next_required_detail(state, True),
+                "preferred_date",
+            )
+
+    def test_customer_reply_markdown_is_rendered_as_plain_text(self):
+        reply = self.compose(
+            (
+                "### Massage options\n"
+                "- **Relaxing Massage** - 30 min (£35)\n"
+                "- `Hot Stone Massage` - 60 min (£55)"
+            ),
+            {},
+            "Do you offer massages?",
+            detail=None,
+        )
+
+        self.assertIn("Relaxing Massage - 30 min (£35)", reply)
+        self.assertIn("Hot Stone Massage - 60 min (£55)", reply)
+        self.assertNotIn("**", reply)
+        self.assertNotIn("###", reply)
+        self.assertNotIn("`", reply)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -653,6 +653,11 @@ messages.scrollTop = messages.scrollHeight;
 function cleanBotReply(reply) {
     return String(reply ?? "")
         .replace(/\\n/g, "\n")
+        .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+        .replace(/^\s*[-*+]\s+/gm, "")
+        .replace(/\*\*(.+?)\*\*/g, "$1")
+        .replace(/__(.+?)__/g, "$1")
+        .replace(/`([^`\n]+)`/g, "$1")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
 }
