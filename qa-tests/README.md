@@ -40,6 +40,15 @@ prints the pass/fail totals and the paths to all three reports.
 Each detected issue includes:
 
 - Confidence: `definite_failure`, `likely_failure`, or `informational_warning`.
+- One failure category:
+  - `Connection / Infrastructure`
+  - `Calendar / Availability`
+  - `Lead Capture`
+  - `Treatment Selection`
+  - `Service Switching`
+  - `Side Question Handling`
+  - `Premature Handoff`
+  - `State Persistence`
 - Expected behavior.
 - The exact bot reply.
 - Why the behavior is a problem.

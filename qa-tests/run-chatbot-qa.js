@@ -12,6 +12,16 @@ const JSON_REPORT = path.join(REPORT_DIR, "latest-report.json");
 const TEXT_TRANSCRIPTS = path.join(REPORT_DIR, "latest-transcripts.txt");
 const MARKDOWN_TRANSCRIPTS = path.join(REPORT_DIR, "latest-transcripts.md");
 const CLI_ARGS = process.argv.slice(2);
+const FAILURE_CATEGORIES = [
+  "Connection / Infrastructure",
+  "Calendar / Availability",
+  "Lead Capture",
+  "Treatment Selection",
+  "Service Switching",
+  "Side Question Handling",
+  "Premature Handoff",
+  "State Persistence"
+];
 
 const BASE_URL = process.env.QA_BASE_URL || "https://veronika-wellness.onrender.com";
 const HEADLESS = !CLI_ARGS.includes("--headed") &&
@@ -349,10 +359,46 @@ function issueImpact(message) {
   return "The reply does not satisfy the expected receptionist-flow behavior for this turn.";
 }
 
-function createIssue({ confidence, message, expected, actual, reason, likelyRootCause, suggestedFixDirection }) {
+function failureCategory(message, expected = "") {
+  const combined = `${message} ${expected}`;
+  if (/runner error|connection|network|timeout|reach|service health/i.test(combined)) {
+    return "Connection / Infrastructure";
+  }
+  if (/premature handoff|handoff wording|autonomously confirmed|reserved/i.test(combined)) {
+    return "Premature Handoff";
+  }
+  if (/side-question|informational answer/i.test(combined)) {
+    return "Side Question Handling";
+  }
+  if (/forbidden stale content|changed|latest supplied details/i.test(combined)) {
+    return "Service Switching";
+  }
+  if (/availability|calendar|slot|schedule|verified backend/i.test(combined)) {
+    return "Calendar / Availability";
+  }
+  if (/treatment|service detail|service choice|duration|variant|session length/i.test(combined)) {
+    return "Treatment Selection";
+  }
+  if (/\b(?:name|phone|mobile|contact number|customer detail)\b/i.test(combined)) {
+    return "Lead Capture";
+  }
+  return "State Persistence";
+}
+
+function createIssue({
+  confidence,
+  message,
+  expected,
+  actual,
+  reason,
+  likelyRootCause,
+  suggestedFixDirection,
+  category
+}) {
   const guidance = issueGuidance(message);
   return {
     confidence: formatConfidence(confidence),
+    category: category || failureCategory(message, expected),
     message,
     expected,
     actual,
@@ -539,6 +585,7 @@ function writeAnnotation(scenarioSlug, stepNumber, issues, screenshot) {
     "Detected issues:",
     ...issues.flatMap((issue) => [
       `- [${issue.confidence}] ${issue.message}`,
+      `  Failure category: ${issue.category}`,
       `  Expected: ${issue.expected}`,
       `  Actual: ${issue.actual}`,
       `  Why this is a problem: ${issue.whyProblem}`,
@@ -748,6 +795,7 @@ function issueFailsScenario(issue) {
 function appendPlainTextIssue(lines, issue, issueNumber) {
   lines.push(`ISSUE ${issueNumber}`);
   lines.push(`Confidence: ${formatConfidence(issue.confidence)}`);
+  lines.push(`Failure category: ${issue.category}`);
   lines.push(`Finding: ${formatIssue(issue)}`);
   lines.push("Expected:");
   lines.push(issue.expected);
@@ -770,6 +818,8 @@ function appendMarkdownIssue(lines, issue, issueNumber) {
   lines.push(`#### Issue ${issueNumber}`);
   lines.push("");
   lines.push(`**Confidence:** \`${formatConfidence(issue.confidence)}\``);
+  lines.push("");
+  lines.push(`**Failure category:** ${issue.category}`);
   lines.push("");
   lines.push(`**Finding:** ${formatIssue(issue)}`);
   lines.push("");
@@ -805,6 +855,9 @@ function textTranscripts(report) {
     `TIMEZONE: ${report.timezone}`,
     `PASSED: ${report.summary.passed}`,
     `FAILED: ${report.summary.failed}`,
+    "",
+    "FAILURE CATEGORIES:",
+    ...FAILURE_CATEGORIES.map((category) => `[ ] ${category}`),
     ""
   ];
 
@@ -857,6 +910,10 @@ function markdownTranscripts(report) {
     `- Scenarios: ${report.summary.total}`,
     `- Passed: ${report.summary.passed}`,
     `- Failed: ${report.summary.failed}`,
+    "",
+    "## Failure Categories",
+    "",
+    ...FAILURE_CATEGORIES.map((category) => `- [ ] ${category}`),
     ""
   ];
 
@@ -930,6 +987,7 @@ async function main() {
     baseUrl: BASE_URL,
     timezone: "Europe/London",
     screenshotsEnabled: TAKE_SCREENSHOTS,
+    failureCategories: FAILURE_CATEGORIES,
     scenarios: []
   };
   const browser = await chromium.launch({ headless: HEADLESS, slowMo: SLOW_MO });
@@ -971,6 +1029,7 @@ main().catch((error) => {
     baseUrl: BASE_URL,
     timezone: "Europe/London",
     screenshotsEnabled: TAKE_SCREENSHOTS,
+    failureCategories: FAILURE_CATEGORIES,
     summary: { total: 0, passed: 0, failed: 1 },
     runnerError: error.stack || error.message,
     scenarios: []
