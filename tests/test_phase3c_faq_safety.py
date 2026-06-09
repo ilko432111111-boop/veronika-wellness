@@ -343,7 +343,15 @@ class Phase3CActiveFlowReplyTests(unittest.TestCase):
     def setUpClass(cls):
         cls.chatbot = load_chatbot_module()
 
-    def compose(self, body, state, detail, message="thanks", history=None):
+    def compose(
+        self,
+        body,
+        state,
+        detail,
+        message="thanks",
+        history=None,
+        calendar=None,
+    ):
         with patch.object(
             self.chatbot,
             "generate_natural_reply_body",
@@ -352,7 +360,7 @@ class Phase3CActiveFlowReplyTests(unittest.TestCase):
             return self.chatbot.compose_verified_customer_reply(
                 state=state,
                 extractor_result=self.chatbot.empty_extractor_result(),
-                calendar_result={"status": "not_checked"},
+                calendar_result=calendar or {"status": "not_checked"},
                 next_required_detail=detail,
                 business_context="",
                 services_context="",
@@ -397,17 +405,28 @@ class Phase3CActiveFlowReplyTests(unittest.TestCase):
             "name": "Test Customer",
             "phone": "07000000000",
             "verified_alternatives": [],
+            "slot_status": "provisional_free",
+            "_canonical_save_succeeded": True,
         }
-        handoff = "Veronika will confirm the appointment with you shortly."
-        first = self.compose("", state, "handoff")
+        handoff = (
+            "Thank you, Test Customer. Your requested slot currently appears "
+            "free. Veronika will confirm the appointment with you shortly."
+        )
+        first = self.compose(
+            "",
+            state,
+            "handoff",
+            calendar={"status": "free"},
+        )
         second = self.compose(
             "",
             state,
             "handoff",
             history=[self.chatbot.ChatMessage(role="assistant", content=first)],
+            calendar={"status": "free"},
         )
 
-        self.assertEqual(first.count(handoff), 1)
+        self.assertEqual(first, handoff)
         self.assertNotIn(handoff, second)
         self.assertNotEqual(second, "Thanks.")
 

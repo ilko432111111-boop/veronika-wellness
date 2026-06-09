@@ -7217,6 +7217,59 @@ def compute_next_required_detail(
     return "handoff"
 
 
+def handoff_is_allowed(
+    state: dict,
+    calendar_result: dict | None,
+) -> bool:
+    """Return true only after a fully saved, backend-verified lead is ready."""
+    treatment = state.get("treatment")
+    canonical_treatment = canonical_treatment_from_text(
+        treatment,
+        str(treatment or ""),
+        treatment,
+    )
+    duration_minutes = parse_duration_minutes(
+        state.get("duration")
+    )
+    unresolved_variant = (
+        needs_massage_variant(state)
+        or needs_vitamin_shot_variant(state)
+        or needs_ultrasound_variant(state)
+        or needs_microneedling_variant(state)
+        or needs_facial_variant(state)
+        or needs_dermal_filler_variant(state)
+    )
+    calendar_status = str(
+        (calendar_result or {}).get("status") or ""
+    ).strip()
+    slot_status = str(
+        state.get("slot_status") or ""
+    ).strip()
+
+    return bool(
+        state.get("_canonical_save_succeeded") is True
+        and treatment not in [None, ""]
+        and canonical_treatment not in [None, ""]
+        and normalise_treatment_name(canonical_treatment)
+        == normalise_treatment_name(treatment)
+        and not unresolved_variant
+        and duration_minutes
+        and duration_minutes > 0
+        and duration_is_valid_for_treatment(
+            treatment,
+            state.get("duration"),
+        )
+        and state.get("preferred_date") not in [None, ""]
+        and state.get("preferred_time") not in [None, ""]
+        and calendar_status in {"free", "provisional_free"}
+        and slot_status in {"free", "provisional_free"}
+        and not active_verified_alternatives(state)
+        and state.get("name") not in [None, ""]
+        and state.get("phone") not in [None, ""]
+        and compute_next_required_detail(state, True) == "handoff"
+    )
+
+
 def render_next_question(
     state: dict,
     next_required_detail: str | None,
@@ -7308,6 +7361,12 @@ def apply_canonical_controller_state(
     elif (calendar_result or {}).get("status") == "free":
         result["verified_alternatives"] = []
 
+    if not handoff_is_allowed(
+        {**result, "_canonical_save_succeeded": True},
+        calendar_result,
+    ) and result["status"] == "booking_request_complete":
+        result["status"] = "details_incomplete"
+
     if result["status"] != "booking_request_complete":
         result["notification_sent_at"] = None
 
@@ -7383,13 +7442,10 @@ def safe_calendar_customer_text(
                     state.get("preferred_date"),
                     state.get("preferred_time"),
                 )
-                + " automatically. Veronika will check the availability "
-                "manually before confirming."
+                + " automatically."
             )
 
-        return (
-            "Veronika will need to check the availability manually."
-        )
+        return "I could not verify the requested availability automatically."
 
     return ""
 
@@ -7409,7 +7465,8 @@ Write a short, warm and natural reply to the customer's newest message.
 IMPORTANT LOCKED RULES:
 - The saved state below is authoritative.
 - Never mention, paraphrase, invent, or calculate availability, calendar results, dates, weekdays, times, or slots.
-- Never claim that an appointment is confirmed. Veronika confirms manually.
+- Never mention handoff, contacting Veronika, confirmation, review, follow-up, or passing the request on. Python will append final handoff wording if eligible.
+- Never claim that an appointment is confirmed.
 - Do not ask any question or request any missing booking detail.
 - Answer a customer's side question briefly when possible.
 - Do not repeat information unnecessarily.
@@ -7484,9 +7541,14 @@ def sentence_contains_forbidden_booking_claim(sentence: str) -> bool:
         r"(?i)\b(?:available|free|busy|unavailable)\b[^.!?]*\b(?:slot|appointment|requested time|requested date)\b",
         r"(?i)\b(?:calendar|schedule)\b[^.!?]*\b(?:shows|says|confirms|has|is|looks|appears)\b",
         r"(?i)\b(?:i(?:'ll| will)? have the therapist|the therapist will)\s+check\b[^.!?]*\bconfirm\b",
-        r"(?i)\b(?:we(?:'ll| will)|i(?:'ll| will))\s+pass\s+your\s+request\s+(?:on\s+)?to\s+veronika\b",
+        r"(?i)\b(?:we(?:['\u2019]ll| will)|i(?:['\u2019]ll| will))\s+pass\s+your\s+request\s+(?:on\s+)?to\s+veronika\b",
+        r"(?i)\b(?:we(?:['\u2019]ll| will)|i(?:['\u2019]ll| will))\s+pass\s+your\s+request\s+on\b",
+        r"(?i)\b(?:i(?:['\u2019]ll| will)|i have|i['\u2019]ve)\s+let\s+veronika\s+know\b",
         r"(?i)\bveronika will confirm(?: the appointment| it| your request)?(?: with you)?(?: shortly)?\b",
-        r"(?i)\bveronika will (?:review|be in touch|get back to you)\b",
+        r"(?i)\bveronika will (?:review|be in touch|contact you|get back to you|follow up)\b",
+        r"(?i)\b(?:she(?:['\u2019]ll| will)|the therapist will) (?:be in touch|contact you|get back to you|follow up|confirm)\b",
+        r"(?i)\bi(?:['\u2019]ve| have) noted your booking\b",
+        r"(?i)\byour booking request has been sent\b",
         r"(?i)\blooking forward to welcoming you\b",
         r"(?i)\bif there(?:'s| is) anything else you(?:'d| would) like to know\b",
     ]
@@ -7680,12 +7742,10 @@ def compose_verified_customer_reply(
         state.get("conversation_mode") == "booking_request"
         or next_required_detail is not None
     )
-    handoff_ready = (
-        next_required_detail == "handoff"
-        and booking_request_is_complete(state)
-        and not active_verified_alternatives(state)
+    handoff_ready = handoff_is_allowed(
+        state,
+        calendar_result,
     )
-    booked_status_handoff = ""
 
     # Suggested slots are fully deterministic because the model must never
     # invent alternatives or rewrite date labels.
@@ -7703,10 +7763,6 @@ def compose_verified_customer_reply(
             "Your request has been noted, but the appointment is not "
             "confirmed yet."
         )
-        if handoff_ready:
-            booked_status_handoff = (
-                "Veronika will confirm it with you shortly."
-            )
     elif extractor_result.get("verified_alternative_selected"):
         body = ""
     else:
@@ -7722,6 +7778,8 @@ def compose_verified_customer_reply(
         state,
         calendar_result,
     )
+    if handoff_ready:
+        calendar_text = ""
     previous_reply = latest_assistant_reply(history)
 
     if (
@@ -7769,8 +7827,10 @@ def compose_verified_customer_reply(
         parts.append(calendar_text)
 
     if handoff_ready:
-        handoff = booked_status_handoff or (
-            "Veronika will confirm the appointment with you shortly."
+        handoff = (
+            f"Thank you, {state.get('name')}. Your requested slot currently "
+            "appears free. Veronika will confirm the appointment with you "
+            "shortly."
         )
 
         if (
@@ -8069,7 +8129,7 @@ def sync_simple_single_request_projection(
 
 CANONICAL_SAVE_FAILURE_REPLY = (
     "Sorry, I could not safely save your request just now. "
-    "Please try again in a moment or call Veronika directly."
+    "Please try again in a moment."
 )
 
 
@@ -8197,6 +8257,8 @@ async def chat(
         source=request_source,
     ):
         return {"reply": CANONICAL_SAVE_FAILURE_REPLY}
+
+    merged_state["_canonical_save_succeeded"] = True
 
     sync_simple_single_request_projection(
         session_id=request.session_id,
