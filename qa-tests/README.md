@@ -1,8 +1,8 @@
 # Veronika Wellness Chatbot QA Runner
 
 This Playwright QA agent opens the live website, runs realistic customer
-conversations, captures every customer and assistant turn, and writes JSON and
-Markdown issue reports.
+conversations, records every customer and assistant turn, and writes
+transcript-first QA reports.
 
 ## Setup
 
@@ -29,10 +29,37 @@ $env:QA_TIMEOUT="120000"; npm run qa:chatbot
 
 Generated output:
 
-- `qa-tests/screenshots`: screenshots after every user message and bot reply.
-- `qa-tests/screenshots/*-issues.txt`: issue annotations linked to failed turns.
+- `qa-tests/reports/latest-transcripts.txt`: plain text transcripts designed for quick review.
+- `qa-tests/reports/latest-transcripts.md`: Markdown transcripts that are easy to paste into ChatGPT.
 - `qa-tests/reports/latest-report.json`: structured report for automation.
-- `qa-tests/reports/latest-report.md`: readable report.
+
+Each transcript includes the scenario name, pass/fail status, detected issues,
+the full user/bot conversation, and a scenario summary. The terminal also
+prints the pass/fail totals and the paths to all three reports.
+
+Each detected issue includes:
+
+- Confidence: `definite failure`, `likely failure`, or `informational warning`.
+- Expected behavior.
+- The exact bot reply.
+- The reason the detector raised the issue.
+
+`Definite failure` and `likely failure` findings fail a scenario.
+`Informational warning` findings are reported without failing the scenario.
+
+## Optional Screenshots
+
+Screenshots are disabled by default so the main output stays lightweight and
+text-focused. To capture screenshots after every user message and bot reply,
+change the setting near the top of `qa-tests/run-chatbot-qa.js`:
+
+```js
+const TAKE_SCREENSHOTS = true;
+```
+
+When enabled, screenshots are saved in `qa-tests/screenshots`. Issue annotation
+files are written beside the relevant failed-turn screenshots. When disabled,
+all tests, issue detection, transcripts, and JSON reporting still run normally.
 
 ## Add A Scenario
 

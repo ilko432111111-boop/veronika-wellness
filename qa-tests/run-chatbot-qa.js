@@ -3,11 +3,14 @@ const path = require("path");
 const { chromium } = require("playwright");
 const scenarios = require("./scenarios");
 
+const TAKE_SCREENSHOTS = false;
+
 const ROOT = __dirname;
 const SCREENSHOT_DIR = path.join(ROOT, "screenshots");
 const REPORT_DIR = path.join(ROOT, "reports");
 const JSON_REPORT = path.join(REPORT_DIR, "latest-report.json");
-const MARKDOWN_REPORT = path.join(REPORT_DIR, "latest-report.md");
+const TEXT_TRANSCRIPTS = path.join(REPORT_DIR, "latest-transcripts.txt");
+const MARKDOWN_TRANSCRIPTS = path.join(REPORT_DIR, "latest-transcripts.md");
 const CLI_ARGS = process.argv.slice(2);
 
 const BASE_URL = process.env.QA_BASE_URL || "https://veronika-wellness.onrender.com";
@@ -33,6 +36,8 @@ const SELECTORS = {
 const HANDOFF_PATTERNS = [
   /\b(?:i(?:'|\u2019)ll|i have|i(?:'|\u2019)ve)\s+let\s+veronika\s+know\b/i,
   /\b(?:i(?:'|\u2019)ll|we(?:'|\u2019)ll|i will|we will)\s+pass\s+(?:your\s+)?(?:request|details)\s+on\b/i,
+  /\b(?:i(?:'|\u2019)ll|we(?:'|\u2019)ll|i will|we will)\s+(?:be in touch|get back to you|follow up)\b/i,
+  /\b(?:i(?:'|\u2019)ll|we(?:'|\u2019)ll|i will|we will)\s+take care of (?:the )?rest\b/i,
   /\bveronika\s+will\s+(?:be in touch|contact|review|get back|follow up|confirm)\b/i,
   /\b(?:she|the therapist)\s+will\s+(?:be in touch|contact|get back|follow up|confirm)\b/i,
   /\b(?:request|details|booking request)\s+(?:has|have)\s+been\s+(?:sent|passed on|forwarded)\b/i
@@ -51,12 +56,19 @@ const AUTONOMOUS_CONFIRMATION_PATTERNS = [
 
 const QUESTION_PATTERNS = {
   treatment: /\b(?:which|what)\s+(?:treatment|service|massage|facial|filler)\b/i,
-  duration: /\b(?:how long|which duration|what duration|30|45|60|90|120 minutes)\b[^?]*\?/i,
+  duration: /\b(?:how long|what duration|which duration|choose (?:a |your )?(?:session )?length|select (?:a |your )?(?:session )?length|what session length|which session length)\b/i,
   date: /\b(?:which|what)\s+(?:day|date)\b[^?]*\?/i,
   time: /\b(?:which|what)\s+time\b[^?]*\?/i,
   name: /\b(?:your name|take your name)\b[^?]*\?/i,
   phone: /\b(?:phone|mobile|contact number)\b[^?]*\?/i
 };
+
+const DURATION_OPTION_REQUEST_PATTERNS = [
+  /\b(?:would you like|do you prefer|which would you prefer|please choose|choose|select|pick)\b[^?.!]{0,100}\b(?:30|45|60|90|120)\s*(?:minutes?|mins?)\b/i,
+  /\b(?:would you like|do you prefer|which would you prefer|please choose|choose|select|pick)\b[^?.!]{0,100}\b(?:one|two|1|2)\s*hours?\b/i,
+  /\b(?:30|45|60|90|120)\s*(?:minutes?|mins?)\b[^?.!]{0,100}\b(?:which|what)\s+(?:duration|session length)\b/i,
+  /\b30\s*\/\s*60\s*\/\s*90(?:\s*\/\s*120)?\s*(?:minutes?|mins?)?\s*\?/i
+];
 
 function ensureDirectories() {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
@@ -64,7 +76,8 @@ function ensureDirectories() {
 }
 
 function clearGeneratedOutputs() {
-  for (const directory of [SCREENSHOT_DIR, REPORT_DIR]) {
+  const directories = TAKE_SCREENSHOTS ? [SCREENSHOT_DIR, REPORT_DIR] : [REPORT_DIR];
+  for (const directory of directories) {
     for (const filename of fs.readdirSync(directory)) {
       if (filename === ".gitkeep") {
         continue;
@@ -197,7 +210,15 @@ function updateStateFromBot(state, reply) {
 }
 
 function asksQuestionType(reply, type) {
+  if (type === "duration") {
+    return asksForDuration(reply);
+  }
   return Boolean(QUESTION_PATTERNS[type] && QUESTION_PATTERNS[type].test(reply));
+}
+
+function asksForDuration(reply) {
+  return QUESTION_PATTERNS.duration.test(reply) ||
+    DURATION_OPTION_REQUEST_PATTERNS.some((pattern) => pattern.test(reply));
 }
 
 function countQuestions(reply) {
@@ -224,27 +245,47 @@ function handoffEligibleForVisibleConversation(state) {
   );
 }
 
+function createIssue({ confidence, message, expected, actual, reason }) {
+  return { confidence, message, expected, actual, reason };
+}
+
 function detectIssues({ state, reply, step }) {
   const issues = [];
   const handoffDetected = HANDOFF_PATTERNS.some((pattern) => pattern.test(reply));
 
   if (handoffDetected && !handoffEligibleForVisibleConversation(state)) {
-    issues.push(
-      "Premature handoff wording appeared before the visible conversation satisfied the required flow."
-    );
+    issues.push(createIssue({
+      confidence: "definite failure",
+      message: "Premature handoff wording appeared before the visible conversation satisfied the required flow.",
+      expected: "Continue collecting required booking details without implying handoff.",
+      actual: reply,
+      reason: "The reply used handoff wording before the visible conversation met handoff eligibility."
+    }));
   }
 
   if (AUTONOMOUS_CONFIRMATION_PATTERNS.some((pattern) => pattern.test(reply))) {
-    issues.push("The bot implied that the booking was autonomously confirmed or reserved.");
+    issues.push(createIssue({
+      confidence: "definite failure",
+      message: "The bot implied that the booking was autonomously confirmed or reserved.",
+      expected: "Act as a receptionist and do not confirm or reserve appointments autonomously.",
+      actual: reply,
+      reason: "The reply matched explicit autonomous confirmation or reservation wording."
+    }));
   }
 
-  const availabilityClaim = /\b(?:available|currently appears free|slot is free|fit you in)\b/i.test(reply);
+  const availabilityClaim = /\b(?:currently appears free|slot is free|appointment is available|time is available|can fit you in|availability (?:on|at))\b/i.test(reply);
   if (
     availabilityClaim &&
     !/currently appears free/i.test(reply) &&
     !(state.treatment && state.preferredDate && state.preferredTime)
   ) {
-    issues.push("The bot made an availability claim before enough schedule details were supplied.");
+    issues.push(createIssue({
+      confidence: "likely failure",
+      message: "The bot made an availability claim before enough schedule details were supplied.",
+      expected: "Only claim slot availability after treatment, date, and time are known and backend verification has run.",
+      actual: reply,
+      reason: "The reply used slot-availability wording before the visible conversation supplied enough schedule details."
+    }));
   }
 
   const alreadyKnown = {
@@ -257,48 +298,114 @@ function detectIssues({ state, reply, step }) {
   };
   for (const [type, known] of Object.entries(alreadyKnown)) {
     if (known && asksQuestionType(reply, type)) {
-      issues.push(`The bot asked for ${type} even though it was already supplied.`);
+      issues.push(createIssue({
+        confidence: "definite failure",
+        message: `The bot asked for ${type} even though it was already supplied.`,
+        expected: `${type[0].toUpperCase()}${type.slice(1)} already known.`,
+        actual: reply,
+        reason: `Bot explicitly requested ${type} again.`
+      }));
     }
   }
 
   if (countQuestions(reply) > 1) {
-    issues.push("The reply contains more than one workflow question.");
+    issues.push(createIssue({
+      confidence: "likely failure",
+      message: "The reply contains more than one workflow question.",
+      expected: "Ask at most one workflow question in the final reply.",
+      actual: reply,
+      reason: "The reply contains more than one question mark."
+    }));
   }
 
   if (step.expectAnswerAny && !hasAny(reply, step.expectAnswerAny)) {
-    issues.push(`Expected an informational answer containing one of: ${step.expectAnswerAny.join(", ")}.`);
+    issues.push(createIssue({
+      confidence: "definite failure",
+      message: `Expected an informational answer containing one of: ${step.expectAnswerAny.join(", ")}.`,
+      expected: `Answer the side question using one of these expected concepts: ${step.expectAnswerAny.join(", ")}.`,
+      actual: reply,
+      reason: "The reply did not contain any expected answer concept."
+    }));
   }
   if (step.expectWorkflowContinuation && countQuestions(reply) !== 1) {
-    issues.push("Expected the side-question answer to continue with exactly one workflow question.");
+    issues.push(createIssue({
+      confidence: "likely failure",
+      message: "Expected the side-question answer to continue with exactly one workflow question.",
+      expected: "Answer the side question and continue with exactly one workflow question.",
+      actual: reply,
+      reason: `The reply contained ${countQuestions(reply)} questions.`
+    }));
   }
   if (step.forbidAnswerAny && hasAny(reply, step.forbidAnswerAny)) {
-    issues.push(`Reply contained forbidden stale content: ${step.forbidAnswerAny.join(", ")}.`);
+    issues.push(createIssue({
+      confidence: "definite failure",
+      message: `Reply contained forbidden stale content: ${step.forbidAnswerAny.join(", ")}.`,
+      expected: "Continue using the customer's latest supplied details.",
+      actual: reply,
+      reason: "The reply contained content explicitly forbidden by the scenario."
+    }));
   }
   for (const type of step.expectQuestionTypes || []) {
     if (!asksQuestionType(reply, type)) {
-      issues.push(`Expected the bot to ask for ${type}.`);
+      issues.push(createIssue({
+        confidence: "definite failure",
+        message: `Expected the bot to ask for ${type}.`,
+        expected: `Ask for ${type}.`,
+        actual: reply,
+        reason: `The reply did not explicitly request ${type}.`
+      }));
     }
   }
   for (const type of step.forbidQuestionTypes || []) {
     if (asksQuestionType(reply, type)) {
-      issues.push(`The bot repeated a question for already supplied ${type}.`);
+      issues.push(createIssue({
+        confidence: "definite failure",
+        message: `The bot repeated a question for already supplied ${type}.`,
+        expected: `${type[0].toUpperCase()}${type.slice(1)} already known.`,
+        actual: reply,
+        reason: `Bot explicitly requested ${type} again.`
+      }));
     }
   }
 
   if (!reply.trim()) {
-    issues.push("The bot returned an empty reply.");
+    issues.push(createIssue({
+      confidence: "definite failure",
+      message: "The bot returned an empty reply.",
+      expected: "Return a meaningful receptionist response.",
+      actual: reply,
+      reason: "The reply was empty."
+    }));
   }
   if (/^[\s\p{P}]+$/u.test(reply)) {
-    issues.push("The bot returned punctuation-only content.");
+    issues.push(createIssue({
+      confidence: "definite failure",
+      message: "The bot returned punctuation-only content.",
+      expected: "Return a meaningful receptionist response.",
+      actual: reply,
+      reason: "The reply contained only whitespace or punctuation."
+    }));
   }
   if (reply.trim().toLowerCase() === "thanks.") {
-    issues.push('The bot returned the meaningless fallback "Thanks.".');
+    issues.push(createIssue({
+      confidence: "definite failure",
+      message: 'The bot returned the meaningless fallback "Thanks.".',
+      expected: "Return a meaningful answer or workflow question.",
+      actual: reply,
+      reason: 'The sole reply was "Thanks.".'
+    }));
   }
 
-  return [...new Set(issues)];
+  return issues.filter((issue, index) =>
+    issues.findIndex((candidate) => candidate.message === issue.message) === index
+  );
 }
 
 async function takeScreenshot(page, scenarioSlug, stepNumber, phase) {
+  if (!TAKE_SCREENSHOTS) {
+    return null;
+  }
+
   const filename = `${scenarioSlug}-${String(stepNumber).padStart(2, "0")}-${phase}.png`;
   const fullPath = path.join(SCREENSHOT_DIR, filename);
   await page.screenshot({ path: fullPath, fullPage: true });
@@ -306,13 +413,22 @@ async function takeScreenshot(page, scenarioSlug, stepNumber, phase) {
 }
 
 function writeAnnotation(scenarioSlug, stepNumber, issues, screenshot) {
+  if (!TAKE_SCREENSHOTS || !screenshot) {
+    return null;
+  }
+
   const filename = `${scenarioSlug}-${String(stepNumber).padStart(2, "0")}-issues.txt`;
   const fullPath = path.join(SCREENSHOT_DIR, filename);
   const body = [
     `Screenshot: ${screenshot}`,
     "",
     "Detected issues:",
-    ...issues.map((issue) => `- ${issue}`)
+    ...issues.flatMap((issue) => [
+      `- [${issue.confidence}] ${issue.message}`,
+      `  Expected: ${issue.expected}`,
+      `  Actual: ${issue.actual}`,
+      `  Reason: ${issue.reason}`
+    ])
   ].join("\n");
   fs.writeFileSync(fullPath, body, "utf8");
   return path.relative(ROOT, fullPath).replace(/\\/g, "/");
@@ -394,7 +510,7 @@ async function runScenario(browser, scenario) {
       if (issues.length) {
         annotationFile = writeAnnotation(scenarioSlug, stepNumber, issues, botScreenshot);
         result.detectedIssues.push(
-          ...issues.map((issue) => ({ step: stepNumber, message: issue }))
+          ...issues.map((issue) => ({ step: stepNumber, ...issue }))
         );
       }
 
@@ -414,22 +530,30 @@ async function runScenario(browser, scenario) {
     const finalReply = result.conversation.at(-1)?.botReply || "";
     const finalIssues = [];
     if (scenario.finalExpectQuestionAny && !hasAny(finalReply, scenario.finalExpectQuestionAny)) {
-      finalIssues.push(
-        `Final reply did not request one of: ${scenario.finalExpectQuestionAny.join(", ")}.`
-      );
+      finalIssues.push(createIssue({
+        confidence: "definite failure",
+        message: `Final reply did not request one of: ${scenario.finalExpectQuestionAny.join(", ")}.`,
+        expected: `Request one of: ${scenario.finalExpectQuestionAny.join(", ")}.`,
+        actual: finalReply,
+        reason: "The final reply did not contain any expected request concept."
+      }));
     }
     if (scenario.finalForbidAnswerAny && hasAny(finalReply, scenario.finalForbidAnswerAny)) {
-      finalIssues.push(
-        `Final reply contained forbidden wording: ${scenario.finalForbidAnswerAny.join(", ")}.`
-      );
+      finalIssues.push(createIssue({
+        confidence: "definite failure",
+        message: `Final reply contained forbidden wording: ${scenario.finalForbidAnswerAny.join(", ")}.`,
+        expected: "Do not use forbidden handoff or stale workflow wording.",
+        actual: finalReply,
+        reason: "The final reply contained wording explicitly forbidden by the scenario."
+      }));
     }
     if (finalIssues.length && result.conversation.length) {
       const finalTurn = result.conversation.at(-1);
       finalTurn.detectedIssues.push(...finalIssues);
       result.detectedIssues.push(
-        ...finalIssues.map((message) => ({
+        ...finalIssues.map((issue) => ({
           step: scenario.messages.length,
-          message
+          ...issue
         }))
       );
       finalTurn.annotationFile = writeAnnotation(
@@ -442,7 +566,11 @@ async function runScenario(browser, scenario) {
   } catch (error) {
     result.detectedIssues.push({
       step: result.conversation.length + 1,
-      message: `Runner error: ${error.message}`
+      confidence: "likely failure",
+      message: `Runner error: ${error.message}`,
+      expected: "Complete the scenario and collect all bot replies.",
+      actual: error.message,
+      reason: "The runner could not complete the scenario, so chatbot behavior could not be fully evaluated."
     });
     const failureScreenshot = await takeScreenshot(
       page,
@@ -451,29 +579,120 @@ async function runScenario(browser, scenario) {
       "runner-error"
     ).catch(() => null);
     if (failureScreenshot) {
+      const runnerIssue = result.detectedIssues.at(-1);
       writeAnnotation(
         scenarioSlug,
         result.conversation.length + 1,
-        [error.stack || error.message],
+        [runnerIssue],
         failureScreenshot
       );
     }
   } finally {
     result.finishedAt = new Date().toISOString();
-    result.status = result.detectedIssues.length ? "failed" : "passed";
+    result.status = result.detectedIssues.some(issueFailsScenario) ? "failed" : "passed";
     await context.close();
   }
 
   return result;
 }
 
-function markdownReport(report) {
+function scenarioSummary(scenario) {
+  const failures = scenario.detectedIssues.filter(issueFailsScenario);
+  const warnings = scenario.detectedIssues.filter((issue) => !issueFailsScenario(issue));
+  if (!failures.length && !warnings.length) {
+    return "The conversation completed without any detected receptionist-flow issues.";
+  }
+
+  const issueCount = failures.length;
+  const affectedSteps = [...new Set(scenario.detectedIssues.map((issue) => issue.step))]
+    .filter(Boolean)
+    .join(", ");
+  const failureSummary = issueCount
+    ? `${issueCount} failure${issueCount === 1 ? " was" : "s were"} detected` +
+      `${affectedSteps ? ` after message${affectedSteps.includes(",") ? "s" : ""} ${affectedSteps}` : ""}.`
+    : "No failures were detected.";
+  return `${failureSummary}${warnings.length ? ` ${warnings.length} informational warning${warnings.length === 1 ? " was" : "s were"} also recorded.` : ""}`;
+}
+
+function formatIssue(issue) {
+  return `[${issue.confidence.toUpperCase()}] ${issue.message} (after message ${issue.step})`;
+}
+
+function issueFailsScenario(issue) {
+  return issue.confidence === "definite failure" || issue.confidence === "likely failure";
+}
+
+function appendPlainTextIssue(lines, issue) {
+  lines.push(`- ${formatIssue(issue)}`);
+  lines.push(`  Expected: ${issue.expected}`);
+  lines.push("  Actual bot reply:");
+  lines.push(`  ${String(issue.actual || "").replace(/\n/g, "\n  ")}`);
+  lines.push(`  Reason: ${issue.reason}`);
+}
+
+function appendMarkdownIssue(lines, issue) {
+  lines.push(`- **${issue.confidence.toUpperCase()}**: ${issue.message} (after message ${issue.step})`);
+  lines.push(`  - **Expected:** ${issue.expected}`);
+  lines.push(`  - **Actual bot reply:** ${String(issue.actual || "").replace(/\n/g, "<br>")}`);
+  lines.push(`  - **Reason:** ${issue.reason}`);
+}
+
+function textTranscripts(report) {
   const lines = [
-    "# Veronika Wellness Chatbot QA Report",
+    "VERONIKA WELLNESS CHATBOT QA TRANSCRIPTS",
+    `RUN STARTED: ${report.startedAt}`,
+    `BASE URL: ${report.baseUrl}`,
+    `TIMEZONE: ${report.timezone}`,
+    `PASSED: ${report.summary.passed}`,
+    `FAILED: ${report.summary.failed}`,
+    ""
+  ];
+
+  for (const scenario of report.scenarios) {
+    lines.push("==============================");
+    lines.push(`SCENARIO: ${scenario.testName}`);
+    lines.push(`STATUS: ${scenario.status.toUpperCase()}`);
+    lines.push("ISSUES:");
+    if (scenario.detectedIssues.length) {
+      for (const issue of scenario.detectedIssues) {
+        appendPlainTextIssue(lines, issue);
+      }
+    } else {
+      lines.push("- None");
+    }
+    lines.push("");
+    lines.push("CONVERSATION:");
+    if (scenario.conversation.length) {
+      for (const turn of scenario.conversation) {
+        lines.push(`USER: ${turn.userMessage}`);
+        lines.push(`BOT: ${turn.botReply}`);
+        lines.push("");
+      }
+    } else {
+      lines.push("No conversation turns completed.");
+      lines.push("");
+    }
+    lines.push("SUMMARY:");
+    lines.push(scenarioSummary(scenario));
+    lines.push("==============================");
+    lines.push("");
+  }
+
+  lines.push("FINAL SUMMARY:");
+  lines.push(
+    `${report.summary.passed} scenario${report.summary.passed === 1 ? "" : "s"} passed; ` +
+    `${report.summary.failed} scenario${report.summary.failed === 1 ? "" : "s"} failed.`
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+function markdownTranscripts(report) {
+  const lines = [
+    "# Veronika Wellness Chatbot QA Transcripts",
     "",
     `- Run started: ${report.startedAt}`,
     `- Base URL: ${report.baseUrl}`,
-    `- Timezone: Europe/London`,
+    `- Timezone: ${report.timezone}`,
     `- Result: **${report.summary.failed ? "FAILED" : "PASSED"}**`,
     `- Scenarios: ${report.summary.total}`,
     `- Passed: ${report.summary.passed}`,
@@ -482,35 +701,56 @@ function markdownReport(report) {
   ];
 
   for (const scenario of report.scenarios) {
-    lines.push(`## ${scenario.testName}`);
+    lines.push("---");
+    lines.push("");
+    lines.push(`## Scenario: ${scenario.testName}`);
     lines.push("");
     lines.push(`Status: **${scenario.status.toUpperCase()}**`);
     lines.push("");
+    lines.push("### Issues");
+    lines.push("");
+    if (scenario.detectedIssues.length) {
+      for (const issue of scenario.detectedIssues) {
+        appendMarkdownIssue(lines, issue);
+      }
+    } else {
+      lines.push("- None");
+    }
+    lines.push("");
+    lines.push("### Conversation");
+    lines.push("");
 
     for (const turn of scenario.conversation) {
-      lines.push(`### Step ${turn.step}`);
+      lines.push(`**USER:** ${turn.userMessage}`);
       lines.push("");
-      lines.push(`**Customer:** ${turn.userMessage}`);
+      lines.push(`**BOT:** ${turn.botReply}`);
       lines.push("");
-      lines.push(`**Assistant:** ${turn.botReply}`);
-      lines.push("");
-      lines.push(`- User screenshot: \`${turn.screenshots.afterUserMessage}\``);
-      lines.push(`- Bot screenshot: \`${turn.screenshots.afterBotReply}\``);
+      if (turn.screenshots.afterUserMessage) {
+        lines.push(`- User screenshot: \`${turn.screenshots.afterUserMessage}\``);
+      }
+      if (turn.screenshots.afterBotReply) {
+        lines.push(`- Bot screenshot: \`${turn.screenshots.afterBotReply}\``);
+      }
       if (turn.annotationFile) {
         lines.push(`- Annotation: \`${turn.annotationFile}\``);
       }
-      for (const issue of turn.detectedIssues) {
-        lines.push(`- Issue: ${issue}`);
-      }
-      lines.push("");
     }
 
-    if (!scenario.detectedIssues.length) {
-      lines.push("No issues detected.");
-      lines.push("");
-    }
+    lines.push("### Summary");
+    lines.push("");
+    lines.push(scenarioSummary(scenario));
+    lines.push("");
   }
 
+  lines.push("---");
+  lines.push("");
+  lines.push("## Final Summary");
+  lines.push("");
+  lines.push(
+    `${report.summary.passed} scenario${report.summary.passed === 1 ? "" : "s"} passed; ` +
+    `${report.summary.failed} scenario${report.summary.failed === 1 ? "" : "s"} failed.`
+  );
+  lines.push("");
   return `${lines.join("\n")}\n`;
 }
 
@@ -529,6 +769,7 @@ async function main() {
     startedAt: new Date().toISOString(),
     baseUrl: BASE_URL,
     timezone: "Europe/London",
+    screenshotsEnabled: TAKE_SCREENSHOTS,
     scenarios: []
   };
   const browser = await chromium.launch({ headless: HEADLESS, slowMo: SLOW_MO });
@@ -550,11 +791,16 @@ async function main() {
   };
 
   fs.writeFileSync(JSON_REPORT, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-  fs.writeFileSync(MARKDOWN_REPORT, markdownReport(report), "utf8");
+  fs.writeFileSync(TEXT_TRANSCRIPTS, textTranscripts(report), "utf8");
+  fs.writeFileSync(MARKDOWN_TRANSCRIPTS, markdownTranscripts(report), "utf8");
 
+  console.log("");
+  console.log("QA run complete");
+  console.log(`Passed: ${report.summary.passed}`);
+  console.log(`Failed: ${report.summary.failed}`);
+  console.log(`Text transcripts: ${TEXT_TRANSCRIPTS}`);
+  console.log(`Markdown transcripts: ${MARKDOWN_TRANSCRIPTS}`);
   console.log(`JSON report: ${JSON_REPORT}`);
-  console.log(`Markdown report: ${MARKDOWN_REPORT}`);
-  console.log(`Passed: ${report.summary.passed}; Failed: ${report.summary.failed}`);
   process.exitCode = report.summary.failed ? 1 : 0;
 }
 
@@ -563,16 +809,30 @@ main().catch((error) => {
   const failure = {
     startedAt: new Date().toISOString(),
     baseUrl: BASE_URL,
+    timezone: "Europe/London",
+    screenshotsEnabled: TAKE_SCREENSHOTS,
     summary: { total: 0, passed: 0, failed: 1 },
     runnerError: error.stack || error.message,
     scenarios: []
   };
   fs.writeFileSync(JSON_REPORT, `${JSON.stringify(failure, null, 2)}\n`, "utf8");
   fs.writeFileSync(
-    MARKDOWN_REPORT,
-    `# Veronika Wellness Chatbot QA Report\n\nRunner failed:\n\n\`\`\`\n${failure.runnerError}\n\`\`\`\n`,
+    TEXT_TRANSCRIPTS,
+    `VERONIKA WELLNESS CHATBOT QA TRANSCRIPTS\n\nRUNNER FAILED:\n${failure.runnerError}\n`,
+    "utf8"
+  );
+  fs.writeFileSync(
+    MARKDOWN_TRANSCRIPTS,
+    `# Veronika Wellness Chatbot QA Transcripts\n\n## Runner Failed\n\n\`\`\`\n${failure.runnerError}\n\`\`\`\n`,
     "utf8"
   );
   console.error(error);
+  console.log("");
+  console.log("QA runner failed");
+  console.log("Passed: 0");
+  console.log("Failed: 1");
+  console.log(`Text transcripts: ${TEXT_TRANSCRIPTS}`);
+  console.log(`Markdown transcripts: ${MARKDOWN_TRANSCRIPTS}`);
+  console.log(`JSON report: ${JSON_REPORT}`);
   process.exitCode = 1;
 });
