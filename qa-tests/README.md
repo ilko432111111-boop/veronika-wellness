@@ -39,13 +39,15 @@ prints the pass/fail totals and the paths to all three reports.
 
 Each detected issue includes:
 
-- Confidence: `definite failure`, `likely failure`, or `informational warning`.
+- Confidence: `definite_failure`, `likely_failure`, or `informational_warning`.
 - Expected behavior.
 - The exact bot reply.
-- The reason the detector raised the issue.
+- Why the behavior is a problem.
+- A likely root cause.
+- A suggested fix direction.
 
-`Definite failure` and `likely failure` findings fail a scenario.
-`Informational warning` findings are reported without failing the scenario.
+`definite_failure` and `likely_failure` findings fail a scenario.
+`informational_warning` findings are reported without failing the scenario.
 
 ## Optional Screenshots
 

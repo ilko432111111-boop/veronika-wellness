@@ -59,8 +59,8 @@ const QUESTION_PATTERNS = {
   duration: /\b(?:how long|what duration|which duration|choose (?:a |your )?(?:session )?length|select (?:a |your )?(?:session )?length|what session length|which session length)\b/i,
   date: /\b(?:which|what)\s+(?:day|date)\b[^?]*\?/i,
   time: /\b(?:which|what)\s+time\b[^?]*\?/i,
-  name: /\b(?:your name|take your name)\b[^?]*\?/i,
-  phone: /\b(?:phone|mobile|contact number)\b[^?]*\?/i
+  name: /\b(?:what(?:'s| is) your name|could i take your name|may i have your name|can i have your name|your name,?\s*please)\b/i,
+  phone: /\b(?:what(?:'s| is) your (?:phone|mobile|contact) number|could i take your (?:phone|mobile|contact) number|may i have your (?:phone|mobile|contact) number|can i have your (?:phone|mobile|contact) number|your (?:phone|mobile|contact) number,?\s*please)\b/i
 };
 
 const DURATION_OPTION_REQUEST_PATTERNS = [
@@ -245,8 +245,122 @@ function handoffEligibleForVisibleConversation(state) {
   );
 }
 
-function createIssue({ confidence, message, expected, actual, reason }) {
-  return { confidence, message, expected, actual, reason };
+function issueGuidance(message) {
+  if (/premature handoff|handoff wording/i.test(message)) {
+    return {
+      likelyRootCause: "Handoff language is being generated before the workflow state passes the handoff eligibility gate.",
+      suggestedFixDirection: "Keep handoff wording Python-controlled and append it only after every required detail and backend verification are complete."
+    };
+  }
+  if (/autonomously confirmed|reserved/i.test(message)) {
+    return {
+      likelyRootCause: "The natural responder is allowed to imply confirmation instead of using backend-controlled booking status wording.",
+      suggestedFixDirection: "Strip autonomous confirmation claims and render only verified, Python-controlled availability or handoff wording."
+    };
+  }
+  if (/availability claim/i.test(message)) {
+    return {
+      likelyRootCause: "The reply generator is treating service information or unverified schedule context as confirmed slot availability.",
+      suggestedFixDirection: "Require a verified backend availability result before allowing slot-availability claims."
+    };
+  }
+  if (/asked for .+ even though|repeated a question/i.test(message)) {
+    return {
+      likelyRootCause: "The workflow question selector is not consistently reading or preserving already-collected canonical state.",
+      suggestedFixDirection: "Select the next workflow question from saved canonical state and skip fields that are already resolved."
+    };
+  }
+  if (/informational answer|side-question answer/i.test(message)) {
+    return {
+      likelyRootCause: "The responder is prioritising the pending booking workflow over the customer's latest informational intent.",
+      suggestedFixDirection: "Detect and answer informational side questions before appending at most one Python-controlled workflow question."
+    };
+  }
+  if (/forbidden stale content/i.test(message)) {
+    return {
+      likelyRootCause: "The responder or workflow state is still using details from an earlier customer choice.",
+      suggestedFixDirection: "Invalidate stale dependent state when the customer changes details, then compose the reply from the latest canonical values."
+    };
+  }
+  if (/expected the bot to ask|final reply did not request/i.test(message)) {
+    return {
+      likelyRootCause: "The next-required-detail selector did not choose the expected missing workflow field.",
+      suggestedFixDirection: "Derive the next question deterministically from unresolved canonical state after processing the latest message."
+    };
+  }
+  if (/more than one workflow question/i.test(message)) {
+    return {
+      likelyRootCause: "Multiple response layers are appending workflow questions independently.",
+      suggestedFixDirection: "Make final composition append exactly one Python-controlled next question and strip model-generated workflow questions."
+    };
+  }
+  if (/empty reply|punctuation-only|meaningless fallback/i.test(message)) {
+    return {
+      likelyRootCause: "Reply sanitization removed the useful response without producing a meaningful deterministic fallback.",
+      suggestedFixDirection: "After sanitization, detect meaningless output and render an authoritative answer or the next required workflow question."
+    };
+  }
+  if (/runner error/i.test(message)) {
+    return {
+      likelyRootCause: "The browser run could not reach or complete interaction with the live chatbot.",
+      suggestedFixDirection: "Check live-site reachability, service health, and runner timeout settings, then rerun the affected scenario."
+    };
+  }
+  return {
+    likelyRootCause: "The final reply did not match the expected receptionist-flow contract.",
+    suggestedFixDirection: "Trace the latest-message intent, canonical workflow state, and final response composition for this turn."
+  };
+}
+
+function issueImpact(message) {
+  if (/premature handoff|handoff wording/i.test(message)) {
+    return "The customer may believe their incomplete request has already been handed to Veronika.";
+  }
+  if (/autonomously confirmed|reserved/i.test(message)) {
+    return "The customer may believe an appointment is confirmed or reserved when the receptionist flow cannot guarantee that.";
+  }
+  if (/availability claim/i.test(message)) {
+    return "The customer may rely on a slot that has not been verified by the backend.";
+  }
+  if (/asked for .+ even though|repeated a question/i.test(message)) {
+    return "Repeating an already-answered question makes the bot appear to have lost customer details and can stall the flow.";
+  }
+  if (/informational answer/i.test(message)) {
+    return "The customer asked a side question, but the reply did not answer it.";
+  }
+  if (/side-question answer/i.test(message)) {
+    return "The side question did not cleanly return the customer to the active booking flow.";
+  }
+  if (/forbidden stale content/i.test(message)) {
+    return "The reply uses outdated details after the customer changed their request.";
+  }
+  if (/expected the bot to ask|final reply did not request/i.test(message)) {
+    return "The booking flow cannot progress because the bot did not request the next required detail.";
+  }
+  if (/more than one workflow question/i.test(message)) {
+    return "Multiple workflow questions make the next required customer action ambiguous.";
+  }
+  if (/empty reply|punctuation-only|meaningless fallback/i.test(message)) {
+    return "The customer receives no useful answer or next action.";
+  }
+  if (/runner error/i.test(message)) {
+    return "The scenario could not be evaluated, so the report cannot confirm whether the chatbot flow passed.";
+  }
+  return "The reply does not satisfy the expected receptionist-flow behavior for this turn.";
+}
+
+function createIssue({ confidence, message, expected, actual, reason, likelyRootCause, suggestedFixDirection }) {
+  const guidance = issueGuidance(message);
+  return {
+    confidence: formatConfidence(confidence),
+    message,
+    expected,
+    actual,
+    whyProblem: issueImpact(message),
+    detectionReason: reason,
+    likelyRootCause: likelyRootCause || guidance.likelyRootCause,
+    suggestedFixDirection: suggestedFixDirection || guidance.suggestedFixDirection
+  };
 }
 
 function detectIssues({ state, reply, step }) {
@@ -427,7 +541,10 @@ function writeAnnotation(scenarioSlug, stepNumber, issues, screenshot) {
       `- [${issue.confidence}] ${issue.message}`,
       `  Expected: ${issue.expected}`,
       `  Actual: ${issue.actual}`,
-      `  Reason: ${issue.reason}`
+      `  Why this is a problem: ${issue.whyProblem}`,
+      `  Detection reason: ${issue.detectionReason}`,
+      `  Likely root cause: ${issue.likelyRootCause}`,
+      `  Suggested fix direction: ${issue.suggestedFixDirection}`
     ])
   ].join("\n");
   fs.writeFileSync(fullPath, body, "utf8");
@@ -566,11 +683,13 @@ async function runScenario(browser, scenario) {
   } catch (error) {
     result.detectedIssues.push({
       step: result.conversation.length + 1,
-      confidence: "likely failure",
-      message: `Runner error: ${error.message}`,
-      expected: "Complete the scenario and collect all bot replies.",
-      actual: error.message,
-      reason: "The runner could not complete the scenario, so chatbot behavior could not be fully evaluated."
+      ...createIssue({
+        confidence: "likely failure",
+        message: `Runner error: ${error.message}`,
+        expected: "Complete the scenario and collect all bot replies.",
+        actual: error.message,
+        reason: "The runner could not complete the scenario, so chatbot behavior could not be fully evaluated."
+      })
     });
     const failureScreenshot = await takeScreenshot(
       page,
@@ -615,26 +734,67 @@ function scenarioSummary(scenario) {
 }
 
 function formatIssue(issue) {
-  return `[${issue.confidence.toUpperCase()}] ${issue.message} (after message ${issue.step})`;
+  return `${issue.message} (after message ${issue.step})`;
+}
+
+function formatConfidence(confidence) {
+  return confidence.replace(/\s+/g, "_");
 }
 
 function issueFailsScenario(issue) {
-  return issue.confidence === "definite failure" || issue.confidence === "likely failure";
+  return issue.confidence === "definite_failure" || issue.confidence === "likely_failure";
 }
 
-function appendPlainTextIssue(lines, issue) {
-  lines.push(`- ${formatIssue(issue)}`);
-  lines.push(`  Expected: ${issue.expected}`);
-  lines.push("  Actual bot reply:");
-  lines.push(`  ${String(issue.actual || "").replace(/\n/g, "\n  ")}`);
-  lines.push(`  Reason: ${issue.reason}`);
+function appendPlainTextIssue(lines, issue, issueNumber) {
+  lines.push(`ISSUE ${issueNumber}`);
+  lines.push(`Confidence: ${formatConfidence(issue.confidence)}`);
+  lines.push(`Finding: ${formatIssue(issue)}`);
+  lines.push("Expected:");
+  lines.push(issue.expected);
+  lines.push("");
+  lines.push("Actual bot reply:");
+  lines.push(`"${String(issue.actual || "").replace(/"/g, '\\"')}"`);
+  lines.push("");
+  lines.push("Why this is a problem:");
+  lines.push(issue.whyProblem);
+  lines.push("");
+  lines.push("Likely root cause:");
+  lines.push(issue.likelyRootCause);
+  lines.push("");
+  lines.push("Suggested fix direction:");
+  lines.push(issue.suggestedFixDirection);
+  lines.push("");
 }
 
-function appendMarkdownIssue(lines, issue) {
-  lines.push(`- **${issue.confidence.toUpperCase()}**: ${issue.message} (after message ${issue.step})`);
-  lines.push(`  - **Expected:** ${issue.expected}`);
-  lines.push(`  - **Actual bot reply:** ${String(issue.actual || "").replace(/\n/g, "<br>")}`);
-  lines.push(`  - **Reason:** ${issue.reason}`);
+function appendMarkdownIssue(lines, issue, issueNumber) {
+  lines.push(`#### Issue ${issueNumber}`);
+  lines.push("");
+  lines.push(`**Confidence:** \`${formatConfidence(issue.confidence)}\``);
+  lines.push("");
+  lines.push(`**Finding:** ${formatIssue(issue)}`);
+  lines.push("");
+  lines.push("**Expected:**");
+  lines.push("");
+  lines.push(issue.expected);
+  lines.push("");
+  lines.push("**Actual bot reply:**");
+  lines.push("");
+  lines.push("```text");
+  lines.push(String(issue.actual || ""));
+  lines.push("```");
+  lines.push("");
+  lines.push("**Why this is a problem:**");
+  lines.push("");
+  lines.push(issue.whyProblem);
+  lines.push("");
+  lines.push("**Likely root cause:**");
+  lines.push("");
+  lines.push(issue.likelyRootCause);
+  lines.push("");
+  lines.push("**Suggested fix direction:**");
+  lines.push("");
+  lines.push(issue.suggestedFixDirection);
+  lines.push("");
 }
 
 function textTranscripts(report) {
@@ -654,8 +814,8 @@ function textTranscripts(report) {
     lines.push(`STATUS: ${scenario.status.toUpperCase()}`);
     lines.push("ISSUES:");
     if (scenario.detectedIssues.length) {
-      for (const issue of scenario.detectedIssues) {
-        appendPlainTextIssue(lines, issue);
+      for (const [index, issue] of scenario.detectedIssues.entries()) {
+        appendPlainTextIssue(lines, issue, index + 1);
       }
     } else {
       lines.push("- None");
@@ -710,8 +870,8 @@ function markdownTranscripts(report) {
     lines.push("### Issues");
     lines.push("");
     if (scenario.detectedIssues.length) {
-      for (const issue of scenario.detectedIssues) {
-        appendMarkdownIssue(lines, issue);
+      for (const [index, issue] of scenario.detectedIssues.entries()) {
+        appendMarkdownIssue(lines, issue, index + 1);
       }
     } else {
       lines.push("- None");
