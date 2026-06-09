@@ -1,6 +1,9 @@
 from datetime import datetime
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
+
+from fastapi import BackgroundTasks
 
 from test_smoke import load_chatbot_module
 
@@ -205,6 +208,302 @@ class Phase3CTreatmentBeforeCalendarTests(unittest.TestCase):
         self.assertEqual(reply, "Which treatment are you interested in?")
         self.assertEqual(result["status"], "not_checked")
         calendar_check.assert_not_called()
+
+
+class Phase3CAlternativeLifecycleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.chatbot = load_chatbot_module()
+
+    def setUp(self):
+        self.alternatives = [
+            {
+                "date": "2026-06-11",
+                "time": "09:00",
+                "label": "Thursday 11 June at 09:00",
+                "duration_minutes": 60,
+            },
+            {
+                "date": "2026-06-11",
+                "time": "11:00",
+                "label": "Thursday 11 June at 11:00",
+                "duration_minutes": 60,
+            },
+            {
+                "date": "2026-06-11",
+                "time": "11:30",
+                "label": "Thursday 11 June at 11:30",
+                "duration_minutes": 60,
+            },
+        ]
+        self.state = {
+            "treatment": "Relaxing Massage",
+            "duration": "1 hour",
+            "preferred_date": "2026-06-10",
+            "preferred_time": "09:00",
+            "name": None,
+            "phone": None,
+            "notes": "Keep this note",
+            "slot_status": "unavailable",
+            "verified_alternatives": self.alternatives,
+            "conversation_mode": "booking_request",
+        }
+
+    def test_short_bare_hour_replies_resolve_unique_verified_alternative(self):
+        for message in ["9?", "9", "yes 9", "the 9 one"]:
+            with self.subTest(message=message):
+                resolution = self.chatbot.resolve_verified_alternative_reply(
+                    self.state,
+                    message,
+                )
+                self.assertEqual(resolution["status"], "selected")
+                self.assertEqual(resolution["matches"][0]["time"], "09:00")
+
+    def test_ambiguous_bare_hour_retains_verified_alternatives(self):
+        state = {
+            **self.state,
+            "verified_alternatives": [
+                self.alternatives[0],
+                {
+                    **self.alternatives[0],
+                    "date": "2026-06-12",
+                    "label": "Friday 12 June at 09:00",
+                },
+            ],
+        }
+        resolution = self.chatbot.resolve_verified_alternative_reply(
+            state,
+            "9?",
+        )
+        retained = self.chatbot.apply_verified_alternative_resolution(
+            state,
+            state,
+            resolution,
+        )
+
+        self.assertEqual(resolution["status"], "ambiguous")
+        self.assertEqual(retained["verified_alternatives"], state["verified_alternatives"])
+
+    def test_selection_clears_stale_slot_state_and_preserves_other_fields(self):
+        resolution = self.chatbot.resolve_verified_alternative_reply(
+            self.state,
+            "9?",
+        )
+        selected = self.chatbot.apply_verified_alternative_resolution(
+            self.state,
+            self.state,
+            resolution,
+        )
+
+        self.assertEqual(selected["preferred_date"], "2026-06-11")
+        self.assertEqual(selected["preferred_time"], "09:00")
+        self.assertEqual(selected["verified_alternatives"], [])
+        self.assertEqual(selected["slot_status"], "not_checked")
+        self.assertEqual(selected["notes"], "Keep this note")
+
+    def test_pending_alternatives_remain_the_next_required_workflow_action(self):
+        complete_original_fields = {
+            **self.state,
+            "name": "Test Customer",
+            "phone": "07000000000",
+        }
+        controlled = self.chatbot.apply_canonical_controller_state(
+            complete_original_fields,
+            booking_flow_active=True,
+            calendar_result={"status": "not_checked"},
+        )
+
+        self.assertEqual(controlled["next_required_detail"], "verified_alternative")
+        self.assertEqual(controlled["verified_alternatives"], self.alternatives)
+
+    def test_contact_details_after_selection_keep_selected_slot(self):
+        resolution = self.chatbot.resolve_verified_alternative_reply(
+            self.state,
+            "9?",
+        )
+        selected = self.chatbot.apply_verified_alternative_resolution(
+            self.state,
+            self.state,
+            resolution,
+        )
+        selected.update({"name": "Test Customer", "phone": "07000000000"})
+        after_contact = self.chatbot.apply_verified_alternative_resolution(
+            selected,
+            selected,
+            {"status": "not_applicable", "matches": []},
+        )
+
+        self.assertEqual(after_contact["preferred_date"], "2026-06-11")
+        self.assertEqual(after_contact["preferred_time"], "09:00")
+        self.assertEqual(after_contact["verified_alternatives"], [])
+
+
+class Phase3CActiveFlowReplyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.chatbot = load_chatbot_module()
+
+    def compose(self, body, state, detail, message="thanks", history=None):
+        with patch.object(
+            self.chatbot,
+            "generate_natural_reply_body",
+            return_value=body,
+        ):
+            return self.chatbot.compose_verified_customer_reply(
+                state=state,
+                extractor_result=self.chatbot.empty_extractor_result(),
+                calendar_result={"status": "not_checked"},
+                next_required_detail=detail,
+                business_context="",
+                services_context="",
+                latest_message=message,
+                history=history or [],
+            )
+
+    def test_active_flow_never_returns_only_thanks(self):
+        state = {"conversation_mode": "booking_request", "treatment": "Massage"}
+
+        for body in ["", "Thanks."]:
+            with self.subTest(body=body):
+                reply = self.compose(body, state, "duration")
+                self.assertNotEqual(reply, "Thanks.")
+                self.assertEqual(reply.count("?"), 1)
+
+    def test_premature_handoff_boilerplate_is_suppressed(self):
+        body = (
+            "We'll pass your request on to Veronika. "
+            "Veronika will confirm the appointment shortly. "
+            "Relaxing massage sounds good."
+        )
+        reply = self.compose(
+            body,
+            {"conversation_mode": "booking_request", "treatment": "Relaxing Massage"},
+            "duration",
+        )
+
+        self.assertNotIn("pass your request", reply.lower())
+        self.assertNotIn("confirm the appointment", reply.lower())
+        self.assertIn("Relaxing massage sounds good.", reply)
+        self.assertEqual(reply.count("?"), 1)
+
+    def test_final_handoff_appears_once_and_is_not_repeated(self):
+        state = {
+            "conversation_mode": "booking_request",
+            "status": "booking_request_complete",
+            "treatment": "Relaxing Massage",
+            "duration": "1 hour",
+            "preferred_date": "2026-06-11",
+            "preferred_time": "09:00",
+            "name": "Test Customer",
+            "phone": "07000000000",
+            "verified_alternatives": [],
+        }
+        handoff = "Veronika will confirm the appointment with you shortly."
+        first = self.compose("", state, "handoff")
+        second = self.compose(
+            "",
+            state,
+            "handoff",
+            history=[self.chatbot.ChatMessage(role="assistant", content=first)],
+        )
+
+        self.assertEqual(first.count(handoff), 1)
+        self.assertNotIn(handoff, second)
+        self.assertNotEqual(second, "Thanks.")
+
+
+class Phase3CSelectedSlotControllerTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.chatbot = load_chatbot_module()
+
+    async def test_selected_slot_reaches_projection_and_old_alternatives_do_not_return(self):
+        alternatives = [
+            {
+                "date": "2026-06-11",
+                "time": "09:00",
+                "label": "Thursday 11 June at 09:00",
+                "duration_minutes": 60,
+            },
+        ]
+        current = {
+            "treatment": "Relaxing Massage",
+            "duration": "1 hour",
+            "preferred_date": "2026-06-10",
+            "preferred_time": "09:00",
+            "name": None,
+            "phone": None,
+            "slot_status": "unavailable",
+            "verified_alternatives": alternatives,
+            "conversation_mode": "booking_request",
+        }
+        projected = []
+        request = self.chatbot.ChatRequest(
+            session_id="phase-3c-short-selection",
+            message="9?",
+            history=[],
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(self.chatbot, "save_message"))
+            stack.enter_context(patch.object(
+                self.chatbot, "get_existing_conversation", return_value=current
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot, "load_recent_messages", return_value=[]
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot, "build_authoritative_services_context", return_value=""
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot, "load_business_documents_context", return_value=""
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot,
+                "extract_hidden_state_patch",
+                return_value=self.chatbot.empty_extractor_result(),
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot,
+                "apply_structured_service_resolution",
+                side_effect=lambda state, message: state,
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot,
+                "hydrate_configured_service_defaults",
+                side_effect=lambda state: state,
+            ))
+            calendar_check = stack.enter_context(patch.object(
+                self.chatbot,
+                "verified_calendar_result_for_state",
+                return_value={"status": "free"},
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot, "save_conversation_overview", return_value=True
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot,
+                "sync_simple_single_request_projection",
+                side_effect=lambda session_id, state, booking_flow_active: projected.append(
+                    dict(state)
+                ),
+            ))
+            stack.enter_context(patch.object(
+                self.chatbot, "generate_natural_reply_body", return_value=""
+            ))
+            stack.enter_context(patch.object(self.chatbot, "send_booking_notification"))
+
+            response = await self.chatbot.chat(request, BackgroundTasks())
+
+        checked_state = calendar_check.call_args.args[0]
+        self.assertEqual(checked_state["preferred_date"], "2026-06-11")
+        self.assertEqual(checked_state["preferred_time"], "09:00")
+        self.assertEqual(checked_state["verified_alternatives"], [])
+        self.assertEqual(projected[-1]["preferred_date"], "2026-06-11")
+        self.assertEqual(projected[-1]["preferred_time"], "09:00")
+        self.assertNotIn("next available options", response["reply"].lower())
+        self.assertIn("Thursday 11 June at 09:00 currently appears free.", response["reply"])
+        self.assertEqual(response["reply"].count("?"), 1)
 
 
 if __name__ == "__main__":

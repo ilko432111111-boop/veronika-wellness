@@ -189,7 +189,7 @@ class VerifiedAlternativeSelectionTests(unittest.TestCase):
             self.alternatives[2],
         )
 
-    def test_relative_suggestions_are_persisted_and_handoff_clears_them(self):
+    def test_relative_suggestions_remain_pending_until_customer_selects(self):
         structured = self.chatbot.structured_verified_alternatives(
             ["tomorrow at 10:00"],
             60,
@@ -206,8 +206,14 @@ class VerifiedAlternativeSelectionTests(unittest.TestCase):
             booking_flow_active=True,
             calendar_result={"status": "not_checked"},
         )
-        self.assertEqual(controlled["next_required_detail"], "handoff")
-        self.assertEqual(controlled["verified_alternatives"], [])
+        self.assertEqual(
+            controlled["next_required_detail"],
+            "verified_alternative",
+        )
+        self.assertEqual(
+            controlled["verified_alternatives"],
+            structured,
+        )
 
     def test_successful_selection_clears_alternatives_and_preserves_contact(self):
         resolution = self.chatbot.resolve_verified_alternative_reply(
@@ -261,7 +267,7 @@ class VerifiedAlternativeSelectionTests(unittest.TestCase):
         self.assertEqual(
             complete_reply,
             "Your request has been noted, but the appointment is not "
-            "confirmed yet. Veronika will confirm it with you shortly.",
+            "confirmed yet.",
         )
         self.assertEqual(complete_reply.count("?"), 0)
 

@@ -137,9 +137,12 @@ def booking_request_is_complete(lead_data: dict) -> bool:
     A booking request is complete only when every required field is present.
     Never trust a status label on its own.
     """
-    return all(
-        lead_data.get(field) not in [None, ""]
-        for field in REQUIRED_BOOKING_FIELDS
+    return (
+        not lead_data.get("verified_alternatives")
+        and all(
+            lead_data.get(field) not in [None, ""]
+            for field in REQUIRED_BOOKING_FIELDS
+        )
     )
 
 
@@ -4345,6 +4348,12 @@ def build_calendar_alternative_reply(
             "Which one would you prefer?"
         )
 
+    if status == "pending_alternatives":
+        return (
+            f"The current verified options are {options}.\n\n"
+            "Which one would you prefer?"
+        )
+
     if status == "closed_day":
         opening = "That day is closed."
     elif status == "past":
@@ -4844,8 +4853,9 @@ def resolve_verified_alternative_reply(
     requested_times = [requested_time] if requested_time else []
 
     if not requested_times:
-        bare_hour_match = re.search(
-            r"\b(1[0-2]|[1-9])\s+(?:works|suits|please)\b",
+        bare_hour_match = re.fullmatch(
+            r"(?:yes[\s,]+)?(?:the\s+)?(1[0-2]|[1-9])"
+            r"(?:\s+(?:one|works|suits|please))?\??",
             cleaned,
         )
 
@@ -4914,6 +4924,7 @@ def apply_verified_alternative_resolution(
         result["preferred_date"] = selected["date"]
         result["preferred_time"] = selected["time"]
         result["verified_alternatives"] = []
+        result["slot_status"] = "not_checked"
         return result
 
     if status in {"ambiguous", "no_match"}:
@@ -7188,6 +7199,9 @@ def compute_next_required_detail(
     if state.get("preferred_time") in [None, ""]:
         return "preferred_time"
 
+    if active_verified_alternatives(state):
+        return "verified_alternative"
+
     if (
         state.get("name") in [None, ""]
         and state.get("phone") in [None, ""]
@@ -7251,6 +7265,9 @@ def render_next_question(
     if next_required_detail == "phone":
         return "Could I take your phone number, please?"
 
+    if next_required_detail == "verified_alternative":
+        return ""
+
     return ""
 
 
@@ -7289,9 +7306,6 @@ def apply_canonical_controller_state(
             parse_duration_minutes(result.get("duration")),
         )
     elif (calendar_result or {}).get("status") == "free":
-        result["verified_alternatives"] = []
-
-    if next_detail == "handoff":
         result["verified_alternatives"] = []
 
     if result["status"] != "booking_request_complete":
@@ -7470,9 +7484,11 @@ def sentence_contains_forbidden_booking_claim(sentence: str) -> bool:
         r"(?i)\b(?:available|free|busy|unavailable)\b[^.!?]*\b(?:slot|appointment|requested time|requested date)\b",
         r"(?i)\b(?:calendar|schedule)\b[^.!?]*\b(?:shows|says|confirms|has|is|looks|appears)\b",
         r"(?i)\b(?:i(?:'ll| will)? have the therapist|the therapist will)\s+check\b[^.!?]*\bconfirm\b",
+        r"(?i)\b(?:we(?:'ll| will)|i(?:'ll| will))\s+pass\s+your\s+request\s+(?:on\s+)?to\s+veronika\b",
+        r"(?i)\bveronika will confirm(?: the appointment| it| your request)?(?: with you)?(?: shortly)?\b",
         r"(?i)\bveronika will (?:review|be in touch|get back to you)\b",
         r"(?i)\blooking forward to welcoming you\b",
-        r"(?i)\bif there is anything else you would like to know\b",
+        r"(?i)\bif there(?:'s| is) anything else you(?:'d| would) like to know\b",
     ]
     return any(re.search(pattern, cleaned) for pattern in forbidden_patterns)
 
@@ -7660,6 +7676,16 @@ def compose_verified_customer_reply(
         state,
         next_required_detail,
     )
+    booking_flow_active = (
+        state.get("conversation_mode") == "booking_request"
+        or next_required_detail is not None
+    )
+    handoff_ready = (
+        next_required_detail == "handoff"
+        and booking_request_is_complete(state)
+        and not active_verified_alternatives(state)
+    )
+    booked_status_handoff = ""
 
     # Suggested slots are fully deterministic because the model must never
     # invent alternatives or rewrite date labels.
@@ -7670,20 +7696,17 @@ def compose_verified_customer_reply(
             )
         )
 
-        if (
-            alternative_reply
-            and alternative_reply in latest_assistant_reply(history)
-            and not customer_explicitly_asks_availability(latest_message)
-        ):
-            return "Thanks."
-
         return alternative_reply
 
     if customer_asks_if_booked(latest_message):
         body = (
             "Your request has been noted, but the appointment is not "
-            "confirmed yet. Veronika will confirm it with you shortly."
+            "confirmed yet."
         )
+        if handoff_ready:
+            booked_status_handoff = (
+                "Veronika will confirm it with you shortly."
+            )
     elif extractor_result.get("verified_alternative_selected"):
         body = ""
     else:
@@ -7731,13 +7754,13 @@ def compose_verified_customer_reply(
             latest_message
         )
 
-    if (
-        body.strip().lower() == "thanks."
-        and customer_requests_information(latest_message)
-    ):
-        body = authoritative_information_fallback(
-            latest_message
-        )
+    if body.strip().lower() == "thanks.":
+        if booking_flow_active:
+            body = ""
+        elif customer_requests_information(latest_message):
+            body = authoritative_information_fallback(
+                latest_message
+            )
 
     if body:
         parts.append(body)
@@ -7745,11 +7768,8 @@ def compose_verified_customer_reply(
     if calendar_text and calendar_text.lower() not in body.lower():
         parts.append(calendar_text)
 
-    if (
-        next_required_detail == "handoff"
-        and not customer_asks_if_booked(latest_message)
-    ):
-        handoff = (
+    if handoff_ready:
+        handoff = booked_status_handoff or (
             "Veronika will confirm the appointment with you shortly."
         )
 
@@ -7766,14 +7786,14 @@ def compose_verified_customer_reply(
             parts.append(next_question)
 
     if not parts:
-        parts.append(
-            next_question
-            or (
-                authoritative_information_fallback(latest_message)
-                if customer_requests_information(latest_message)
-                else "Thanks."
-            )
-        )
+        if next_question:
+            parts.append(next_question)
+        elif booking_flow_active:
+            parts.append("Your request details are saved.")
+        elif customer_requests_information(latest_message):
+            parts.append(authoritative_information_fallback(latest_message))
+        else:
+            parts.append("Thanks.")
 
     return collapse_repeated_reply_content(
         "\n\n".join(parts)
@@ -8145,6 +8165,14 @@ async def chat(
                 if alternative_resolution.get("status") == "ambiguous"
                 else "alternative_no_match"
             ),
+            "suggestions": [
+                option["label"]
+                for option in active_verified_alternatives(merged_state)
+            ],
+        }
+    elif active_verified_alternatives(merged_state):
+        calendar_result = {
+            "status": "pending_alternatives",
             "suggestions": [
                 option["label"]
                 for option in active_verified_alternatives(merged_state)
