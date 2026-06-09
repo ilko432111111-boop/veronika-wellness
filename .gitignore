@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 Codex Installer.exe
 Microsoft.Services.Store.winmd
+node_modules/
+qa-tests/screenshots/*
+qa-tests/reports/*
+!qa-tests/screenshots/.gitkeep
+!qa-tests/reports/.gitkeep

@@ -1,0 +1,13 @@
+{
+  "name": "veronika-wellness-qa",
+  "private": true,
+  "scripts": {
+    "qa:chatbot": "node qa-tests/run-chatbot-qa.js",
+    "qa:chatbot:headed": "node qa-tests/run-chatbot-qa.js --headed",
+    "qa:chatbot:debug": "node qa-tests/run-chatbot-qa.js --headed --slow-mo=250",
+    "qa:install": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.52.0"
+  }
+}
