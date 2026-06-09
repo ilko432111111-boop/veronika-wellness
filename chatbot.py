@@ -4332,6 +4332,19 @@ def build_calendar_alternative_reply(
     options = format_natural_list(suggestions)
     status = calendar_result.get("status")
 
+    if status == "alternative_ambiguous":
+        return (
+            f"I found more than one verified option matching that time: "
+            f"{options}.\n\nWhich one would you prefer?"
+        )
+
+    if status == "alternative_no_match":
+        return (
+            f"That time is not one of the current verified options. "
+            f"The available options are {options}.\n\n"
+            "Which one would you prefer?"
+        )
+
     if status == "closed_day":
         opening = "That day is closed."
     elif status == "past":
@@ -4687,6 +4700,252 @@ def format_datetime_slot(
         local_start.date().isoformat(),
         local_start.strftime("%H:%M"),
     )
+
+
+def structured_verified_alternatives(
+    suggestions: list[str],
+    duration_minutes: int | None,
+) -> list[dict]:
+    if not duration_minutes or duration_minutes <= 0:
+        return []
+
+    alternatives = []
+
+    for label in suggestions:
+        cleaned_label = str(label or "").strip()
+        relative_match = re.fullmatch(
+            r"(today|tomorrow) at ([0-2]\d:[0-5]\d)",
+            cleaned_label,
+            flags=re.IGNORECASE,
+        )
+        dated_match = re.fullmatch(
+            r"[A-Za-z]+ (\d{1,2}) ([A-Za-z]+) at ([0-2]\d:[0-5]\d)",
+            cleaned_label,
+        )
+
+        if not relative_match and not dated_match:
+            continue
+
+        try:
+            if relative_match:
+                day_offset = (
+                    1
+                    if relative_match.group(1).lower() == "tomorrow"
+                    else 0
+                )
+                parsed_date = (
+                    datetime.now(BUSINESS_TIMEZONE).date()
+                    + timedelta(days=day_offset)
+                )
+                parsed = datetime.fromisoformat(
+                    f"{parsed_date.isoformat()}T{relative_match.group(2)}"
+                )
+            else:
+                parsed = datetime.strptime(
+                    f"{dated_match.group(1)} {dated_match.group(2)} "
+                    f"{datetime.now(BUSINESS_TIMEZONE).year} "
+                    f"{dated_match.group(3)}",
+                    "%d %B %Y %H:%M",
+                )
+
+                if parsed.date() < datetime.now(BUSINESS_TIMEZONE).date():
+                    parsed = parsed.replace(year=parsed.year + 1)
+
+            alternatives.append({
+                "date": parsed.date().isoformat(),
+                "time": parsed.strftime("%H:%M"),
+                "label": format_customer_slot(
+                    parsed.date().isoformat(),
+                    parsed.strftime("%H:%M"),
+                ),
+                "duration_minutes": duration_minutes,
+            })
+        except ValueError:
+            continue
+
+    return alternatives
+
+
+def active_verified_alternatives(state: dict) -> list[dict]:
+    alternatives = state.get("verified_alternatives") or []
+
+    if not isinstance(alternatives, list):
+        return []
+
+    return [
+        option
+        for option in alternatives
+        if (
+            isinstance(option, dict)
+            and option.get("date")
+            and option.get("time")
+            and option.get("label")
+            and isinstance(option.get("duration_minutes"), int)
+            and option.get("duration_minutes") > 0
+        )
+    ]
+
+
+def message_explicitly_replaces_requested_slot(message: str) -> bool:
+    cleaned = str(message or "").lower()
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "actually",
+            "instead",
+            "change it",
+            "change the",
+            "different day",
+            "different time",
+            "new day",
+            "new time",
+            "i would like",
+            "i'd like",
+            "can i do",
+            "could i do",
+            "how about",
+            "what about",
+        ]
+    )
+
+
+def resolve_verified_alternative_reply(
+    state: dict,
+    latest_message: str,
+) -> dict:
+    alternatives = active_verified_alternatives(state)
+
+    if not alternatives:
+        return {"status": "not_applicable", "matches": []}
+
+    cleaned = re.sub(r"\s+", " ", str(latest_message or "").strip().lower())
+
+    if message_explicitly_replaces_requested_slot(cleaned):
+        return {"status": "explicit_replacement", "matches": []}
+
+    ordinal_patterns = [
+        (r"\b(?:the\s+)?first(?:\s+(?:one|option|slot))?\b", 0),
+        (r"\b(?:the\s+)?second(?:\s+(?:one|option|slot))?\b", 1),
+        (r"\b(?:the\s+)?third(?:\s+(?:one|option|slot))?\b", 2),
+        (r"\b(?:the\s+)?last(?:\s+(?:one|option|slot))?\b", -1),
+    ]
+
+    for pattern, index in ordinal_patterns:
+        if re.search(pattern, cleaned):
+            try:
+                return {
+                    "status": "selected",
+                    "matches": [alternatives[index]],
+                }
+            except IndexError:
+                return {"status": "no_match", "matches": []}
+
+    requested_time = parse_time_from_text(cleaned)
+    requested_times = [requested_time] if requested_time else []
+
+    if not requested_times:
+        bare_hour_match = re.search(
+            r"\b(1[0-2]|[1-9])\s+(?:works|suits|please)\b",
+            cleaned,
+        )
+
+        if bare_hour_match:
+            hour = int(bare_hour_match.group(1))
+            requested_times = [
+                f"{hour:02d}:00",
+                f"{(hour + 12) % 24:02d}:00",
+            ]
+
+    if not requested_times:
+        return {"status": "not_applicable", "matches": []}
+
+    matches = [
+        option
+        for option in alternatives
+        if option["time"] in requested_times
+    ]
+    date_words = re.findall(
+        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"january|february|march|april|may|june|july|august|september|"
+        r"october|november|december|\d{4}-\d{2}-\d{2})\b",
+        cleaned,
+    )
+
+    if date_words:
+        matches = [
+            option
+            for option in matches
+            if all(
+                word in option["label"].lower()
+                or word == option["date"]
+                for word in date_words
+            )
+        ]
+
+        day_match = re.search(r"\b([0-3]?\d)\s+[a-z]+\b", cleaned)
+
+        if day_match:
+            matches = [
+                option
+                for option in matches
+                if int(option["date"][-2:]) == int(day_match.group(1))
+            ]
+
+    if len(matches) == 1:
+        return {"status": "selected", "matches": matches}
+
+    if len(matches) > 1:
+        return {"status": "ambiguous", "matches": matches}
+
+    return {"status": "no_match", "matches": []}
+
+
+def apply_verified_alternative_resolution(
+    state: dict,
+    existing_state: dict,
+    resolution: dict,
+) -> dict:
+    result = dict(state)
+    alternatives = active_verified_alternatives(existing_state)
+    status = resolution.get("status")
+
+    if status == "selected":
+        selected = resolution["matches"][0]
+        result["preferred_date"] = selected["date"]
+        result["preferred_time"] = selected["time"]
+        result["verified_alternatives"] = []
+        return result
+
+    if status in {"ambiguous", "no_match"}:
+        result["preferred_date"] = existing_state.get("preferred_date")
+        result["preferred_time"] = existing_state.get("preferred_time")
+        result["verified_alternatives"] = alternatives
+        return result
+
+    treatment_changed = (
+        existing_state.get("treatment")
+        and result.get("treatment")
+        and normalise_treatment_name(existing_state.get("treatment"))
+        != normalise_treatment_name(result.get("treatment"))
+    )
+    duration_changed = (
+        parse_duration_minutes(existing_state.get("duration"))
+        != parse_duration_minutes(result.get("duration"))
+    )
+    schedule_changed = (
+        existing_state.get("preferred_date") != result.get("preferred_date")
+        or existing_state.get("preferred_time") != result.get("preferred_time")
+    )
+
+    result["verified_alternatives"] = (
+        []
+        if treatment_changed
+        or duration_changed
+        or schedule_changed
+        or status == "explicit_replacement"
+        else alternatives
+    )
+    return result
 
 
 def suggested_slot_is_within_live_hours(
@@ -6372,6 +6631,7 @@ CORE_STATE_FIELDS = [
     "preferred_time",
     "notes",
     "summary",
+    "verified_alternatives",
 ]
 
 PATCHABLE_FIELDS = {
@@ -6402,6 +6662,7 @@ def serialisable_saved_state(state: dict) -> dict:
             "active_category",
             "slot_status",
             "next_required_detail",
+            "verified_alternatives",
         ]
     }
 
@@ -7020,6 +7281,19 @@ def apply_canonical_controller_state(
         result.get("status"),
     )
 
+    suggestions = (calendar_result or {}).get("suggestions") or []
+
+    if suggestions:
+        result["verified_alternatives"] = structured_verified_alternatives(
+            suggestions,
+            parse_duration_minutes(result.get("duration")),
+        )
+    elif (calendar_result or {}).get("status") == "free":
+        result["verified_alternatives"] = []
+
+    if next_detail == "handoff":
+        result["verified_alternatives"] = []
+
     if result["status"] != "booking_request_complete":
         result["notification_sent_at"] = None
 
@@ -7042,7 +7316,8 @@ def verified_calendar_result_for_state(
     )
 
     if (
-        state.get("preferred_date") in [None, ""]
+        state.get("treatment") in [None, ""]
+        or state.get("preferred_date") in [None, ""]
         or state.get("preferred_time") in [None, ""]
         or not duration_minutes
         or duration_minutes <= 0
@@ -7050,7 +7325,8 @@ def verified_calendar_result_for_state(
         return {
             "status": "not_checked",
             "message": (
-                "A positive duration, date, and time are not all saved yet."
+                "A treatment, positive duration, date, and time are not all "
+                "saved yet."
             ),
         }
 
@@ -7152,28 +7428,13 @@ def sanitise_natural_responder_body(reply: str) -> str:
     """
     Keep the model-written body free of calendar wording and workflow prompts.
 
-    Python owns all calendar statements and workflow questions. This cleaner is
-    deliberately conservative because removing an unsafe sentence is better
-    than allowing generated scheduling details into the customer reply.
+    Python owns all calendar statements and workflow questions. Filter only
+    explicit booking or availability claims so factual FAQ answers containing
+    addresses, prices, durations, opening hours, or phone numbers survive.
     """
-    cleaned = normalise_reply_line_breaks(reply)
-    rejected_patterns = [
-        r"\?",
-        r"(?i)\b(?:availability|available|unavailable|calendar|schedule|slot|free|busy)\b",
-        r"(?i)\b(?:fit you in|opening hours|alternative times?|next available)\b",
-        r"(?i)\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        r"(?i)\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b",
-        r"\b20\d{2}-\d{2}-\d{2}\b",
-        r"(?i)\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
-        r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b",
-        r"(?i)\b(?:noon|midday|midnight|morning|afternoon|evening)\b",
-        r"(?i)\b(?:at|around)\s+\d{1,2}\b",
-        r"(?i)\b(?:which|what|when|how long|would you like|do you prefer|could you|can you)\b",
-        r"(?i)\b(?:tell|send|share|provide|give|need|let me know)\b[^.!?\n]*\b(?:name|phone|number|date|day|time|duration|treatment|service)\b",
-        r"(?i)\bveronika will (?:review|be in touch|get back to you)\b",
-        r"(?i)\blooking forward to welcoming you\b",
-        r"(?i)\bif there is anything else you would like to know\b",
-    ]
+    cleaned = strip_model_booking_questions(
+        normalise_reply_line_breaks(reply)
+    )
     safe_sentences = []
 
     for sentence in re.findall(r"[^.!?\n]+[.!?]?", cleaned):
@@ -7182,13 +7443,106 @@ def sanitise_natural_responder_body(reply: str) -> str:
         if not sentence:
             continue
 
-        if any(re.search(pattern, sentence) for pattern in rejected_patterns):
+        if sentence_contains_forbidden_booking_claim(sentence):
             continue
 
         safe_sentences.append(sentence)
 
     return collapse_repeated_reply_content(
         " ".join(safe_sentences)
+    )
+
+
+def sentence_contains_forbidden_booking_claim(sentence: str) -> bool:
+    """Identify explicit model-owned booking claims, not generic numbers."""
+    cleaned = str(sentence or "").strip()
+    forbidden_patterns = [
+        r"(?i)\b(?:i have|i've|we have|we've)\s+(?:booked|confirmed|reserved|scheduled)\b",
+        r"(?i)\b(?:you(?:'re| are)|your (?:booking|appointment|visit))\s+(?:is\s+)?(?:booked|confirmed|reserved|scheduled)\b",
+        r"(?i)\b(?:booking|appointment)\s+(?:is|has been)\s+(?:booked|confirmed|reserved|scheduled)\b",
+        r"(?i)\b(?:i checked|i have checked|we checked|we have checked)\s+(?:the\s+)?(?:calendar|schedule|availability)\b",
+        r"(?i)\b(?:i|we)\s+have\s+availability\b",
+        r"(?i)\b(?:next available|alternative)\s+(?:slot|appointment|time)\b",
+        r"(?i)\b(?:fit you in|found you a slot|offer you a slot)\b",
+        r"(?i)^try\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+instead\b",
+        r"(?i)\b(?:around\s+)?(?:noon|midday|midnight|morning|afternoon|evening|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+could\s+also\s+work\b",
+        r"(?i)\b(?:slot|appointment|requested time|requested date)\b[^.!?]*\b(?:is|looks|appears|seems)\s+(?:available|free|busy|unavailable)\b",
+        r"(?i)\b(?:available|free|busy|unavailable)\b[^.!?]*\b(?:slot|appointment|requested time|requested date)\b",
+        r"(?i)\b(?:calendar|schedule)\b[^.!?]*\b(?:shows|says|confirms|has|is|looks|appears)\b",
+        r"(?i)\b(?:i(?:'ll| will)? have the therapist|the therapist will)\s+check\b[^.!?]*\bconfirm\b",
+        r"(?i)\bveronika will (?:review|be in touch|get back to you)\b",
+        r"(?i)\blooking forward to welcoming you\b",
+        r"(?i)\bif there is anything else you would like to know\b",
+    ]
+    return any(re.search(pattern, cleaned) for pattern in forbidden_patterns)
+
+
+def reply_is_meaningful(reply: str) -> bool:
+    cleaned = str(reply or "").strip()
+    return bool(
+        cleaned
+        and re.search(r"[A-Za-z0-9£]", cleaned)
+    )
+
+
+def customer_requests_information(message: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(message or "").strip().lower())
+
+    if not cleaned:
+        return False
+
+    if "?" in cleaned:
+        return True
+
+    return bool(re.match(
+        r"^(?:where|what|which|who|when|why|how|is|are|do|does|can|could|"
+        r"tell me|please tell me)\b",
+        cleaned,
+    ))
+
+
+def customer_asks_business_faq(message: str) -> bool:
+    cleaned = normalise_service_match_text(message)
+    faq_phrases = [
+        "where",
+        "based",
+        "address",
+        "location",
+        "city centre",
+        "how much",
+        "price",
+        "cost",
+        "do you offer",
+        "do you have",
+        "opening",
+        "open",
+        "close",
+        "phone",
+        "number",
+        "parking",
+    ]
+    return any(phrase in cleaned for phrase in faq_phrases)
+
+
+def authoritative_information_fallback(latest_message: str) -> str:
+    """Answer only stable built-in business facts; otherwise admit the gap."""
+    cleaned = normalise_service_match_text(latest_message)
+
+    if any(
+        phrase in cleaned
+        for phrase in [
+            "where",
+            "based",
+            "address",
+            "location",
+            "city centre",
+        ]
+    ):
+        return f"We're based at {BUSINESS_ADDRESS}."
+
+    return (
+        "I'm sorry, I do not have that information available. "
+        "Veronika can confirm it for you."
     )
 
 
@@ -7214,6 +7568,22 @@ def customer_explicitly_asks_availability(message: str) -> bool:
                 "is the slot free",
             ]
         )
+    )
+
+
+def customer_asks_if_booked(message: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(message or "").strip().lower())
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "am i booked",
+            "is it booked",
+            "is that booked",
+            "is my appointment confirmed",
+            "is it confirmed",
+            "so i'm booked",
+            "so i am booked",
+        ]
     )
 
 
@@ -7247,8 +7617,8 @@ def generate_natural_reply_body(
         reply = normalise_reply_line_breaks(
             completion.choices[0].message.content
         )
-        reply = sanitise_booking_claims(reply)
         reply = sanitise_natural_responder_body(reply)
+        reply = sanitise_booking_claims(reply)
         return reply.strip()
 
     except Exception as error:
@@ -7264,29 +7634,16 @@ def strip_unverified_calendar_claims(
     Remove model-written calendar claims unless Python has verified that the
     wording is allowed. Calendar text is appended deterministically later.
     """
-    cleaned = str(reply or "")
-    patterns = [
-        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:availability|available|unavailable|calendar|schedule|slot|free|busy|fit you in|opening hours|alternative times?|next available)[^.!?]*[.!?]?",
-        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)[^.!?]*[.!?]?",
-        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:january|february|march|april|may|june|july|august|september|october|november|december)[^.!?]*[.!?]?",
-        r"(?is)(?:^|(?<=[.!?]))\s*[^.!?]*(?:\b(?:[01]?\d|2[0-3]):[0-5]\d\b|\b\d{1,2}\s*(?:am|pm)\b|\b(?:noon|midday|midnight|morning|afternoon|evening)\b|\b(?:at|around)\s+\d{1,2}\b)[^.!?]*[.!?]?",
-        r"(?is)(?:\s*\n\s*)?i(?:'ll| will)? have the therapist check that slot and confirm[.!]?",
-        r"(?is)(?:\s*\n\s*)?the therapist will check (?:that|the) slot and confirm[.!]?",
-        r"(?is)(?:\s*\n\s*)?the therapist will check[^.!?]*(?:and )?confirm[.!]?",
-        r"(?is)(?:\s*\n\s*)?i(?:'ll| will) have the therapist check[^.!?]*(?:and )?confirm[.!]?",
-        r"(?is)(?:\s*\n\s*)?(?:that|the requested) slot (?:looks|appears|is) free[.!]?",
-        r"(?is)(?:\s*\n\s*)?(?:that|the requested) time (?:looks|appears|is) free[.!]?",
-    ]
+    del calendar_result
+    safe_sentences = []
 
-    for pattern in patterns:
-        cleaned = re.sub(
-            pattern,
-            "",
-            cleaned,
-        )
+    for sentence in re.findall(r"[^.!?\n]+[.!?]?", str(reply or "")):
+        sentence = sentence.strip()
 
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+        if sentence and not sentence_contains_forbidden_booking_claim(sentence):
+            safe_sentences.append(sentence)
+
+    return collapse_repeated_reply_content(" ".join(safe_sentences))
 
 
 def compose_verified_customer_reply(
@@ -7322,14 +7679,22 @@ def compose_verified_customer_reply(
 
         return alternative_reply
 
-    body = generate_natural_reply_body(
-        state,
-        extractor_result,
-        business_context,
-        services_context,
-        latest_message,
-        history,
-    )
+    if customer_asks_if_booked(latest_message):
+        body = (
+            "Your request has been noted, but the appointment is not "
+            "confirmed yet. Veronika will confirm it with you shortly."
+        )
+    elif extractor_result.get("verified_alternative_selected"):
+        body = ""
+    else:
+        body = generate_natural_reply_body(
+            state,
+            extractor_result,
+            business_context,
+            services_context,
+            latest_message,
+            history,
+        )
     calendar_text = safe_calendar_customer_text(
         state,
         calendar_result,
@@ -7351,13 +7716,39 @@ def compose_verified_customer_reply(
         calendar_result,
     )
 
+    if not reply_is_meaningful(body):
+        body = ""
+
+    if (
+        not body
+        and customer_requests_information(latest_message)
+        and (
+            not next_question
+            or customer_asks_business_faq(latest_message)
+        )
+    ):
+        body = authoritative_information_fallback(
+            latest_message
+        )
+
+    if (
+        body.strip().lower() == "thanks."
+        and customer_requests_information(latest_message)
+    ):
+        body = authoritative_information_fallback(
+            latest_message
+        )
+
     if body:
         parts.append(body)
 
     if calendar_text and calendar_text.lower() not in body.lower():
         parts.append(calendar_text)
 
-    if next_required_detail == "handoff":
+    if (
+        next_required_detail == "handoff"
+        and not customer_asks_if_booked(latest_message)
+    ):
         handoff = (
             "Veronika will confirm the appointment with you shortly."
         )
@@ -7377,7 +7768,11 @@ def compose_verified_customer_reply(
     if not parts:
         parts.append(
             next_question
-            or "Thanks."
+            or (
+                authoritative_information_fallback(latest_message)
+                if customer_requests_information(latest_message)
+                else "Thanks."
+            )
         )
 
     return collapse_repeated_reply_content(
@@ -7697,12 +8092,27 @@ async def chat(
         history=effective_history,
         services_context=services_context,
     )
+    alternative_resolution = resolve_verified_alternative_reply(
+        current_state,
+        request.message,
+    )
+
+    if alternative_resolution.get("status") == "selected":
+        extractor_result = {
+            **extractor_result,
+            "verified_alternative_selected": True,
+        }
 
     merged_state = apply_validated_state_patch(
         existing_state=current_state,
         extractor_result=extractor_result,
         latest_message=request.message,
         history=effective_history,
+    )
+    merged_state = apply_verified_alternative_resolution(
+        merged_state,
+        current_state,
+        alternative_resolution,
     )
     merged_state = add_manual_multi_treatment_note(
         merged_state,
@@ -7728,11 +8138,24 @@ async def chat(
     ):
         return {"reply": CANONICAL_SAVE_FAILURE_REPLY}
 
-    calendar_result = verified_calendar_result_for_state(
-        merged_state,
-        booking_flow_active,
-        request.message,
-    )
+    if alternative_resolution.get("status") in {"ambiguous", "no_match"}:
+        calendar_result = {
+            "status": (
+                "alternative_ambiguous"
+                if alternative_resolution.get("status") == "ambiguous"
+                else "alternative_no_match"
+            ),
+            "suggestions": [
+                option["label"]
+                for option in active_verified_alternatives(merged_state)
+            ],
+        }
+    else:
+        calendar_result = verified_calendar_result_for_state(
+            merged_state,
+            booking_flow_active,
+            request.message,
+        )
 
     merged_state = apply_canonical_controller_state(
         merged_state,
