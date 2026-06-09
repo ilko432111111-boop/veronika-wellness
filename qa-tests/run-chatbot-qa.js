@@ -20,6 +20,9 @@ const FAILURE_CATEGORIES = [
   "Service Switching",
   "Side Question Handling",
   "Premature Handoff",
+  "Soft Premature Handoff",
+  "Contact Detail Ignored",
+  "Repeated Slot Prompt",
   "State Persistence"
 ];
 
@@ -47,10 +50,20 @@ const HANDOFF_PATTERNS = [
   /\b(?:i(?:'|\u2019)ll|i have|i(?:'|\u2019)ve)\s+let\s+veronika\s+know\b/i,
   /\b(?:i(?:'|\u2019)ll|we(?:'|\u2019)ll|i will|we will)\s+pass\s+(?:your\s+)?(?:request|details)\s+on\b/i,
   /\b(?:i(?:'|\u2019)ll|we(?:'|\u2019)ll|i will|we will)\s+(?:be in touch|get back to you|follow up)\b/i,
-  /\b(?:i(?:'|\u2019)ll|we(?:'|\u2019)ll|i will|we will)\s+take care of (?:the )?rest\b/i,
   /\bveronika\s+will\s+(?:be in touch|contact|review|get back|follow up|confirm)\b/i,
   /\b(?:she|the therapist)\s+will\s+(?:be in touch|contact|get back|follow up|confirm)\b/i,
   /\b(?:request|details|booking request)\s+(?:has|have)\s+been\s+(?:sent|passed on|forwarded)\b/i
+];
+
+const SOFT_HANDOFF_PATTERNS = [
+  /\b(?:we|i)(?:'|\u2019)ll\s+take care of\b/i,
+  /\bwe(?:'|\u2019)ll\s+get everything set up\b/i,
+  /\bwe(?:'|\u2019)ll\s+make sure everything is ready\b/i,
+  /\b(?:we|i)(?:'|\u2019)ll\s+arrange (?:the )?(?:remaining )?details\b/i,
+  /\bi(?:'|\u2019)ll\s+look into suitable times and get back to you\b/i,
+  /\bi(?:'|\u2019)ve noted your request and (?:i |we )?will take care of\b/i,
+  /\bi(?:'|\u2019)ve noted your request and (?:i(?:'|\u2019)ll|we(?:'|\u2019)ll)\s+take care of\b/i,
+  /\bi(?:'|\u2019)ve noted (?:your|the)\s+(?:request|preference|details?)[^.!?]{0,80}\band will take care of\b/i
 ];
 
 const AUTONOMOUS_CONFIRMATION_PATTERNS = [
@@ -125,7 +138,8 @@ function createConversationState() {
     availabilityVerified: false,
     nameClearlyRequested: false,
     phoneClearlyRequested: false,
-    lastBotReply: ""
+    lastBotReply: "",
+    lastSlotOptionsSignature: null
   };
 }
 
@@ -196,6 +210,8 @@ function updateStateFromUser(state, message) {
     state.name = text.match(/\b(?:my name is|i am|i'm)\s+([a-z][a-z'-]+)/i)[1];
   } else if (asksQuestionType(state.lastBotReply, "name") && /^[a-z][a-z'-]+$/i.test(text)) {
     state.name = text;
+  } else if (/^[A-Z][a-z'-]+$/.test(text)) {
+    state.name = text;
   }
 
   if (
@@ -207,6 +223,20 @@ function updateStateFromUser(state, message) {
   }
 }
 
+function contactDetailsProvided(message) {
+  const text = message.trim();
+  const phone = text.match(/(?:\+44|0)7[\d\s-]{8,13}\d/)?.[0]?.replace(/[^\d+]/g, "") || null;
+  const explicitName = text.match(/\b(?:my name is|i am|i'm)\s+([a-z][a-z'-]+)/i)?.[1] ||
+    text.match(/^([a-z][a-z'-]+)\s*[,-]\s*(?:\+44|0)7/i)?.[1] ||
+    (/^[A-Z][a-z'-]+$/.test(text) ? text : null);
+  return {
+    providedName: Boolean(explicitName),
+    providedPhone: Boolean(phone),
+    name: explicitName || null,
+    phone
+  };
+}
+
 function updateStateFromBot(state, reply) {
   if (/\bcurrently appears free\b/i.test(reply)) {
     state.availabilityVerified = true;
@@ -216,6 +246,7 @@ function updateStateFromBot(state, reply) {
   }
   state.nameClearlyRequested ||= asksQuestionType(reply, "name");
   state.phoneClearlyRequested ||= asksQuestionType(reply, "phone");
+  state.lastSlotOptionsSignature = slotOptionsSignature(reply);
   state.lastBotReply = reply;
 }
 
@@ -255,7 +286,67 @@ function handoffEligibleForVisibleConversation(state) {
   );
 }
 
+function leadCompleteForProceeding(state) {
+  return Boolean(
+    state.treatment &&
+    state.treatmentResolved &&
+    state.duration &&
+    state.preferredDate &&
+    state.preferredTime &&
+    state.availabilityVerified &&
+    state.name &&
+    state.phone
+  );
+}
+
+function acknowledgesContactDetails(reply, turnContext) {
+  const lower = reply.toLowerCase();
+  if (/\b(?:thank you|thanks)\s+(?:for sharing|for providing)\s+(?:your\s+)?details\b/i.test(reply) ||
+      /\b(?:noted|saved|got)\s+(?:your\s+)?(?:contact details|details|name|phone|number)\b/i.test(reply)) {
+    return true;
+  }
+  if (turnContext.providedName && turnContext.name && lower.includes(turnContext.name.toLowerCase())) {
+    return true;
+  }
+  return turnContext.providedPhone && turnContext.phone &&
+    reply.replace(/[^\d]/g, "").includes(turnContext.phone.replace(/[^\d]/g, ""));
+}
+
+function asksClearMissingDetailQuestion(reply) {
+  return ["treatment", "duration", "date", "time", "name", "phone"]
+    .some((type) => asksQuestionType(reply, type));
+}
+
+function slotOptionsSignature(reply) {
+  if (!/\b(?:next available options|current verified options|verified options)\b/i.test(reply)) {
+    return null;
+  }
+  return reply
+    .split(/\n\s*\n/)[0]
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function issueGuidance(message) {
+  if (/soft premature handoff/i.test(message)) {
+    return {
+      likelyRootCause: "The natural responder is adding reassuring proceed-language before the lead is complete.",
+      suggestedFixDirection: "Strip soft proceed-language during active collection and allow it only after treatment, schedule, verified availability, name, and phone are resolved."
+    };
+  }
+  if (/contact detail ignored/i.test(message)) {
+    return {
+      likelyRootCause: "The latest contact-detail extraction is not influencing final response composition.",
+      suggestedFixDirection: "Acknowledge newly supplied contact details before continuing with one clear next-required-detail question."
+    };
+  }
+  if (/repeated slot prompt/i.test(message)) {
+    return {
+      likelyRootCause: "Pending slot alternatives are overriding the customer's latest useful information.",
+      suggestedFixDirection: "Process and acknowledge the latest message before repeating verified alternatives, and avoid repeating an unchanged slot prompt verbatim."
+    };
+  }
   if (/premature handoff|handoff wording/i.test(message)) {
     return {
       likelyRootCause: "Handoff language is being generated before the workflow state passes the handoff eligibility gate.",
@@ -323,6 +414,15 @@ function issueGuidance(message) {
 }
 
 function issueImpact(message) {
+  if (/soft premature handoff/i.test(message)) {
+    return "The customer may believe the business is already proceeding with an incomplete or unverified request.";
+  }
+  if (/contact detail ignored/i.test(message)) {
+    return "The customer cannot tell whether their name or phone number was captured, which undermines lead capture reliability.";
+  }
+  if (/repeated slot prompt/i.test(message)) {
+    return "Repeating unchanged slot options after useful new information makes the bot appear stuck and ignores customer progress.";
+  }
   if (/premature handoff|handoff wording/i.test(message)) {
     return "The customer may believe their incomplete request has already been handed to Veronika.";
   }
@@ -363,6 +463,15 @@ function failureCategory(message, expected = "") {
   const combined = `${message} ${expected}`;
   if (/runner error|connection|network|timeout|reach|service health/i.test(combined)) {
     return "Connection / Infrastructure";
+  }
+  if (/soft premature handoff/i.test(combined)) {
+    return "Soft Premature Handoff";
+  }
+  if (/contact detail ignored/i.test(combined)) {
+    return "Contact Detail Ignored";
+  }
+  if (/repeated slot prompt/i.test(combined)) {
+    return "Repeated Slot Prompt";
   }
   if (/premature handoff|handoff wording|autonomously confirmed|reserved/i.test(combined)) {
     return "Premature Handoff";
@@ -409,9 +518,10 @@ function createIssue({
   };
 }
 
-function detectIssues({ state, reply, step }) {
+function detectIssues({ state, reply, step, turnContext = {} }) {
   const issues = [];
   const handoffDetected = HANDOFF_PATTERNS.some((pattern) => pattern.test(reply));
+  const softHandoffDetected = SOFT_HANDOFF_PATTERNS.some((pattern) => pattern.test(reply));
 
   if (handoffDetected && !handoffEligibleForVisibleConversation(state)) {
     issues.push(createIssue({
@@ -420,6 +530,51 @@ function detectIssues({ state, reply, step }) {
       expected: "Continue collecting required booking details without implying handoff.",
       actual: reply,
       reason: "The reply used handoff wording before the visible conversation met handoff eligibility."
+    }));
+  }
+
+  if (softHandoffDetected && !leadCompleteForProceeding(state)) {
+    issues.push(createIssue({
+      confidence: "definite failure",
+      category: "Soft Premature Handoff",
+      message: "Soft premature handoff wording appeared before the lead was complete.",
+      expected: "Continue collecting treatment, duration, date, time, verified availability, name, and phone without implying the business will proceed.",
+      actual: reply,
+      reason: "The reply implied the business would take care of remaining steps before the complete lead state was resolved."
+    }));
+  }
+
+  const contactProvided = turnContext.providedName || turnContext.providedPhone;
+  const contactAcknowledged = contactProvided && acknowledgesContactDetails(reply, turnContext);
+  const currentSlotSignature = slotOptionsSignature(reply);
+  if (
+    contactProvided &&
+    !contactAcknowledged &&
+    !asksClearMissingDetailQuestion(reply)
+  ) {
+    issues.push(createIssue({
+      confidence: "likely failure",
+      category: "Contact Detail Ignored",
+      message: "Contact detail ignored after the customer supplied a name or phone number.",
+      expected: "Acknowledge the newly supplied contact detail or continue with one clear missing-detail question.",
+      actual: reply,
+      reason: "The reply neither acknowledged the new contact information nor asked a clear next-required-detail question."
+    }));
+  }
+
+  if (
+    contactProvided &&
+    !contactAcknowledged &&
+    currentSlotSignature &&
+    currentSlotSignature === turnContext.previousSlotOptionsSignature
+  ) {
+    issues.push(createIssue({
+      confidence: "likely failure",
+      category: "Repeated Slot Prompt",
+      message: "Repeated slot prompt ignored useful contact details.",
+      expected: "Acknowledge the newly supplied name or phone before repeating or advancing slot selection.",
+      actual: reply,
+      reason: "The bot repeated the same verified options after the customer supplied useful contact information."
     }));
   }
 
@@ -659,6 +814,10 @@ async function runScenario(browser, scenario) {
         SELECTORS.typingText
       );
 
+      const turnContext = {
+        ...contactDetailsProvided(step.text),
+        previousSlotOptionsSignature: state.lastSlotOptionsSignature
+      };
       updateStateFromUser(state, step.text);
       await page.locator(SELECTORS.input).fill(step.text);
       await page.locator(SELECTORS.sendButton).click();
@@ -668,7 +827,7 @@ async function runScenario(browser, scenario) {
       const botReply = await waitForBotReply(page, previousBotCount);
       updateStateFromBot(state, botReply);
       const botScreenshot = await takeScreenshot(page, scenarioSlug, stepNumber, "bot");
-      const issues = detectIssues({ state, reply: botReply, step });
+      const issues = detectIssues({ state, reply: botReply, step, turnContext });
       let annotationFile = null;
 
       if (issues.length) {

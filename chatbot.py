@@ -7060,8 +7060,10 @@ def apply_validated_state_patch(
     parsed_phone = parse_phone_from_text(
         str(patch.get("phone") or latest_message)
     )
+    # Duration is a calendar-critical field. Accept it only when the newest
+    # customer message explicitly supplies it; never trust an extractor guess.
     parsed_duration = explicit_duration_minutes_from_reply(
-        str(patch.get("duration") or latest_message),
+        latest_message,
         treatment=result.get("treatment"),
     )
 
@@ -7466,6 +7468,7 @@ IMPORTANT LOCKED RULES:
 - The saved state below is authoritative.
 - Never mention, paraphrase, invent, or calculate availability, calendar results, dates, weekdays, times, or slots.
 - Never mention handoff, contacting Veronika, confirmation, review, follow-up, or passing the request on. Python will append final handoff wording if eligible.
+- Never imply the business will proceed or finish the request. Do not say "we'll take care of the rest", "we'll take care of the next steps", "we'll get everything set up", "we'll make sure everything is ready", "we'll arrange the remaining details", or similar.
 - Never claim that an appointment is confirmed.
 - Do not ask any question or request any missing booking detail.
 - Answer a customer's side question briefly when possible.
@@ -7544,6 +7547,13 @@ def sentence_contains_forbidden_booking_claim(sentence: str) -> bool:
         r"(?i)\b(?:we(?:['\u2019]ll| will)|i(?:['\u2019]ll| will))\s+pass\s+your\s+request\s+(?:on\s+)?to\s+veronika\b",
         r"(?i)\b(?:we(?:['\u2019]ll| will)|i(?:['\u2019]ll| will))\s+pass\s+your\s+request\s+on\b",
         r"(?i)\b(?:i(?:['\u2019]ll| will)|i have|i['\u2019]ve)\s+let\s+veronika\s+know\b",
+        r"(?i)\b(?:we|i)(?:['\u2019]ll| will)\s+take care of\b",
+        r"(?i)\bwe(?:['\u2019]ll| will)\s+get everything set up\b",
+        r"(?i)\bwe(?:['\u2019]ll| will)\s+make sure everything is ready\b",
+        r"(?i)\b(?:we|i)(?:['\u2019]ll| will)\s+arrange (?:the )?(?:remaining )?details\b",
+        r"(?i)\bi(?:['\u2019]ve| have) noted (?:your|the)\s+(?:request|preference|details?)[^.!?]{0,80}\b(?:and\s+)?(?:i|we)?\s*(?:will|['\u2019]ll)\s+take care of\b",
+        r"(?i)\bi(?:['\u2019]ll| will)\s+look into suitable times and get back to you\b",
+        r"(?i)\bwe(?:['\u2019]ll| will)\s+(?:be in touch|get back to you)\b",
         r"(?i)\bveronika will confirm(?: the appointment| it| your request)?(?: with you)?(?: shortly)?\b",
         r"(?i)\bveronika will (?:review|be in touch|contact you|get back to you|follow up)\b",
         r"(?i)\b(?:she(?:['\u2019]ll| will)|the therapist will) (?:be in touch|contact you|get back to you|follow up|confirm)\b",
@@ -7628,6 +7638,46 @@ def latest_assistant_reply(history: list[ChatMessage]) -> str:
     for message in reversed(history):
         if message.role not in {"user", "customer"}:
             return str(message.content or "")
+
+    return ""
+
+
+def newest_contact_acknowledgement(
+    state: dict,
+    extractor_result: dict,
+    latest_message: str,
+) -> str:
+    """Acknowledge contact details supplied in the newest customer turn."""
+    patch = extractor_result.get("state_patch") or {}
+    parsed_phone = parse_phone_from_text(latest_message)
+    supplied_phone = bool(
+        parsed_phone
+        and is_valid_phone_number(parsed_phone)
+        and state.get("phone") not in [None, ""]
+    )
+    name_candidate = str(patch.get("name") or "").strip()
+    if (
+        not name_candidate
+        and state.get("name") not in [None, ""]
+        and str(latest_message or "").strip().lower()
+        == str(state.get("name") or "").strip().lower()
+    ):
+        name_candidate = str(state.get("name") or "").strip()
+
+    supplied_name = bool(
+        name_candidate
+        and is_valid_customer_name(name_candidate)
+        and state.get("name") not in [None, ""]
+    )
+
+    if supplied_name and supplied_phone:
+        return "Thanks, I've got your name and phone number."
+
+    if supplied_name:
+        return "Thanks, I've got your name."
+
+    if supplied_phone:
+        return "Thanks, I've got your phone number."
 
     return ""
 
@@ -7748,15 +7798,50 @@ def compose_verified_customer_reply(
     )
 
     # Suggested slots are fully deterministic because the model must never
-    # invent alternatives or rewrite date labels.
+    # invent alternatives or rewrite date labels. The newest useful message
+    # still gets handled first so pending alternatives cannot swallow a side
+    # question or newly supplied contact detail.
     if calendar_result.get("suggestions"):
+        parts = []
+        contact_acknowledgement = newest_contact_acknowledgement(
+            state,
+            extractor_result,
+            latest_message,
+        )
+
+        if contact_acknowledgement:
+            parts.append(contact_acknowledgement)
+
+        if customer_requests_information(latest_message):
+            information_body = generate_natural_reply_body(
+                state,
+                extractor_result,
+                business_context,
+                services_context,
+                latest_message,
+                history,
+            )
+            information_body = sanitise_natural_responder_body(
+                information_body
+            )
+            information_body = strip_unverified_calendar_claims(
+                information_body,
+                calendar_result,
+            )
+
+            if reply_is_meaningful(information_body):
+                parts.append(information_body)
+
         alternative_reply = collapse_repeated_reply_content(
             build_calendar_alternative_reply(
                 calendar_result
             )
         )
+        parts.append(alternative_reply)
 
-        return alternative_reply
+        return collapse_repeated_reply_content(
+            "\n\n".join(parts)
+        )
 
     if customer_asks_if_booked(latest_message):
         body = (

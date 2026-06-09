@@ -48,6 +48,9 @@ Each detected issue includes:
   - `Service Switching`
   - `Side Question Handling`
   - `Premature Handoff`
+  - `Soft Premature Handoff`
+  - `Contact Detail Ignored`
+  - `Repeated Slot Prompt`
   - `State Persistence`
 - Expected behavior.
 - The exact bot reply.
