@@ -1624,15 +1624,34 @@
                     },
                     body: JSON.stringify({ booking_request_id: requestId })
                 });
-                const result = await response.json();
+                const responseText = await response.text();
+                let result = null;
 
-                if (!response.ok) {
-                    throw new Error(result.detail || "The appointment could not be confirmed.");
+                if (responseText.trim()) {
+                    try {
+                        result = JSON.parse(responseText);
+                    } catch (parseError) {
+                        console.error(
+                            "Confirmation endpoint returned invalid JSON.",
+                            parseError
+                        );
+                    }
                 }
 
-                message.textContent = result.already_confirmed
-                    ? "This appointment was already confirmed."
-                    : "Appointment confirmed and added to Google Calendar.";
+                if (!response.ok || !result?.success) {
+                    throw new Error(
+                        result?.message
+                        || result?.detail
+                        || (
+                            responseText.trim()
+                                ? `The server returned an invalid response (HTTP ${response.status}).`
+                                : `The server returned an empty response (HTTP ${response.status}).`
+                        )
+                    );
+                }
+
+                message.textContent =
+                    result.message || "Appointment confirmed and added to Google Calendar.";
                 button.textContent = "Confirmed";
                 await loadLeads();
             } catch (error) {

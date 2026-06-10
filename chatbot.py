@@ -1,5 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from groq import Groq
 from supabase import create_client, Client
@@ -16,6 +16,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -23,6 +24,8 @@ import time
 from zoneinfo import ZoneInfo
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def read_positive_int_environment_variable(name: str, default: int) -> int:
@@ -6907,6 +6910,41 @@ def confirmation_missing_fields(
     return [label for label, present in checks.items() if not present]
 
 
+def confirmation_json_response(
+    success: bool,
+    status: str,
+    message: str,
+    status_code: int = 200,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "success": success,
+            "status": status,
+            "message": message,
+        },
+    )
+
+
+def release_confirmation_claim(
+    booking_request_id: int,
+    claim_token: str,
+) -> None:
+    try:
+        supabase.rpc(
+            "release_booking_request_confirmation",
+            {
+                "target_request_id": booking_request_id,
+                "lock_token": claim_token,
+            },
+        ).execute()
+    except Exception:
+        logger.exception(
+            "Could not release confirmation claim for booking request %s",
+            booking_request_id,
+        )
+
+
 @app.post("/admin/confirm-appointment")
 async def confirm_appointment(
     confirmation: ConfirmAppointmentRequest,
@@ -6918,20 +6956,61 @@ async def confirm_appointment(
     The database claim prevents concurrent clicks from creating duplicate
     Google events. Calendar availability is always rechecked after the claim.
     """
-    require_authenticated_admin(request)
-    booking_request, conversation, items = load_confirmation_context(
-        confirmation.booking_request_id
-    )
+    booking_request_id = confirmation.booking_request_id
+
+    try:
+        require_authenticated_admin(request)
+    except HTTPException as error:
+        return confirmation_json_response(
+            False,
+            "error",
+            str(error.detail),
+            error.status_code,
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected admin authentication error while confirming booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "Admin authentication could not be verified. Please sign in again.",
+            401,
+        )
+
+    try:
+        booking_request, conversation, items = load_confirmation_context(
+            booking_request_id
+        )
+    except HTTPException as error:
+        return confirmation_json_response(
+            False,
+            "error",
+            str(error.detail),
+            error.status_code,
+        )
+    except Exception:
+        logger.exception(
+            "Could not load confirmation context for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "The appointment request could not be loaded. Please try again.",
+            500,
+        )
 
     if (
         booking_request.get("request_status") == "confirmed"
         and booking_request.get("calendar_event_id")
     ):
-        return {
-            "status": "confirmed",
-            "booking_request": booking_request,
-            "already_confirmed": True,
-        }
+        return confirmation_json_response(
+            True,
+            "already_confirmed",
+            "This appointment was already confirmed.",
+        )
 
     if booking_request.get("request_status") in {
         "expired",
@@ -6939,9 +7018,11 @@ async def confirm_appointment(
         "completed",
         "abandoned",
     }:
-        raise HTTPException(
-            status_code=409,
-            detail="This appointment request is no longer active.",
+        return confirmation_json_response(
+            False,
+            "error",
+            "This appointment request is no longer active.",
+            409,
         )
 
     missing = confirmation_missing_fields(
@@ -6951,77 +7032,166 @@ async def confirm_appointment(
     )
 
     if missing:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot confirm until these details are present: " + ", ".join(missing),
-        )
-
-    duration_minutes = int(booking_request["total_duration_minutes"])
-    confirmation_state = {
-        "preferred_date": booking_request["preferred_date"],
-        "preferred_time": booking_request["preferred_time"],
-        "duration": f"{duration_minutes} minutes",
-    }
-    slot = build_requested_slot(confirmation_state)
-
-    if not slot:
-        raise HTTPException(status_code=400, detail="The requested slot is invalid.")
-
-    start_time, end_time, _ = slot
-    claim_token = secrets.token_urlsafe(24)
-    claim_response = supabase.rpc(
-        "claim_booking_request_confirmation",
-        {
-            "target_request_id": confirmation.booking_request_id,
-            "new_lock_token": claim_token,
-        },
-    ).execute()
-
-    if not claim_response.data:
-        latest, _, _ = load_confirmation_context(
-            confirmation.booking_request_id
-        )
-
-        if latest.get("request_status") == "confirmed" and latest.get("calendar_event_id"):
-            return {
-                "status": "confirmed",
-                "booking_request": latest,
-                "already_confirmed": True,
-            }
-
-        raise HTTPException(
-            status_code=409,
-            detail="This request is already being confirmed. Please refresh in a moment.",
+        return confirmation_json_response(
+            False,
+            "error",
+            "Cannot confirm until these details are present: " + ", ".join(missing),
+            400,
         )
 
     try:
-        event = find_google_calendar_event_for_request(
-            confirmation.booking_request_id
+        duration_minutes = int(booking_request["total_duration_minutes"])
+        confirmation_state = {
+            "preferred_date": booking_request["preferred_date"],
+            "preferred_time": booking_request["preferred_time"],
+            "duration": f"{duration_minutes} minutes",
+        }
+        slot = build_requested_slot(confirmation_state)
+    except Exception:
+        logger.exception(
+            "Could not build requested slot for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "The requested appointment time is invalid.",
+            400,
         )
 
-        if not event:
+    if not slot:
+        return confirmation_json_response(
+            False,
+            "error",
+            "The requested appointment time is invalid.",
+            400,
+        )
+
+    start_time, end_time, _ = slot
+    claim_token = secrets.token_urlsafe(24)
+
+    try:
+        claim_response = supabase.rpc(
+            "claim_booking_request_confirmation",
+            {
+                "target_request_id": booking_request_id,
+                "new_lock_token": claim_token,
+            },
+        ).execute()
+    except Exception:
+        logger.exception(
+            "Could not claim confirmation for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "The appointment could not be locked for confirmation. Please try again.",
+            500,
+        )
+
+    if not getattr(claim_response, "data", None):
+        try:
+            latest, _, _ = load_confirmation_context(booking_request_id)
+        except Exception:
+            logger.exception(
+                "Could not reload booking request %s after confirmation claim conflict",
+                booking_request_id,
+            )
+            return confirmation_json_response(
+                False,
+                "error",
+                "The latest appointment status could not be loaded. Please refresh and try again.",
+                500,
+            )
+
+        if latest.get("request_status") == "confirmed" and latest.get("calendar_event_id"):
+            return confirmation_json_response(
+                True,
+                "already_confirmed",
+                "This appointment was already confirmed.",
+            )
+
+        return confirmation_json_response(
+            False,
+            "confirmation_in_progress",
+            "This request is already being confirmed. Please refresh in a moment.",
+            409,
+        )
+
+    try:
+        event = find_google_calendar_event_for_request(booking_request_id)
+    except Exception as error:
+        if isinstance(error, urllib_error.HTTPError):
+            error.close()
+        logger.exception(
+            "Could not check Google Calendar for booking request %s",
+            booking_request_id,
+        )
+        release_confirmation_claim(booking_request_id, claim_token)
+        return confirmation_json_response(
+            False,
+            "error",
+            "Google Calendar could not be checked. Reconnect Calendar and try again.",
+            502,
+        )
+
+    if not event:
+        try:
             availability = check_requested_calendar_slot(
                 confirmation_state,
                 "",
             )
+        except Exception:
+            logger.exception(
+                "Could not recheck availability for booking request %s",
+                booking_request_id,
+            )
+            release_confirmation_claim(booking_request_id, claim_token)
+            return confirmation_json_response(
+                False,
+                "error",
+                "Calendar availability could not be verified. Please try again.",
+                503,
+            )
 
-            if availability.get("status") in {
-                "busy",
-                "past",
-                "outside_hours",
-                "closed_day",
-            }:
-                raise HTTPException(
-                    status_code=409,
-                    detail="This slot is no longer available. Please choose another time.",
-                )
+        if not isinstance(availability, dict):
+            logger.error(
+                "Calendar availability returned an invalid result for booking request %s",
+                booking_request_id,
+            )
+            release_confirmation_claim(booking_request_id, claim_token)
+            return confirmation_json_response(
+                False,
+                "error",
+                "Calendar availability could not be verified. Please try again.",
+                503,
+            )
 
-            if availability.get("status") != "free":
-                raise HTTPException(
-                    status_code=503,
-                    detail="Calendar availability could not be verified. Please try again.",
-                )
+        if availability.get("status") in {
+            "busy",
+            "past",
+            "outside_hours",
+            "closed_day",
+        }:
+            release_confirmation_claim(booking_request_id, claim_token)
+            return confirmation_json_response(
+                False,
+                "slot_unavailable",
+                "This slot is no longer available. Please choose another time.",
+                409,
+            )
 
+        if availability.get("status") != "free":
+            release_confirmation_claim(booking_request_id, claim_token)
+            return confirmation_json_response(
+                False,
+                "error",
+                "Calendar availability could not be verified. Please try again.",
+                503,
+            )
+
+        try:
             service_names = [
                 str(item.get("service_name"))
                 for item in items
@@ -7043,8 +7213,24 @@ async def confirm_appointment(
                 end_time,
                 title,
                 description,
-                confirmation.booking_request_id,
+                booking_request_id,
             )
+        except Exception as error:
+            if isinstance(error, urllib_error.HTTPError):
+                error.close()
+            logger.exception(
+                "Could not create Google Calendar event for booking request %s",
+                booking_request_id,
+            )
+            release_confirmation_claim(booking_request_id, claim_token)
+            return confirmation_json_response(
+                False,
+                "error",
+                "Google Calendar could not create the appointment. Reconnect Calendar and try again.",
+                502,
+            )
+
+    try:
         confirmed_at = datetime.now(timezone.utc).isoformat()
         update_response = (
             supabase.table("booking_requests")
@@ -7056,14 +7242,27 @@ async def confirm_appointment(
                 "confirmation_started_at": None,
                 "updated_at": confirmed_at,
             })
-            .eq("id", confirmation.booking_request_id)
+            .eq("id", booking_request_id)
             .eq("confirmation_lock_token", claim_token)
             .execute()
         )
 
         if not update_response.data:
             raise RuntimeError("Confirmed event could not be saved.")
+    except Exception:
+        logger.exception(
+            "Could not save confirmed state for booking request %s",
+            booking_request_id,
+        )
+        release_confirmation_claim(booking_request_id, claim_token)
+        return confirmation_json_response(
+            False,
+            "error",
+            "The Calendar event was created, but the confirmed status could not be saved. Please try again.",
+            500,
+        )
 
+    try:
         supabase.table("conversations").update({
             "active_booking_request_id": None,
             "updated_at": confirmed_at,
@@ -7071,51 +7270,18 @@ async def confirm_appointment(
             "session_id",
             booking_request.get("session_id"),
         ).execute()
-
-        # Outbound channel confirmation intentionally belongs in a later hook.
-        return {
-            "status": "confirmed",
-            "booking_request": update_response.data[0],
-            "already_confirmed": False,
-        }
-
-    except HTTPException:
-        supabase.rpc(
-            "release_booking_request_confirmation",
-            {
-                "target_request_id": confirmation.booking_request_id,
-                "lock_token": claim_token,
-            },
-        ).execute()
-        raise
-    except urllib_error.HTTPError as error:
-        error.close()
-        supabase.rpc(
-            "release_booking_request_confirmation",
-            {
-                "target_request_id": confirmation.booking_request_id,
-                "lock_token": claim_token,
-            },
-        ).execute()
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Google Calendar could not create the appointment. "
-                "Reconnect Calendar and try again."
-            ),
-        )
     except Exception:
-        supabase.rpc(
-            "release_booking_request_confirmation",
-            {
-                "target_request_id": confirmation.booking_request_id,
-                "lock_token": claim_token,
-            },
-        ).execute()
-        raise HTTPException(
-            status_code=500,
-            detail="The appointment could not be confirmed safely.",
+        logger.exception(
+            "Confirmed booking request %s, but could not clear its active conversation request",
+            booking_request_id,
         )
+
+    # Outbound channel confirmation intentionally belongs in a later hook.
+    return confirmation_json_response(
+        True,
+        "confirmed",
+        "Appointment confirmed and added to Google Calendar.",
+    )
 
 
 def advanced_multi_booking_enabled() -> bool:
