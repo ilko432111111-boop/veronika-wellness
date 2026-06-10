@@ -465,9 +465,61 @@
             padding: 14px;
         }
 
+        .modal-body > .detail-section {
+            margin-bottom: 14px;
+        }
+
         .detail-section h4 {
             margin: 0 0 10px;
             color: var(--primary);
+        }
+
+        .internal-note-textarea {
+            width: 100%;
+            min-height: 110px;
+            resize: vertical;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            background: white;
+            font: inherit;
+        }
+
+        .note-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .history-details summary {
+            cursor: pointer;
+            color: var(--primary);
+            font-weight: 700;
+        }
+
+        .history-list {
+            display: grid;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .history-card {
+            border: 1px solid var(--border);
+            border-left: 4px solid var(--primary);
+            border-radius: 10px;
+            padding: 11px;
+            background: #f8fafb;
+        }
+
+        .history-card strong {
+            display: block;
+            margin-bottom: 6px;
+        }
+
+        .history-card div {
+            margin-top: 4px;
+            font-size: 0.88rem;
         }
 
         .lead-summary-grid {
@@ -868,6 +920,20 @@
             </div>
             <div class="modal-body">
                 <div id="lead-overview" class="lead-overview"></div>
+                <section class="detail-section">
+                    <h4>Private internal note</h4>
+                    <textarea id="internal-note-textarea" class="internal-note-textarea" placeholder="Private note for the owner only"></textarea>
+                    <div class="note-actions">
+                        <button id="save-internal-note-button" class="small-button" type="button">Save note</button>
+                        <span id="internal-note-message" class="request-message"></span>
+                    </div>
+                </section>
+                <section class="detail-section">
+                    <details class="history-details" open>
+                        <summary>Customer history</summary>
+                        <div id="customer-history" class="history-list"></div>
+                    </details>
+                </section>
                 <h4 class="transcript-heading">Chat transcript</h4>
                 <div id="transcript" class="transcript"></div>
             </div>
@@ -920,6 +986,10 @@
         const transcript = document.getElementById("transcript");
         const leadOverview = document.getElementById("lead-overview");
         const modalTitle = document.getElementById("modal-title");
+        const internalNoteTextarea = document.getElementById("internal-note-textarea");
+        const saveInternalNoteButton = document.getElementById("save-internal-note-button");
+        const internalNoteMessage = document.getElementById("internal-note-message");
+        const customerHistory = document.getElementById("customer-history");
 
         const WEEKDAY_NAMES = [
             "Monday",
@@ -939,6 +1009,7 @@
         let bookingItemsByRequest = new Map();
         let pendingActionsBySession = new Map();
         let channelContactsById = new Map();
+        let openLeadSessionId = null;
 
         function showLogin() {
             loginPage.classList.remove("hidden");
@@ -1531,7 +1602,7 @@
                     .order("created_at", { ascending: true }),
                 supabaseClient
                     .from("channel_contacts")
-                    .select("id, source, external_user_id, last_customer_message_at")
+                    .select("id, source, last_customer_message_at")
             ]);
 
             if (requestResult.error) throw requestResult.error;
@@ -1993,15 +2064,213 @@
             }
         }
 
+        async function saveInternalNote() {
+            if (!openLeadSessionId) return;
+
+            const sessionId = openLeadSessionId;
+            saveInternalNoteButton.disabled = true;
+            internalNoteMessage.textContent = "Saving...";
+
+            const note = internalNoteTextarea.value.trim();
+            const { error } = await supabaseClient
+                .from("conversations")
+                .update({ internal_notes: note || null })
+                .eq("session_id", sessionId);
+
+            if (error) {
+                internalNoteMessage.textContent =
+                    `Could not save note: ${error.message}`;
+                saveInternalNoteButton.disabled = false;
+                return;
+            }
+
+            const lead = allLeads.find(
+                (item) => item.session_id === sessionId
+            );
+
+            if (lead) {
+                lead.internal_notes = note || null;
+            }
+
+            internalNoteMessage.textContent = "Saved";
+            saveInternalNoteButton.disabled = false;
+        }
+
+        function formatHistoryDate(value) {
+            if (!value) return "Date unavailable";
+
+            return new Date(value).toLocaleDateString("en-GB", {
+                day: "numeric",
+                month: "long",
+                year: "numeric"
+            });
+        }
+
+        function renderCustomerHistory(
+            lead,
+            previousConversations,
+            historyRequests,
+            historyItems
+        ) {
+            customerHistory.innerHTML = "";
+
+            if (lead?.source !== "instagram" || !lead?.channel_contact_id) {
+                customerHistory.textContent =
+                    "Customer history is not available for this lead.";
+                return;
+            }
+
+            if (!previousConversations.length) {
+                customerHistory.textContent =
+                    "No previous enquiries found for this customer.";
+                return;
+            }
+
+            const requestsBySession = groupRows(
+                historyRequests,
+                "session_id"
+            );
+            const itemsByRequest = groupRows(
+                historyItems,
+                "booking_request_id"
+            );
+
+            for (const conversation of previousConversations) {
+                const requests = requestsBySession.get(
+                    String(conversation.session_id)
+                ) || [];
+                const request = requests[0] || {};
+                const requestItems = itemsByRequest.get(
+                    String(request.id)
+                ) || [];
+                const treatment = requestItems
+                    .map((item) => item.service_name)
+                    .filter(Boolean)
+                    .join(" + ")
+                    || conversation.treatment
+                    || "No treatment recorded";
+
+                const card = document.createElement("article");
+                card.className = "history-card";
+
+                const date = document.createElement("strong");
+                date.textContent = formatHistoryDate(
+                    conversation.created_at || conversation.updated_at
+                );
+
+                const treatmentRow = document.createElement("div");
+                treatmentRow.textContent = `Treatment: ${treatment}`;
+
+                const slotRow = document.createElement("div");
+                slotRow.textContent = `Requested slot: ${formatRequestedSlot(
+                    request.preferred_date,
+                    request.preferred_time
+                )}`;
+
+                const statusRow = document.createElement("div");
+                statusRow.textContent =
+                    `Status: ${bookingRequestStatusLabel(request.request_status || conversation.status)}`;
+
+                const sourceRow = document.createElement("div");
+                sourceRow.textContent =
+                    `Source: ${safeText(conversation.source, "instagram")}`;
+
+                card.append(date, treatmentRow, slotRow, statusRow, sourceRow);
+
+                if (conversation.internal_notes) {
+                    const noteRow = document.createElement("div");
+                    noteRow.textContent =
+                        `Owner note: ${conversation.internal_notes}`;
+                    card.appendChild(noteRow);
+                }
+
+                customerHistory.appendChild(card);
+            }
+        }
+
+        async function loadCustomerHistory(lead) {
+            if (lead?.source !== "instagram" || !lead?.channel_contact_id) {
+                renderCustomerHistory(lead, [], [], []);
+                return;
+            }
+
+            customerHistory.textContent = "Loading customer history...";
+
+            const conversationResult = await supabaseClient
+                .from("conversations")
+                .select("session_id, source, status, treatment, internal_notes, created_at, updated_at")
+                .eq("channel_contact_id", lead.channel_contact_id)
+                .neq("session_id", lead.session_id)
+                .order("updated_at", { ascending: false });
+
+            if (conversationResult.error) {
+                customerHistory.textContent =
+                    `Could not load customer history: ${conversationResult.error.message}`;
+                return;
+            }
+
+            const previousConversations = conversationResult.data || [];
+
+            if (!previousConversations.length) {
+                renderCustomerHistory(lead, [], [], []);
+                return;
+            }
+
+            const sessionIds = previousConversations.map(
+                (conversation) => conversation.session_id
+            );
+            const requestResult = await supabaseClient
+                .from("booking_requests")
+                .select("id, session_id, request_status, preferred_date, preferred_time, updated_at")
+                .in("session_id", sessionIds)
+                .order("updated_at", { ascending: false });
+
+            if (requestResult.error) {
+                customerHistory.textContent =
+                    `Could not load customer history: ${requestResult.error.message}`;
+                return;
+            }
+
+            const historyRequests = requestResult.data || [];
+            let historyItems = [];
+
+            if (historyRequests.length) {
+                const itemResult = await supabaseClient
+                    .from("booking_items")
+                    .select("booking_request_id, service_name, item_order")
+                    .in("booking_request_id", historyRequests.map((request) => request.id))
+                    .order("item_order", { ascending: true });
+
+                if (itemResult.error) {
+                    customerHistory.textContent =
+                        `Could not load customer history: ${itemResult.error.message}`;
+                    return;
+                }
+
+                historyItems = itemResult.data || [];
+            }
+
+            renderCustomerHistory(
+                lead,
+                previousConversations,
+                historyRequests,
+                historyItems
+            );
+        }
+
         async function openTranscript(sessionId) {
+            openLeadSessionId = sessionId;
             modalTitle.textContent = "Lead details";
             leadOverview.innerHTML = "<p>Loading appointment requests...</p>";
             transcript.innerHTML = "<p>Loading transcript...</p>";
+            customerHistory.textContent = "Loading customer history...";
+            internalNoteMessage.textContent = "";
             modalBackdrop.classList.remove("hidden");
 
             const lead = allLeads.find(
                 (item) => item.session_id === sessionId
             ) || {};
+            internalNoteTextarea.value = lead.internal_notes || "";
 
             const [
                 messageResult,
@@ -2023,7 +2292,8 @@
                     .select("id, session_id, service_name, category, action_type, action_status, source_message")
                     .eq("session_id", sessionId)
                     .eq("action_status", "pending")
-                    .order("created_at", { ascending: true })
+                    .order("created_at", { ascending: true }),
+                loadCustomerHistory(lead)
             ]);
 
             if (messageResult.error) {
@@ -2108,6 +2378,7 @@
 
         saveSettingsButton.addEventListener("click", saveChatbotSettings);
         saveHoursButton.addEventListener("click", saveBusinessHours);
+        saveInternalNoteButton.addEventListener("click", saveInternalNote);
 
         aiStatusFilter.addEventListener("change", () => applyFilters());
         ownerStatusFilter.addEventListener("change", () => applyFilters());
@@ -2150,11 +2421,13 @@
 
         closeModalButton.addEventListener("click", () => {
             modalBackdrop.classList.add("hidden");
+            openLeadSessionId = null;
         });
 
         modalBackdrop.addEventListener("click", (event) => {
             if (event.target === modalBackdrop) {
                 modalBackdrop.classList.add("hidden");
+                openLeadSessionId = null;
             }
         });
 
