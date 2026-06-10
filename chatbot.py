@@ -6310,10 +6310,14 @@ def load_recent_messages(
 def send_instagram_text_message(
     recipient_id: str,
     text: str,
-) -> bool:
+) -> dict:
     if not INSTAGRAM_ACCESS_TOKEN:
-        print("Instagram reply skipped: missing access token.")
-        return False
+        logger.warning("Instagram message skipped because the access token is missing.")
+        return {
+            "success": False,
+            "status": "not_configured",
+            "message": "Instagram messaging is not configured.",
+        }
 
     payload = {
         "recipient": {"id": recipient_id},
@@ -6340,19 +6344,92 @@ def send_instagram_text_message(
 
     try:
         with urllib_request.urlopen(api_request, timeout=15) as response:
-            response.read()
+            response_body = response.read().decode("utf-8", errors="replace")
 
-        print(f"Instagram reply sent to {recipient_id}")
-        return True
+        try:
+            meta_response = (
+                json.loads(response_body)
+                if response_body.strip()
+                else {}
+            )
+        except json.JSONDecodeError:
+            meta_response = {}
+
+        logger.info("Instagram message accepted by Meta.")
+        return {
+            "success": True,
+            "status": "sent",
+            "message": "Instagram message sent.",
+            "meta_response": meta_response,
+        }
 
     except urllib_error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        print(f"Instagram reply failed: HTTP {error.code} {body}")
+        error.close()
+        logger.warning(
+            "Instagram message rejected by Meta with HTTP status %s.",
+            error.code,
+        )
+        return {
+            "success": False,
+            "status": "rejected",
+            "message": f"Meta rejected the Instagram message (HTTP {error.code}).",
+        }
 
     except Exception as error:
-        print(f"Instagram reply failed: {error}")
+        logger.error(
+            "Instagram message request failed with %s.",
+            type(error).__name__,
+        )
+        return {
+            "success": False,
+            "status": "error",
+            "message": "Instagram messaging could not be reached.",
+        }
 
-    return False
+
+def save_instagram_channel_contact(
+    sender_id: str,
+    session_id: str,
+    customer_message_at: str,
+) -> dict:
+    """Store one Instagram-scoped identity and link its current conversation."""
+    try:
+        contact_response = (
+            supabase.table("channel_contacts")
+            .upsert(
+                {
+                    "business_slug": BUSINESS_SLUG,
+                    "source": "instagram",
+                    "external_user_id": sender_id,
+                    "last_customer_message_at": customer_message_at,
+                    "updated_at": customer_message_at,
+                },
+                on_conflict="business_slug,source,external_user_id",
+            )
+            .execute()
+        )
+        contact = (
+            contact_response.data[0]
+            if contact_response.data
+            else {}
+        )
+        contact_id = contact.get("id")
+
+        if contact_id:
+            (
+                supabase.table("conversations")
+                .update({"channel_contact_id": contact_id})
+                .eq("session_id", session_id)
+                .execute()
+            )
+
+        return contact
+    except Exception:
+        logger.exception(
+            "Could not save Instagram channel contact for session %s",
+            session_id,
+        )
+        return {}
 
 
 _processed_instagram_message_ids: set[str] = set()
@@ -6566,6 +6643,17 @@ def process_instagram_webhook_payload(payload: dict):
             if not mark_instagram_message_seen(message_id):
                 continue
 
+            session_id, previous_conversation = resolve_instagram_session(
+                sender_id,
+                message_text,
+            )
+            customer_message_at = datetime.now(timezone.utc).isoformat()
+            save_instagram_channel_contact(
+                sender_id,
+                session_id,
+                customer_message_at,
+            )
+
             rate_limit_reply = instagram_rate_limit_message(sender_id)
 
             if rate_limit_reply is not None:
@@ -6576,11 +6664,6 @@ def process_instagram_webhook_payload(payload: dict):
                     )
 
                 continue
-
-            session_id, previous_conversation = resolve_instagram_session(
-                sender_id,
-                message_text,
-            )
 
             history = load_recent_messages(session_id)
 
@@ -6648,6 +6731,11 @@ def process_instagram_webhook_payload(payload: dict):
                 # The BackgroundTasks object above is not executed by FastAPI,
                 # because this call is internal. Trigger the alert directly.
                 send_booking_notification(session_id)
+                save_instagram_channel_contact(
+                    sender_id,
+                    session_id,
+                    customer_message_at,
+                )
 
             except Exception as error:
                 print(f"Could not process Instagram message: {error}")
@@ -6915,14 +7003,20 @@ def confirmation_json_response(
     status: str,
     message: str,
     status_code: int = 200,
+    extra: dict | None = None,
 ) -> JSONResponse:
+    content = {
+        "success": success,
+        "status": status,
+        "message": message,
+    }
+
+    if extra:
+        content.update(extra)
+
     return JSONResponse(
         status_code=status_code,
-        content={
-            "success": success,
-            "status": status,
-            "message": message,
-        },
+        content=content,
     )
 
 
@@ -6943,6 +7037,288 @@ def release_confirmation_claim(
             "Could not release confirmation claim for booking request %s",
             booking_request_id,
         )
+
+
+def load_channel_contact(conversation: dict) -> dict:
+    contact_id = conversation.get("channel_contact_id")
+
+    if not contact_id and conversation.get("source") == "instagram":
+        session_id = str(conversation.get("session_id") or "")
+        session_parts = session_id.split(":")
+
+        if len(session_parts) >= 3 and session_parts[0] == "instagram":
+            message_response = (
+                supabase.table("messages")
+                .select("created_at")
+                .eq("session_id", session_id)
+                .eq("role", "user")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            last_customer_message_at = (
+                message_response.data[0].get("created_at")
+                if message_response.data
+                else None
+            )
+
+            if last_customer_message_at:
+                return save_instagram_channel_contact(
+                    session_parts[1],
+                    session_id,
+                    last_customer_message_at,
+                )
+
+        return {}
+
+    response = (
+        supabase.table("channel_contacts")
+        .select("*")
+        .eq("id", contact_id)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else {}
+
+
+def parse_utc_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return (
+            parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None
+            else parsed.astimezone(timezone.utc)
+        )
+    except ValueError:
+        return None
+
+
+def instagram_reply_window_is_open(contact: dict) -> bool:
+    last_customer_message_at = parse_utc_datetime(
+        contact.get("last_customer_message_at")
+    )
+
+    if not last_customer_message_at:
+        return False
+
+    elapsed = datetime.now(timezone.utc) - last_customer_message_at
+    return timedelta(0) <= elapsed <= timedelta(hours=24)
+
+
+def save_confirmation_message_status(
+    booking_request_id: int,
+    status: str,
+    error_message: str | None = None,
+    sent_at: str | None = None,
+) -> bool:
+    try:
+        response = (
+            supabase.table("booking_requests")
+            .update({
+                "confirmation_message_status": status,
+                "confirmation_message_sent_at": sent_at,
+                "confirmation_message_error": error_message,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", booking_request_id)
+            .execute()
+        )
+        return bool(response.data)
+    except Exception:
+        logger.exception(
+            "Could not save confirmation message status for booking request %s",
+            booking_request_id,
+        )
+        return False
+
+
+def instagram_confirmation_text(
+    booking_request: dict,
+    items: list[dict],
+) -> str:
+    treatment = " + ".join(
+        str(item.get("service_name"))
+        for item in items
+        if item.get("service_name")
+    ) or "your treatment"
+    requested_date = format_customer_date(booking_request.get("preferred_date"))
+    requested_time = format_customer_time(booking_request.get("preferred_time"))
+    return (
+        f"Your appointment has been confirmed for {treatment} on "
+        f"{requested_date} at {requested_time}. We look forward to seeing you."
+    )
+
+
+def confirmation_delivery_result(
+    booking_request: dict,
+    conversation: dict,
+    items: list[dict],
+) -> dict:
+    booking_request_id = int(booking_request["id"])
+    existing_status = booking_request.get("confirmation_message_status")
+
+    if existing_status == "sent":
+        return {
+            "status": "already_confirmed",
+            "message": "This appointment was already confirmed and its Instagram confirmation was already sent.",
+            "retry_available": False,
+        }
+
+    if conversation.get("source") != "instagram":
+        save_confirmation_message_status(
+            booking_request_id,
+            "skipped_non_instagram",
+        )
+        return {
+            "status": "confirmed",
+            "message": "Appointment confirmed and added to Google Calendar. This was not an Instagram lead.",
+            "retry_available": False,
+        }
+
+    try:
+        contact = load_channel_contact(conversation)
+    except Exception:
+        logger.exception(
+            "Could not load Instagram contact for booking request %s",
+            booking_request_id,
+        )
+        contact = {}
+
+    recipient_id = contact.get("external_user_id")
+
+    if not recipient_id:
+        error_message = "Instagram contact details are unavailable."
+        save_confirmation_message_status(
+            booking_request_id,
+            "failed",
+            error_message,
+        )
+        return {
+            "status": "confirmed_message_failed",
+            "message": f"Appointment confirmed, but the Instagram message could not be sent: {error_message}",
+            "retry_available": False,
+        }
+
+    if not instagram_reply_window_is_open(contact):
+        save_confirmation_message_status(
+            booking_request_id,
+            "skipped_reply_window_expired",
+        )
+        return {
+            "status": "confirmed_reply_window_expired",
+            "message": "Appointment confirmed, but the Instagram reply window has expired. Please message the customer manually.",
+            "retry_available": False,
+        }
+
+    send_result = send_instagram_text_message(
+        recipient_id=str(recipient_id),
+        text=instagram_confirmation_text(booking_request, items),
+    )
+
+    if send_result.get("success"):
+        sent_at = datetime.now(timezone.utc).isoformat()
+        saved = save_confirmation_message_status(
+            booking_request_id,
+            "sent",
+            sent_at=sent_at,
+        )
+
+        if not saved:
+            return {
+                "status": "confirmed_message_tracking_failed",
+                "message": "Appointment confirmed and Instagram confirmation sent, but the delivery status could not be saved.",
+                "retry_available": False,
+            }
+
+        return {
+            "status": "confirmed_message_sent",
+            "message": "Appointment confirmed and Instagram confirmation sent.",
+            "retry_available": False,
+        }
+
+    error_message = str(
+        send_result.get("message") or "Instagram messaging failed."
+    )
+    save_confirmation_message_status(
+        booking_request_id,
+        "failed",
+        error_message,
+    )
+    return {
+        "status": "confirmed_message_failed",
+        "message": f"Appointment confirmed, but the Instagram message could not be sent: {error_message}",
+        "retry_available": True,
+    }
+
+
+def safely_deliver_instagram_confirmation(
+    booking_request: dict,
+    conversation: dict,
+    items: list[dict],
+) -> dict:
+    try:
+        return confirmation_delivery_result(
+            booking_request,
+            conversation,
+            items,
+        )
+    except Exception:
+        booking_request_id = booking_request.get("id")
+        logger.exception(
+            "Unexpected Instagram confirmation error for booking request %s",
+            booking_request_id,
+        )
+
+        if booking_request_id:
+            save_confirmation_message_status(
+                int(booking_request_id),
+                "failed",
+                "Instagram confirmation could not be processed.",
+            )
+
+        return {
+            "status": "confirmed_message_failed",
+            "message": "Appointment confirmed, but the Instagram message could not be sent: Instagram confirmation could not be processed.",
+            "retry_available": False,
+        }
+
+
+def existing_confirmation_delivery_result(
+    booking_request: dict,
+    conversation: dict,
+) -> dict:
+    status = booking_request.get("confirmation_message_status")
+
+    if status == "sent":
+        return {
+            "status": "already_confirmed",
+            "message": "This appointment was already confirmed and its Instagram confirmation was already sent.",
+            "retry_available": False,
+        }
+
+    retry_available = False
+
+    if status == "failed" and conversation.get("source") == "instagram":
+        try:
+            contact = load_channel_contact(conversation)
+            retry_available = bool(
+                contact.get("external_user_id")
+                and instagram_reply_window_is_open(contact)
+            )
+        except Exception:
+            logger.exception(
+                "Could not check Instagram retry eligibility for booking request %s",
+                booking_request.get("id"),
+            )
+
+    return {
+        "status": "already_confirmed",
+        "message": "This appointment was already confirmed.",
+        "retry_available": retry_available,
+    }
 
 
 @app.post("/admin/confirm-appointment")
@@ -7006,10 +7382,15 @@ async def confirm_appointment(
         booking_request.get("request_status") == "confirmed"
         and booking_request.get("calendar_event_id")
     ):
+        delivery = existing_confirmation_delivery_result(
+            booking_request,
+            conversation,
+        )
         return confirmation_json_response(
             True,
-            "already_confirmed",
-            "This appointment was already confirmed.",
+            delivery["status"],
+            delivery["message"],
+            extra={"retry_available": delivery["retry_available"]},
         )
 
     if booking_request.get("request_status") in {
@@ -7106,10 +7487,15 @@ async def confirm_appointment(
             )
 
         if latest.get("request_status") == "confirmed" and latest.get("calendar_event_id"):
+            delivery = existing_confirmation_delivery_result(
+                latest,
+                conversation,
+            )
             return confirmation_json_response(
                 True,
-                "already_confirmed",
-                "This appointment was already confirmed.",
+                delivery["status"],
+                delivery["message"],
+                extra={"retry_available": delivery["retry_available"]},
             )
 
         return confirmation_json_response(
@@ -7276,11 +7662,89 @@ async def confirm_appointment(
             booking_request_id,
         )
 
-    # Outbound channel confirmation intentionally belongs in a later hook.
+    confirmed_booking_request = update_response.data[0]
+    delivery = safely_deliver_instagram_confirmation(
+        confirmed_booking_request,
+        conversation,
+        items,
+    )
     return confirmation_json_response(
         True,
-        "confirmed",
-        "Appointment confirmed and added to Google Calendar.",
+        delivery["status"],
+        delivery["message"],
+        extra={"retry_available": delivery["retry_available"]},
+    )
+
+
+@app.post("/admin/retry-instagram-confirmation")
+async def retry_instagram_confirmation(
+    confirmation: ConfirmAppointmentRequest,
+    request: Request,
+):
+    booking_request_id = confirmation.booking_request_id
+
+    try:
+        require_authenticated_admin(request)
+        booking_request, conversation, items = load_confirmation_context(
+            booking_request_id
+        )
+    except HTTPException as error:
+        return confirmation_json_response(
+            False,
+            "error",
+            str(error.detail),
+            error.status_code,
+        )
+    except Exception:
+        logger.exception(
+            "Could not load Instagram confirmation retry context for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "The appointment request could not be loaded. Please try again.",
+            500,
+        )
+
+    if (
+        booking_request.get("request_status") != "confirmed"
+        or not booking_request.get("calendar_event_id")
+    ):
+        return confirmation_json_response(
+            False,
+            "error",
+            "The appointment must be confirmed before retrying the Instagram message.",
+            409,
+        )
+
+    if booking_request.get("confirmation_message_status") == "sent":
+        return confirmation_json_response(
+            True,
+            "already_sent",
+            "The Instagram confirmation was already sent.",
+            extra={"retry_available": False},
+        )
+
+    if booking_request.get("confirmation_message_status") != "failed":
+        return confirmation_json_response(
+            False,
+            "error",
+            "This Instagram confirmation is not eligible for retry.",
+            409,
+            {"retry_available": False},
+        )
+
+    delivery = safely_deliver_instagram_confirmation(
+        booking_request,
+        conversation,
+        items,
+    )
+    return confirmation_json_response(
+        True,
+        delivery["status"],
+        delivery["message"],
+        extra={"retry_available": delivery["retry_available"]},
     )
 
 

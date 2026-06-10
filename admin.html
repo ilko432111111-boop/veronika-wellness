@@ -938,6 +938,7 @@
         let bookingRequestsBySession = new Map();
         let bookingItemsByRequest = new Map();
         let pendingActionsBySession = new Map();
+        let channelContactsById = new Map();
 
         function showLogin() {
             loginPage.classList.remove("hidden");
@@ -1512,11 +1513,12 @@
             const [
                 requestResult,
                 itemResult,
-                pendingResult
+                pendingResult,
+                contactResult
             ] = await Promise.all([
                 supabaseClient
                     .from("booking_requests")
-                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, calendar_event_id, confirmed_at, created_at, updated_at")
+                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, calendar_event_id, confirmed_at, confirmation_message_status, confirmation_message_sent_at, confirmation_message_error, created_at, updated_at")
                     .order("request_number", { ascending: true }),
                 supabaseClient
                     .from("booking_items")
@@ -1526,12 +1528,16 @@
                     .from("pending_booking_actions")
                     .select("id, session_id, service_name, category, action_type, action_status, source_message, created_at")
                     .eq("action_status", "pending")
-                    .order("created_at", { ascending: true })
+                    .order("created_at", { ascending: true }),
+                supabaseClient
+                    .from("channel_contacts")
+                    .select("id, source, external_user_id, last_customer_message_at")
             ]);
 
             if (requestResult.error) throw requestResult.error;
             if (itemResult.error) throw itemResult.error;
             if (pendingResult.error) throw pendingResult.error;
+            if (contactResult.error) throw contactResult.error;
 
             bookingRequestsBySession = groupRows(
                 requestResult.data || [],
@@ -1546,6 +1552,13 @@
             pendingActionsBySession = groupRows(
                 pendingResult.data || [],
                 "session_id"
+            );
+
+            channelContactsById = new Map(
+                (contactResult.data || []).map((contact) => [
+                    String(contact.id),
+                    contact
+                ])
             );
         }
 
@@ -1659,6 +1672,119 @@
                 message.textContent = error.message;
                 button.disabled = false;
                 button.textContent = "Confirm appointment";
+            }
+        }
+
+        function instagramConfirmationRetryAvailable(lead, request) {
+            if (
+                lead?.source !== "instagram"
+                || request.confirmation_message_status !== "failed"
+                || !lead?.channel_contact_id
+            ) {
+                return false;
+            }
+
+            const contact = channelContactsById.get(String(lead.channel_contact_id));
+            const lastMessageAt = new Date(contact?.last_customer_message_at || "");
+
+            if (Number.isNaN(lastMessageAt.getTime())) return false;
+
+            const elapsed = Date.now() - lastMessageAt.getTime();
+            return elapsed >= 0 && elapsed <= 24 * 60 * 60 * 1000;
+        }
+
+        function confirmationMessageLabel(request) {
+            const status = request.confirmation_message_status;
+
+            if (status === "sent") {
+                return request.confirmation_message_sent_at
+                    ? `Instagram confirmation sent ${formatDate(request.confirmation_message_sent_at)}`
+                    : "Instagram confirmation sent";
+            }
+
+            if (status === "failed") {
+                return request.confirmation_message_error
+                    ? `Instagram confirmation failed: ${request.confirmation_message_error}`
+                    : "Instagram confirmation failed";
+            }
+
+            if (status === "skipped_reply_window_expired") {
+                return "Instagram reply window expired. Message the customer manually.";
+            }
+
+            if (status === "skipped_non_instagram") {
+                return "Confirmed. This was not an Instagram lead.";
+            }
+
+            return request.confirmed_at
+                ? `Confirmed ${formatDate(request.confirmed_at)}`
+                : "Confirmed";
+        }
+
+        async function retryInstagramConfirmation(requestId, button, message) {
+            button.disabled = true;
+            button.textContent = "Retrying...";
+            message.textContent = "Retrying Instagram confirmation...";
+
+            try {
+                const {
+                    data: { session }
+                } = await supabaseClient.auth.getSession();
+
+                if (!session?.access_token) {
+                    throw new Error("Your admin session has expired. Please sign in again.");
+                }
+
+                const response = await fetch(`${BACKEND_API_BASE_URL}/admin/retry-instagram-confirmation`, {
+                    method: "POST",
+                    headers: {
+                        "Authorization": `Bearer ${session.access_token}`,
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ booking_request_id: requestId })
+                });
+                const responseText = await response.text();
+                let result = null;
+
+                if (responseText.trim()) {
+                    try {
+                        result = JSON.parse(responseText);
+                    } catch (parseError) {
+                        console.error(
+                            "Instagram retry endpoint returned invalid JSON.",
+                            parseError
+                        );
+                    }
+                }
+
+                if (!response.ok || !result?.success) {
+                    throw new Error(
+                        result?.message
+                        || result?.detail
+                        || (
+                            responseText.trim()
+                                ? `The server returned an invalid response (HTTP ${response.status}).`
+                                : `The server returned an empty response (HTTP ${response.status}).`
+                        )
+                    );
+                }
+
+                message.textContent = result.message;
+
+                if (result.status === "confirmed_message_sent" || result.status === "already_sent") {
+                    button.textContent = "Sent";
+                } else if (result.retry_available) {
+                    button.disabled = false;
+                    button.textContent = "Retry Instagram message";
+                } else {
+                    button.textContent = "Retry unavailable";
+                }
+
+                await loadLeads();
+            } catch (error) {
+                message.textContent = error.message;
+                button.disabled = false;
+                button.textContent = "Retry Instagram message";
             }
         }
 
@@ -1783,9 +1909,22 @@
                 actionMessage.className = "request-message";
 
                 if (request.request_status === "confirmed") {
-                    actionMessage.textContent = request.confirmed_at
-                        ? `Confirmed ${formatDate(request.confirmed_at)}`
-                        : "Confirmed";
+                    actionMessage.textContent = confirmationMessageLabel(request);
+
+                    if (instagramConfirmationRetryAvailable(lead, request)) {
+                        const retryButton = document.createElement("button");
+                        retryButton.className = "small-button";
+                        retryButton.type = "button";
+                        retryButton.textContent = "Retry Instagram message";
+                        retryButton.addEventListener("click", () => {
+                            retryInstagramConfirmation(
+                                request.id,
+                                retryButton,
+                                actionMessage
+                            );
+                        });
+                        actions.appendChild(retryButton);
+                    }
                 } else if (requestCanBeConfirmed(lead, request, requestItems)) {
                     const confirmButton = document.createElement("button");
                     confirmButton.className = "small-button";
@@ -1876,7 +2015,7 @@
                     .order("created_at", { ascending: true }),
                 supabaseClient
                     .from("booking_requests")
-                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, calendar_event_id, confirmed_at")
+                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, calendar_event_id, confirmed_at, confirmation_message_status, confirmation_message_sent_at, confirmation_message_error")
                     .eq("session_id", sessionId)
                     .order("request_number", { ascending: true }),
                 supabaseClient
