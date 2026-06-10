@@ -388,6 +388,7 @@
         .status-ready_for_review,
         .status-awaiting_owner_confirmation { background: #ede9fe; color: #6d28d9; }
         .status-confirmed { background: #dcfce7; color: #166534; }
+        .status-completed { background: #dbeafe; color: #1d4ed8; }
         .status-declined,
         .status-cancelled_by_customer,
         .status-abandoned,
@@ -551,6 +552,18 @@
             padding-top: 9px;
             border-top: 1px solid var(--border);
             font-weight: 700;
+        }
+
+        .request-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-top: 12px;
+        }
+
+        .request-message {
+            color: var(--muted);
+            font-size: 0.86rem;
         }
 
         .pending-card {
@@ -786,6 +799,17 @@
                     </div>
 
                     <div class="filter-group">
+                        <label for="request-status-filter">Request lifecycle</label>
+                        <select id="request-status-filter">
+                            <option value="active">Active requests</option>
+                            <option value="all">All requests</option>
+                            <option value="confirmed">Confirmed</option>
+                            <option value="expired">Expired</option>
+                            <option value="completed">Completed</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-group">
                         <label for="lead-search">Search</label>
                         <input id="lead-search" class="search-input" type="search" placeholder="Name, phone or treatment">
                     </div>
@@ -883,6 +907,7 @@
         const aiStatusFilter = document.getElementById("ai-status-filter");
         const ownerStatusFilter = document.getElementById("owner-status-filter");
         const sourceFilter = document.getElementById("source-filter");
+        const requestStatusFilter = document.getElementById("request-status-filter");
         const leadSearch = document.getElementById("lead-search");
         const pageSizeSelect = document.getElementById("page-size-select");
         const clearFiltersButton = document.getElementById("clear-filters-button");
@@ -1015,7 +1040,8 @@
                 declined: "Declined",
                 cancelled_by_customer: "Cancelled by customer",
                 abandoned: "Abandoned",
-                expired: "Expired"
+                expired: "Expired",
+                completed: "Completed"
             };
 
             return labels[status] || safeText(status);
@@ -1026,8 +1052,28 @@
                 "declined",
                 "cancelled_by_customer",
                 "abandoned",
-                "expired"
+                "expired",
+                "completed"
             ].includes(status);
+        }
+
+        function requestMatchesLifecycleFilter(request) {
+            const selected = requestStatusFilter.value;
+
+            if (selected === "all") return true;
+            if (selected === "active") {
+                return request.request_status !== "expired";
+            }
+
+            return request.request_status === selected;
+        }
+
+        function sessionMatchesLifecycleFilter(sessionId) {
+            const requests = bookingRequestsBySession.get(sessionId) || [];
+
+            if (requestStatusFilter.value === "all") return true;
+            if (requestStatusFilter.value === "active" && !requests.length) return true;
+            return requests.some(requestMatchesLifecycleFilter);
         }
 
         function activeRequestsForSession(sessionId) {
@@ -1290,37 +1336,25 @@
             }, 1200);
         }
 
-        async function deleteLead(sessionId) {
+        async function closeLead(sessionId) {
             const confirmed = window.confirm(
-                "Delete this lead and its full transcript? This cannot be undone."
+                "Close this lead? Its request and transcript history will be retained."
             );
 
             if (!confirmed) return;
 
-            tableMessage.textContent = "Deleting lead...";
-
-            const { error: messageError } = await supabaseClient
-                .from("messages")
-                .delete()
-                .eq("session_id", sessionId);
-
-            if (messageError) {
-                tableMessage.textContent = `Could not delete transcript: ${messageError.message}`;
-                return;
-            }
-
-            const { error: leadError } = await supabaseClient
+            tableMessage.textContent = "Closing lead...";
+            const { error } = await supabaseClient
                 .from("conversations")
-                .delete()
+                .update({ owner_status: "closed" })
                 .eq("session_id", sessionId);
 
-            if (leadError) {
-                tableMessage.textContent = `Could not delete lead: ${leadError.message}`;
+            if (error) {
+                tableMessage.textContent = `Could not close lead: ${error.message}`;
                 return;
             }
 
-            allLeads = allLeads.filter((lead) => lead.session_id !== sessionId);
-            applyFilters();
+            await loadLeads();
         }
 
         function renderLeads(leads) {
@@ -1377,7 +1411,7 @@
                     <td>
                         <div class="row-actions">
                             <button class="small-button view-button" type="button">View</button>
-                            <button class="danger-button delete-button" type="button">Delete</button>
+                            <button class="danger-button close-lead-button" type="button">Close lead</button>
                         </div>
                     </td>
                 `;
@@ -1404,8 +1438,8 @@
                     openTranscript(lead.session_id);
                 });
 
-                row.querySelector(".delete-button").addEventListener("click", () => {
-                    deleteLead(lead.session_id);
+                row.querySelector(".close-lead-button").addEventListener("click", () => {
+                    closeLead(lead.session_id);
                 });
 
                 tableBody.appendChild(row);
@@ -1431,6 +1465,9 @@
                 const sourceMatches =
                     selectedSource === "all" ||
                     (lead.source || "website") === selectedSource;
+                const lifecycleMatches = sessionMatchesLifecycleFilter(
+                    lead.session_id
+                );
 
                 const searchableText = [
                     lead.name,
@@ -1447,7 +1484,8 @@
                 const searchMatches =
                     !searchTerm || searchableText.includes(searchTerm);
 
-                return aiMatches && ownerMatches && sourceMatches && searchMatches;
+                return aiMatches && ownerMatches && sourceMatches
+                    && lifecycleMatches && searchMatches;
             });
 
             renderLeads(filteredLeads);
@@ -1477,7 +1515,7 @@
             ] = await Promise.all([
                 supabaseClient
                     .from("booking_requests")
-                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, created_at, updated_at")
+                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, calendar_event_id, confirmed_at, created_at, updated_at")
                     .order("request_number", { ascending: true }),
                 supabaseClient
                     .from("booking_items")
@@ -1548,6 +1586,62 @@
             parent.appendChild(wrapper);
         }
 
+        function requestCanBeConfirmed(lead, request, requestItems) {
+            return Boolean(
+                requestItems.some((item) => item.service_name)
+                && request.total_duration_minutes
+                && request.preferred_date
+                && request.preferred_time
+                && lead?.name
+                && lead?.phone
+                && [
+                    "draft",
+                    "ready_for_review",
+                    "awaiting_owner_confirmation"
+                ].includes(request.request_status)
+            );
+        }
+
+        async function confirmAppointment(requestId, button, message) {
+            button.disabled = true;
+            button.textContent = "Confirming...";
+            message.textContent = "Rechecking Google Calendar availability...";
+
+            try {
+                const {
+                    data: { session }
+                } = await supabaseClient.auth.getSession();
+
+                if (!session?.access_token) {
+                    throw new Error("Your admin session has expired. Please sign in again.");
+                }
+
+                const response = await fetch("/admin/confirm-appointment", {
+                    method: "POST",
+                    headers: {
+                        "Authorization": `Bearer ${session.access_token}`,
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ booking_request_id: requestId })
+                });
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.detail || "The appointment could not be confirmed.");
+                }
+
+                message.textContent = result.already_confirmed
+                    ? "This appointment was already confirmed."
+                    : "Appointment confirmed and added to Google Calendar.";
+                button.textContent = "Confirmed";
+                await loadLeads();
+            } catch (error) {
+                message.textContent = error.message;
+                button.disabled = false;
+                button.textContent = "Confirm appointment";
+            }
+        }
+
         function renderLeadOverview(lead, requests, items, pendingActions) {
             leadOverview.innerHTML = "";
 
@@ -1589,7 +1683,16 @@
                 requestList.appendChild(empty);
             }
 
-            for (const request of requests) {
+            const visibleRequests = requests.filter(requestMatchesLifecycleFilter);
+
+            if (requests.length && !visibleRequests.length) {
+                const empty = document.createElement("p");
+                empty.className = "muted";
+                empty.textContent = "No appointment requests match the selected lifecycle filter.";
+                requestList.appendChild(empty);
+            }
+
+            for (const request of visibleRequests) {
                 const card = document.createElement("article");
                 card.className = "request-card";
 
@@ -1653,7 +1756,29 @@
                 total.textContent =
                     `Total: ${formatDurationMinutes(request.total_duration_minutes)} — ${formatMoneyPence(request.total_price_pence)}`;
 
-                card.append(header, meta, list, total);
+                const actions = document.createElement("div");
+                actions.className = "request-actions";
+
+                const actionMessage = document.createElement("span");
+                actionMessage.className = "request-message";
+
+                if (request.request_status === "confirmed") {
+                    actionMessage.textContent = request.confirmed_at
+                        ? `Confirmed ${formatDate(request.confirmed_at)}`
+                        : "Confirmed";
+                } else if (requestCanBeConfirmed(lead, request, requestItems)) {
+                    const confirmButton = document.createElement("button");
+                    confirmButton.className = "small-button";
+                    confirmButton.type = "button";
+                    confirmButton.textContent = "Confirm appointment";
+                    confirmButton.addEventListener("click", () => {
+                        confirmAppointment(request.id, confirmButton, actionMessage);
+                    });
+                    actions.appendChild(confirmButton);
+                }
+
+                actions.appendChild(actionMessage);
+                card.append(header, meta, list, total, actions);
                 requestList.appendChild(card);
             }
 
@@ -1731,7 +1856,7 @@
                     .order("created_at", { ascending: true }),
                 supabaseClient
                     .from("booking_requests")
-                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail")
+                    .select("id, session_id, request_number, request_status, appointment_structure, preferred_date, preferred_time, slot_status, item_count, total_duration_minutes, total_price_pence, missing_detail, calendar_event_id, confirmed_at")
                     .eq("session_id", sessionId)
                     .order("request_number", { ascending: true }),
                 supabaseClient
@@ -1828,6 +1953,7 @@
         aiStatusFilter.addEventListener("change", () => applyFilters());
         ownerStatusFilter.addEventListener("change", () => applyFilters());
         sourceFilter.addEventListener("change", () => applyFilters());
+        requestStatusFilter.addEventListener("change", () => applyFilters());
         leadSearch.addEventListener("input", () => applyFilters());
         pageSizeSelect.addEventListener("change", () => applyFilters());
 
@@ -1852,6 +1978,7 @@
             aiStatusFilter.value = "all";
             ownerStatusFilter.value = "all";
             sourceFilter.value = "all";
+            requestStatusFilter.value = "active";
             leadSearch.value = "";
             pageSizeSelect.value = "10";
             applyFilters();

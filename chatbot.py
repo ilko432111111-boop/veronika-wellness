@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from groq import Groq
@@ -91,7 +91,10 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
-GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
+GOOGLE_CALENDAR_SCOPE = (
+    "https://www.googleapis.com/auth/calendar.freebusy "
+    "https://www.googleapis.com/auth/calendar.events"
+)
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 GOOGLE_CALENDAR_LAST_DIAGNOSTIC = "not_checked"
 
@@ -107,6 +110,13 @@ INSTAGRAM_SESSION_IDLE_HOURS = 12
 INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES = 12
 INSTAGRAM_MAX_MESSAGES_PER_DAY = 80
 INSTAGRAM_RATE_LIMIT_NOTICE_COOLDOWN_MINUTES = 60
+INACTIVE_BOOKING_REQUEST_STATUSES = {
+    "confirmed",
+    "expired",
+    "completed",
+    "cancelled_by_customer",
+    "abandoned",
+}
 
 SLOT_STEP_MINUTES = 30
 NEXT_SLOT_LIMIT = 3
@@ -158,6 +168,10 @@ class ChatRequest(BaseModel):
     source: str = "website"
 
 
+class ConfirmAppointmentRequest(BaseModel):
+    booking_request_id: int
+
+
 def normalise_source(source: str | None) -> str:
     allowed_sources = {"website", "instagram", "whatsapp"}
 
@@ -201,6 +215,110 @@ def get_existing_conversation(session_id: str) -> dict:
         print(f"Could not load existing conversation: {error}")
 
     return {}
+
+
+def active_booking_request_status(conversation: dict) -> str | None:
+    request_id = conversation.get("active_booking_request_id")
+
+    try:
+        query = supabase.table("booking_requests").select("request_status")
+
+        if request_id not in [None, ""]:
+            query = query.eq("id", request_id)
+        else:
+            session_id = conversation.get("session_id")
+
+            if session_id in [None, ""]:
+                return None
+
+            query = (
+                query.eq("session_id", session_id)
+                .order("request_number", desc=True)
+            )
+
+        response = query.limit(1).execute()
+
+        if response.data:
+            return str(response.data[0].get("request_status") or "")
+
+    except Exception as error:
+        print(f"Could not load active booking request status: {error}")
+
+    return None
+
+
+def prepare_conversation_for_resume(conversation: dict) -> dict:
+    """Never carry inactive appointment details into a fresh request flow."""
+    status = active_booking_request_status(conversation)
+
+    if status not in INACTIVE_BOOKING_REQUEST_STATUSES:
+        return conversation
+
+    return {
+        "session_id": conversation.get("session_id"),
+        "source": conversation.get("source"),
+        "owner_status": conversation.get("owner_status"),
+        "active_booking_request_id": None,
+        "name": None,
+        "phone": None,
+        "treatment": None,
+        "duration": None,
+        "preferred_date": None,
+        "preferred_time": None,
+        "notes": None,
+        "summary": None,
+        "verified_alternatives": None,
+        "notification_sent_at": None,
+        "status": "new_chat",
+    }
+
+
+def customer_explicitly_cancels_request(message: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(message or "").strip().lower())
+    return bool(re.search(
+        r"\b(?:cancel|cancelled|canceled|do not book|don't book)\b",
+        cleaned,
+    ))
+
+
+def cancel_active_booking_request(conversation: dict) -> bool:
+    request_id = conversation.get("active_booking_request_id")
+
+    if request_id in [None, ""]:
+        return False
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    response = (
+        supabase.table("booking_requests")
+        .update({
+            "request_status": "cancelled_by_customer",
+            "confirmation_lock_token": None,
+            "confirmation_started_at": None,
+            "updated_at": now_iso,
+        })
+        .eq("id", request_id)
+        .in_("request_status", ["draft", "ready_for_review", "awaiting_owner_confirmation"])
+        .execute()
+    )
+
+    if not response.data:
+        return False
+
+    supabase.table("conversations").update({
+        "active_booking_request_id": None,
+        "treatment": None,
+        "duration": None,
+        "preferred_date": None,
+        "preferred_time": None,
+        "verified_alternatives": None,
+        "notification_sent_at": None,
+        "status": "new_chat",
+        "updated_at": now_iso,
+    }).eq(
+        "session_id",
+        conversation.get("session_id"),
+    ).execute()
+    return True
 
 
 def calculate_lead_status(lead_data: dict, extracted_status: str | None) -> str:
@@ -5638,6 +5756,91 @@ def query_google_freebusy(
     return None
 
 
+def create_google_calendar_event(
+    start_time: datetime,
+    end_time: datetime,
+    title: str,
+    description: str,
+    booking_request_id: int,
+) -> dict:
+    """Create one owner-confirmed appointment on the connected calendar."""
+    access_token = refresh_google_access_token()
+
+    if not access_token:
+        raise RuntimeError("Google Calendar is not connected.")
+
+    calendar_id = urllib_parse.quote(
+        GOOGLE_CALENDAR_ID,
+        safe="",
+    )
+    payload = {
+        "summary": title,
+        "description": description,
+        "start": {
+            "dateTime": start_time.isoformat(),
+            "timeZone": "Europe/London",
+        },
+        "end": {
+            "dateTime": end_time.isoformat(),
+            "timeZone": "Europe/London",
+        },
+        "extendedProperties": {
+            "private": {
+                "bookingRequestId": str(booking_request_id),
+            },
+        },
+    }
+    event_request = urllib_request.Request(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "receptionist-chatbot/1.0",
+        },
+        method="POST",
+    )
+
+    with urllib_request.urlopen(event_request, timeout=15) as response:
+        event = json.loads(response.read().decode("utf-8"))
+
+    if not isinstance(event, dict) or not event.get("id"):
+        raise RuntimeError("Google Calendar did not return an event ID.")
+
+    return event
+
+
+def find_google_calendar_event_for_request(
+    booking_request_id: int,
+) -> dict | None:
+    """Find a previously created event after a partial confirmation failure."""
+    access_token = refresh_google_access_token()
+
+    if not access_token:
+        raise RuntimeError("Google Calendar is not connected.")
+
+    calendar_id = urllib_parse.quote(GOOGLE_CALENDAR_ID, safe="")
+    query = urllib_parse.urlencode({
+        "privateExtendedProperty": f"bookingRequestId={booking_request_id}",
+        "singleEvents": "true",
+        "maxResults": "1",
+    })
+    event_request = urllib_request.Request(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events?{query}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "receptionist-chatbot/1.0",
+        },
+        method="GET",
+    )
+
+    with urllib_request.urlopen(event_request, timeout=15) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    items = result.get("items") if isinstance(result, dict) else None
+    return items[0] if items else None
+
+
 def parse_google_datetime(value: str) -> datetime:
     return datetime.fromisoformat(
         value.replace("Z", "+00:00")
@@ -6215,6 +6418,11 @@ def resolve_instagram_session(
     if not latest:
         return new_instagram_session_id(sender_id), None
 
+    request_status = active_booking_request_status(latest)
+
+    if request_status in INACTIVE_BOOKING_REQUEST_STATUSES:
+        return new_instagram_session_id(sender_id), None
+
     if (
         latest.get("status") == "booking_request_complete"
         and not is_simple_acknowledgement(latest_message)
@@ -6588,7 +6796,7 @@ async def google_calendar_callback(
         return HTMLResponse(
             """
             <h2>Google Calendar connected successfully.</h2>
-            <p>You can close this page. The chatbot backend now has availability-only access.</p>
+            <p>You can close this page. The backend can now check availability and create owner-confirmed appointments.</p>
             """
         )
 
@@ -6622,6 +6830,292 @@ async def google_calendar_status():
         "connected": bool(get_google_refresh_token()),
         "last_diagnostic_code": GOOGLE_CALENDAR_LAST_DIAGNOSTIC,
     }
+
+
+def require_authenticated_admin(request: Request):
+    """Use the dashboard's existing Supabase Auth session for admin actions."""
+    authorization = request.headers.get("authorization", "")
+
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Admin sign-in required.")
+
+    access_token = authorization.split(" ", 1)[1].strip()
+
+    try:
+        user_response = supabase.auth.get_user(access_token)
+        user = getattr(user_response, "user", None)
+
+        if not user:
+            raise HTTPException(status_code=401, detail="Admin sign-in required.")
+
+        return user
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Admin sign-in required.")
+
+
+def load_confirmation_context(booking_request_id: int) -> tuple[dict, dict, list[dict]]:
+    request_response = (
+        supabase.table("booking_requests")
+        .select("*")
+        .eq("id", booking_request_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not request_response.data:
+        raise HTTPException(status_code=404, detail="Appointment request not found.")
+
+    booking_request = request_response.data[0]
+    conversation_response = (
+        supabase.table("conversations")
+        .select("*")
+        .eq("session_id", booking_request.get("session_id"))
+        .limit(1)
+        .execute()
+    )
+    item_response = (
+        supabase.table("booking_items")
+        .select("*")
+        .eq("booking_request_id", booking_request_id)
+        .order("item_order")
+        .execute()
+    )
+
+    conversation = (
+        conversation_response.data[0]
+        if conversation_response.data
+        else {}
+    )
+    return booking_request, conversation, list(item_response.data or [])
+
+
+def confirmation_missing_fields(
+    booking_request: dict,
+    conversation: dict,
+    items: list[dict],
+) -> list[str]:
+    checks = {
+        "treatment": bool(items and items[0].get("service_name")),
+        "duration": bool(booking_request.get("total_duration_minutes")),
+        "requested date": bool(booking_request.get("preferred_date")),
+        "requested time": bool(booking_request.get("preferred_time")),
+        "name": bool(conversation.get("name")),
+        "phone": bool(conversation.get("phone")),
+    }
+    return [label for label, present in checks.items() if not present]
+
+
+@app.post("/admin/confirm-appointment")
+async def confirm_appointment(
+    confirmation: ConfirmAppointmentRequest,
+    request: Request,
+):
+    """
+    Owner-only, idempotent appointment confirmation.
+
+    The database claim prevents concurrent clicks from creating duplicate
+    Google events. Calendar availability is always rechecked after the claim.
+    """
+    require_authenticated_admin(request)
+    booking_request, conversation, items = load_confirmation_context(
+        confirmation.booking_request_id
+    )
+
+    if (
+        booking_request.get("request_status") == "confirmed"
+        and booking_request.get("calendar_event_id")
+    ):
+        return {
+            "status": "confirmed",
+            "booking_request": booking_request,
+            "already_confirmed": True,
+        }
+
+    if booking_request.get("request_status") in {
+        "expired",
+        "cancelled_by_customer",
+        "completed",
+        "abandoned",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="This appointment request is no longer active.",
+        )
+
+    missing = confirmation_missing_fields(
+        booking_request,
+        conversation,
+        items,
+    )
+
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot confirm until these details are present: " + ", ".join(missing),
+        )
+
+    duration_minutes = int(booking_request["total_duration_minutes"])
+    confirmation_state = {
+        "preferred_date": booking_request["preferred_date"],
+        "preferred_time": booking_request["preferred_time"],
+        "duration": f"{duration_minutes} minutes",
+    }
+    slot = build_requested_slot(confirmation_state)
+
+    if not slot:
+        raise HTTPException(status_code=400, detail="The requested slot is invalid.")
+
+    start_time, end_time, _ = slot
+    claim_token = secrets.token_urlsafe(24)
+    claim_response = supabase.rpc(
+        "claim_booking_request_confirmation",
+        {
+            "target_request_id": confirmation.booking_request_id,
+            "new_lock_token": claim_token,
+        },
+    ).execute()
+
+    if not claim_response.data:
+        latest, _, _ = load_confirmation_context(
+            confirmation.booking_request_id
+        )
+
+        if latest.get("request_status") == "confirmed" and latest.get("calendar_event_id"):
+            return {
+                "status": "confirmed",
+                "booking_request": latest,
+                "already_confirmed": True,
+            }
+
+        raise HTTPException(
+            status_code=409,
+            detail="This request is already being confirmed. Please refresh in a moment.",
+        )
+
+    try:
+        event = find_google_calendar_event_for_request(
+            confirmation.booking_request_id
+        )
+
+        if not event:
+            availability = check_requested_calendar_slot(
+                confirmation_state,
+                "",
+            )
+
+            if availability.get("status") in {
+                "busy",
+                "past",
+                "outside_hours",
+                "closed_day",
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This slot is no longer available. Please choose another time.",
+                )
+
+            if availability.get("status") != "free":
+                raise HTTPException(
+                    status_code=503,
+                    detail="Calendar availability could not be verified. Please try again.",
+                )
+
+            service_names = [
+                str(item.get("service_name"))
+                for item in items
+                if item.get("service_name")
+            ]
+            treatment_title = " + ".join(service_names)
+            title = f"{treatment_title} - {conversation.get('name')}"
+            description = "\n".join([
+                f"Customer: {conversation.get('name')}",
+                f"Phone: {conversation.get('phone')}",
+                f"Treatment: {treatment_title}",
+                f"Duration: {duration_minutes} minutes",
+                f"Source: {conversation.get('source') or 'website'}",
+                f"Session ID: {booking_request.get('session_id')}",
+                f"Notes: {conversation.get('notes') or 'None'}",
+            ])
+            event = create_google_calendar_event(
+                start_time,
+                end_time,
+                title,
+                description,
+                confirmation.booking_request_id,
+            )
+        confirmed_at = datetime.now(timezone.utc).isoformat()
+        update_response = (
+            supabase.table("booking_requests")
+            .update({
+                "request_status": "confirmed",
+                "calendar_event_id": event["id"],
+                "confirmed_at": confirmed_at,
+                "confirmation_lock_token": None,
+                "confirmation_started_at": None,
+                "updated_at": confirmed_at,
+            })
+            .eq("id", confirmation.booking_request_id)
+            .eq("confirmation_lock_token", claim_token)
+            .execute()
+        )
+
+        if not update_response.data:
+            raise RuntimeError("Confirmed event could not be saved.")
+
+        supabase.table("conversations").update({
+            "active_booking_request_id": None,
+            "updated_at": confirmed_at,
+        }).eq(
+            "session_id",
+            booking_request.get("session_id"),
+        ).execute()
+
+        # Outbound channel confirmation intentionally belongs in a later hook.
+        return {
+            "status": "confirmed",
+            "booking_request": update_response.data[0],
+            "already_confirmed": False,
+        }
+
+    except HTTPException:
+        supabase.rpc(
+            "release_booking_request_confirmation",
+            {
+                "target_request_id": confirmation.booking_request_id,
+                "lock_token": claim_token,
+            },
+        ).execute()
+        raise
+    except urllib_error.HTTPError as error:
+        error.close()
+        supabase.rpc(
+            "release_booking_request_confirmation",
+            {
+                "target_request_id": confirmation.booking_request_id,
+                "lock_token": claim_token,
+            },
+        ).execute()
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Google Calendar could not create the appointment. "
+                "Reconnect Calendar and try again."
+            ),
+        )
+    except Exception:
+        supabase.rpc(
+            "release_booking_request_confirmation",
+            {
+                "target_request_id": confirmation.booking_request_id,
+                "lock_token": claim_token,
+            },
+        ).execute()
+        raise HTTPException(
+            status_code=500,
+            detail="The appointment could not be confirmed safely.",
+        )
 
 
 def advanced_multi_booking_enabled() -> bool:
@@ -8245,7 +8739,7 @@ def simple_request_price_pence(
     return int(value)
 
 
-def load_simple_draft_request(
+def load_active_simple_request(
     session_id: str,
 ) -> dict | None:
     try:
@@ -8253,7 +8747,7 @@ def load_simple_draft_request(
             supabase.table("booking_requests")
             .select("*")
             .eq("session_id", session_id)
-            .eq("request_status", "draft")
+            .in_("request_status", ["draft", "ready_for_review"])
             .order("request_number")
             .limit(1)
             .execute()
@@ -8330,13 +8824,18 @@ def sync_simple_single_request_projection(
         duration_minutes,
     )
     now_iso = datetime.now(timezone.utc).isoformat()
-    request_row = load_simple_draft_request(
+    request_row = load_active_simple_request(
         session_id
+    )
+    request_status = (
+        "ready_for_review"
+        if booking_request_is_complete(state)
+        else "draft"
     )
 
     request_payload = {
         "session_id": session_id,
-        "request_status": "draft",
+        "request_status": request_status,
         "appointment_structure": "single_service",
         "preferred_date": state.get("preferred_date"),
         "preferred_time": state.get("preferred_time"),
@@ -8485,12 +8984,35 @@ async def chat(
         source=request_source,
     )
 
-    current_state = get_existing_conversation(
+    existing_conversation = get_existing_conversation(
         request.session_id
     )
-    effective_history = merge_recent_history(
-        request.history,
-        load_recent_messages(request.session_id),
+
+    if (
+        customer_explicitly_cancels_request(request.message)
+        and cancel_active_booking_request(existing_conversation)
+    ):
+        reply = "Your appointment request has been cancelled."
+        save_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=reply,
+            source=request_source,
+        )
+        return {"reply": reply}
+
+    resume_was_reset = (
+        active_booking_request_status(existing_conversation)
+        in INACTIVE_BOOKING_REQUEST_STATUSES
+    )
+    current_state = prepare_conversation_for_resume(existing_conversation)
+    effective_history = (
+        []
+        if resume_was_reset
+        else merge_recent_history(
+            request.history,
+            load_recent_messages(request.session_id),
+        )
     )
     services_context = build_authoritative_services_context()
     business_context = load_business_documents_context()
