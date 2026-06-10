@@ -7469,6 +7469,194 @@ def safe_calendar_customer_text(
     return ""
 
 
+def option_numbers(value: str) -> set[str]:
+    """Return customer-visible numeric option values from a reply or prompt."""
+    return set(re.findall(
+        r"(?<!\w)\d+(?:\.\d+)?",
+        str(value or "").lower(),
+    ))
+
+
+def duration_option_numbers(value: str) -> set[str]:
+    """Return numeric duration choices while ignoring customer-visible prices."""
+    cleaned = str(value or "").lower()
+
+    if not re.search(r"\b(?:minutes?|mins?|hours?|hrs?)\b", cleaned):
+        return set()
+
+    without_prices = re.sub(
+        r"(?:Â£|£|\$)\s*\d+(?:\.\d+)?",
+        "",
+        cleaned,
+    )
+    return option_numbers(without_prices)
+
+
+def service_variant_options_for_state(state: dict) -> list[dict]:
+    """Return the relevant catalogue choices for an unresolved service."""
+    treatment = state.get("treatment")
+    category = normalise_treatment_name(treatment)
+    loaders = {
+        "massage": load_massage_services,
+        "vitamin shot": load_vitamin_shot_services,
+        "ultrasound": load_ultrasound_services,
+        "microneedling": load_microneedling_services,
+        "facial": load_facial_services,
+        "dermal filler": load_dermal_filler_services,
+    }
+
+    if is_partial_dermal_filler_treatment(treatment):
+        area = dermal_filler_partial_area(treatment)
+        return dermal_filler_services_for_area(area)
+
+    loader = loaders.get(category)
+    return loader()[0] if loader else []
+
+
+def response_already_contains_options(
+    response: str,
+    state: dict,
+    next_required_detail: str | None,
+    full_question: str,
+) -> bool:
+    """
+    Detect whether the information body already presents the pending choices.
+
+    The check uses structured catalogue identities first, then numeric option
+    overlap for choices such as durations, prices, packages, and filler amounts.
+    """
+    cleaned_response = normalise_service_match_text(response)
+
+    if not cleaned_response:
+        return False
+
+    if next_required_detail == "duration":
+        allowed = {
+            str(value)
+            for value in allowed_durations_for_treatment(
+                state.get("treatment")
+            )
+        }
+        return len(duration_option_numbers(response) & allowed) >= 2
+
+    if next_required_detail != "service_variant":
+        return False
+
+    matched_services = 0
+    response_tokens = set(cleaned_response.split())
+    generic_service_tokens = {
+        "dermal",
+        "facial",
+        "filler",
+        "fillers",
+        "massage",
+        "microneedling",
+        "service",
+        "session",
+        "shot",
+        "treatment",
+        "ultrasound",
+        "vitamin",
+    }
+
+    def label_is_present(label) -> bool:
+        normalised_label = normalise_service_match_text(label)
+        distinctive_tokens = (
+            set(normalised_label.split())
+            - generic_service_tokens
+        )
+        return bool(
+            normalised_label
+            and (
+                normalised_label in cleaned_response
+                or (
+                    distinctive_tokens
+                    and distinctive_tokens.issubset(response_tokens)
+                )
+            )
+        )
+
+    for service in service_variant_options_for_state(state):
+        aliases = service.get("aliases") or []
+
+        if isinstance(aliases, str):
+            aliases = [aliases]
+
+        labels = [
+            service.get("service_name"),
+            *aliases,
+        ]
+
+        if any(
+            label_is_present(label)
+            for label in labels
+        ):
+            matched_services += 1
+
+    if matched_services >= 2:
+        return True
+
+    prompt_numbers = option_numbers(full_question)
+    response_numbers = option_numbers(response)
+    return len(prompt_numbers & response_numbers) >= 3
+
+
+def build_short_next_question(
+    state: dict,
+    next_required_detail: str | None,
+) -> str:
+    """Ask for the missing choice without repeating its option list."""
+    if next_required_detail == "duration":
+        return "Which duration would you prefer?"
+
+    if next_required_detail != "service_variant":
+        return render_next_question(state, next_required_detail)
+
+    treatment = state.get("treatment")
+    category = normalise_treatment_name(treatment)
+
+    if category == "massage":
+        return "Which massage would you like?"
+
+    if category == "facial":
+        return "Which facial would you like?"
+
+    if is_partial_dermal_filler_treatment(treatment):
+        return "Which amount would you like?"
+
+    if category == "dermal filler":
+        return "Which area and amount would you like?"
+
+    return "Which option would you like?"
+
+
+def split_customer_sentences(response: str) -> list[str]:
+    """Split customer-facing prose without treating decimal points as stops."""
+    return [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[!?])\s+|(?<=\.)\s+(?=[A-Z])|\n+",
+            str(response or ""),
+        )
+        if sentence.strip()
+    ]
+
+
+def strip_questions_from_response(response: str) -> str:
+    """Remove model-written questions before Python appends the one next step."""
+    cleaned = re.sub(
+        r"(?is)(?:\s*[,;]?\s*(?:and\s+)?)"
+        r"(?:which|what|how|could|can|would|do|does|is|are)\b[^?]*\?",
+        "",
+        str(response or ""),
+    )
+    return " ".join(
+        sentence
+        for sentence in split_customer_sentences(cleaned)
+        if not sentence.endswith("?")
+    ).strip()
+
+
 def build_responder_context(
     state: dict,
     extractor_result: dict,
@@ -7531,12 +7719,7 @@ def sanitise_natural_responder_body(reply: str) -> str:
     )
     safe_sentences = []
 
-    for sentence in re.findall(r"[^.!?\n]+[.!?]?", cleaned):
-        sentence = sentence.strip()
-
-        if not sentence:
-            continue
-
+    for sentence in split_customer_sentences(cleaned):
         if sentence_contains_forbidden_booking_claim(sentence):
             continue
 
@@ -7808,9 +7991,7 @@ def strip_unverified_calendar_claims(
     del calendar_result
     safe_sentences = []
 
-    for sentence in re.findall(r"[^.!?\n]+[.!?]?", str(reply or "")):
-        sentence = sentence.strip()
-
+    for sentence in split_customer_sentences(reply):
         if sentence and not sentence_contains_forbidden_booking_claim(sentence):
             safe_sentences.append(sentence)
 
@@ -7827,10 +8008,11 @@ def compose_verified_customer_reply(
     latest_message: str,
     history: list[ChatMessage],
 ) -> str:
-    next_question = render_next_question(
+    full_next_question = render_next_question(
         state,
         next_required_detail,
     )
+    next_question = full_next_question
     booking_flow_active = (
         state.get("conversation_mode") == "booking_request"
         or next_required_detail is not None
@@ -7870,6 +8052,9 @@ def compose_verified_customer_reply(
             information_body = strip_unverified_calendar_claims(
                 information_body,
                 calendar_result,
+            )
+            information_body = strip_questions_from_response(
+                information_body
             )
 
             if reply_is_meaningful(information_body):
@@ -7924,6 +8109,20 @@ def compose_verified_customer_reply(
         body,
         calendar_result,
     )
+
+    if next_question:
+        body = strip_questions_from_response(body)
+
+        if response_already_contains_options(
+            body,
+            state,
+            next_required_detail,
+            full_next_question,
+        ):
+            next_question = build_short_next_question(
+                state,
+                next_required_detail,
+            )
 
     if not reply_is_meaningful(body):
         body = ""
