@@ -889,6 +889,7 @@
                                 <th>AI status</th>
                                 <th>Owner status</th>
                                 <th>Name</th>
+                                <th>Instagram profile</th>
                                 <th>Phone</th>
                                 <th>Active treatment</th>
                                 <th>Requests</th>
@@ -1476,6 +1477,7 @@
                         <div class="save-note"></div>
                     </td>
                     <td>${safeText(lead.name)}</td>
+                    <td class="instagram-profile"></td>
                     <td>${safeText(lead.phone)}</td>
                     <td>${safeText(lead.treatment)}</td>
                     <td>${requestCountLabel(lead.session_id)}</td>
@@ -1491,6 +1493,8 @@
 
                 const ownerSelect = row.querySelector(".owner-select");
                 const saveNote = row.querySelector(".save-note");
+                row.querySelector(".instagram-profile").textContent =
+                    instagramProfileLabel(lead);
                 ownerSelect.value = lead.owner_status || "unreviewed";
 
                 ownerSelect.addEventListener("change", async () => {
@@ -1545,6 +1549,7 @@
                 const searchableText = [
                     lead.name,
                     lead.phone,
+                    instagramProfileLabel(lead),
                     lead.treatment,
                     lead.summary,
                     lead.source,
@@ -1602,7 +1607,7 @@
                     .order("created_at", { ascending: true }),
                 supabaseClient
                     .from("channel_contacts")
-                    .select("id, source, last_customer_message_at")
+                    .select("id, source, profile_name, profile_username, last_customer_message_at")
             ]);
 
             if (requestResult.error) throw requestResult.error;
@@ -1671,6 +1676,20 @@
             parent.appendChild(wrapper);
         }
 
+        function instagramProfileLabel(lead) {
+            if (lead?.source !== "instagram" || !lead?.channel_contact_id) {
+                return "—";
+            }
+
+            const contact = channelContactsById.get(String(lead.channel_contact_id));
+            const username = contact?.profile_username
+                ? `@${contact.profile_username}`
+                : "";
+            const name = contact?.profile_name || "";
+
+            return [name, username].filter(Boolean).join(" ") || "Profile unavailable";
+        }
+
         function requestCanBeConfirmed(lead, request, requestItems) {
             return Boolean(
                 requestItems.some((item) => item.service_name)
@@ -1678,7 +1697,7 @@
                 && request.preferred_date
                 && request.preferred_time
                 && lead?.name
-                && lead?.phone
+                && (lead?.source === "instagram" || lead?.phone)
                 && [
                     "draft",
                     "ready_for_review",
@@ -1872,6 +1891,11 @@
             customerGrid.className = "lead-summary-grid";
 
             appendSummaryField(customerGrid, "Name", lead?.name);
+            appendSummaryField(
+                customerGrid,
+                "Instagram profile",
+                instagramProfileLabel(lead)
+            );
             appendSummaryField(customerGrid, "Phone", lead?.phone);
             appendSummaryField(customerGrid, "Source", lead?.source || "website");
             appendSummaryField(

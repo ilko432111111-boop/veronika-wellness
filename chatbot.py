@@ -145,6 +145,17 @@ REQUIRED_BOOKING_FIELDS = [
 ]
 
 
+def required_booking_fields(lead_data: dict) -> list[str]:
+    if normalise_source(lead_data.get("source")) == "instagram":
+        return [
+            field
+            for field in REQUIRED_BOOKING_FIELDS
+            if field != "phone"
+        ]
+
+    return REQUIRED_BOOKING_FIELDS
+
+
 def booking_request_is_complete(lead_data: dict) -> bool:
     """
     A booking request is complete only when every required field is present.
@@ -154,7 +165,7 @@ def booking_request_is_complete(lead_data: dict) -> bool:
         not lead_data.get("verified_alternatives")
         and all(
             lead_data.get(field) not in [None, ""]
-            for field in REQUIRED_BOOKING_FIELDS
+            for field in required_booking_fields(lead_data)
         )
     )
 
@@ -5174,7 +5185,7 @@ def send_booking_notification(session_id: str):
             .select(
                 "session_id, name, phone, treatment, duration, "
                 "preferred_date, preferred_time, notes, summary, "
-                "status, notification_sent_at"
+                "status, source, notification_sent_at"
             )
             .eq("session_id", session_id)
             .limit(1)
@@ -5191,7 +5202,7 @@ def send_booking_notification(session_id: str):
 
         missing_email_fields = [
             field
-            for field in REQUIRED_BOOKING_FIELDS
+            for field in required_booking_fields(lead)
             if lead.get(field) in [None, ""]
         ]
 
@@ -6387,23 +6398,103 @@ def send_instagram_text_message(
         }
 
 
+def fetch_instagram_user_profile(sender_id: str) -> dict:
+    """Fetch owner-facing Instagram profile metadata for an Instagram-scoped ID."""
+    if not INSTAGRAM_ACCESS_TOKEN:
+        return {}
+
+    endpoint = (
+        f"https://graph.instagram.com/"
+        f"{INSTAGRAM_GRAPH_VERSION}/{urllib_parse.quote(sender_id, safe='')}?"
+        + urllib_parse.urlencode({
+            "fields": "name,username",
+            "access_token": INSTAGRAM_ACCESS_TOKEN,
+        })
+    )
+    profile_request = urllib_request.Request(
+        endpoint,
+        headers={"User-Agent": "receptionist-chatbot/1.0"},
+        method="GET",
+    )
+
+    try:
+        with urllib_request.urlopen(profile_request, timeout=15) as response:
+            profile = json.loads(response.read().decode("utf-8"))
+
+        if not isinstance(profile, dict):
+            return {}
+
+        return {
+            "profile_name": str(profile.get("name") or "").strip() or None,
+            "profile_username": str(profile.get("username") or "").strip() or None,
+            "profile_fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except urllib_error.HTTPError as error:
+        error.close()
+        logger.warning(
+            "Instagram profile lookup was rejected with HTTP status %s.",
+            error.code,
+        )
+    except Exception as error:
+        logger.error(
+            "Instagram profile lookup failed with %s.",
+            type(error).__name__,
+        )
+
+    return {}
+
+
+def instagram_profile_needs_refresh(contact: dict) -> bool:
+    fetched_at = contact.get("profile_fetched_at")
+
+    if not fetched_at:
+        return True
+
+    try:
+        fetched = datetime.fromisoformat(
+            str(fetched_at).replace("Z", "+00:00")
+        )
+
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+
+        return (
+            datetime.now(timezone.utc) - fetched.astimezone(timezone.utc)
+            >= timedelta(hours=24)
+        )
+    except ValueError:
+        return True
+
+
 def save_instagram_channel_contact(
     sender_id: str,
     session_id: str,
     customer_message_at: str,
+    profile: dict | None = None,
 ) -> dict:
     """Store one Instagram-scoped identity and link its current conversation."""
     try:
+        payload = {
+            "business_slug": BUSINESS_SLUG,
+            "source": "instagram",
+            "external_user_id": sender_id,
+            "last_customer_message_at": customer_message_at,
+            "updated_at": customer_message_at,
+        }
+        payload.update({
+            key: value
+            for key, value in (profile or {}).items()
+            if key in {
+                "profile_name",
+                "profile_username",
+                "profile_fetched_at",
+            }
+            and value not in [None, ""]
+        })
         contact_response = (
             supabase.table("channel_contacts")
             .upsert(
-                {
-                    "business_slug": BUSINESS_SLUG,
-                    "source": "instagram",
-                    "external_user_id": sender_id,
-                    "last_customer_message_at": customer_message_at,
-                    "updated_at": customer_message_at,
-                },
+                payload,
                 on_conflict="business_slug,source,external_user_id",
             )
             .execute()
@@ -6648,11 +6739,23 @@ def process_instagram_webhook_payload(payload: dict):
                 message_text,
             )
             customer_message_at = datetime.now(timezone.utc).isoformat()
-            save_instagram_channel_contact(
+            contact = save_instagram_channel_contact(
                 sender_id,
                 session_id,
                 customer_message_at,
             )
+            instagram_profile = {}
+
+            if instagram_profile_needs_refresh(contact):
+                instagram_profile = fetch_instagram_user_profile(sender_id)
+
+                if instagram_profile:
+                    save_instagram_channel_contact(
+                        sender_id,
+                        session_id,
+                        customer_message_at,
+                        instagram_profile,
+                    )
 
             rate_limit_reply = instagram_rate_limit_message(sender_id)
 
@@ -6735,6 +6838,7 @@ def process_instagram_webhook_payload(payload: dict):
                     sender_id,
                     session_id,
                     customer_message_at,
+                    instagram_profile,
                 )
 
             except Exception as error:
@@ -6993,8 +7097,11 @@ def confirmation_missing_fields(
         "requested date": bool(booking_request.get("preferred_date")),
         "requested time": bool(booking_request.get("preferred_time")),
         "name": bool(conversation.get("name")),
-        "phone": bool(conversation.get("phone")),
     }
+
+    if normalise_source(conversation.get("source")) != "instagram":
+        checks["phone"] = bool(conversation.get("phone"))
+
     return [label for label, present in checks.items() if not present]
 
 
@@ -8345,16 +8452,22 @@ def compute_next_required_detail(
     if active_verified_alternatives(state):
         return "verified_alternative"
 
+    instagram_source = normalise_source(state.get("source")) == "instagram"
+
     if (
         state.get("name") in [None, ""]
         and state.get("phone") in [None, ""]
     ):
-        return "name_and_phone"
+        return (
+            "name_and_optional_phone"
+            if instagram_source
+            else "name_and_phone"
+        )
 
     if state.get("name") in [None, ""]:
         return "name"
 
-    if state.get("phone") in [None, ""]:
+    if state.get("phone") in [None, ""] and not instagram_source:
         return "phone"
 
     return "handoff"
@@ -8408,7 +8521,10 @@ def handoff_is_allowed(
         and slot_status in {"free", "provisional_free"}
         and not active_verified_alternatives(state)
         and state.get("name") not in [None, ""]
-        and state.get("phone") not in [None, ""]
+        and (
+            normalise_source(state.get("source")) == "instagram"
+            or state.get("phone") not in [None, ""]
+        )
         and compute_next_required_detail(state, True) == "handoff"
     )
 
@@ -8454,6 +8570,12 @@ def render_next_question(
 
     if next_required_detail == "name_and_phone":
         return "Could I take your name and phone number, please?"
+
+    if next_required_detail == "name_and_optional_phone":
+        return (
+            "Could I take your name, please? You can also share a phone "
+            "number as an optional backup contact."
+        )
 
     if next_required_detail == "name":
         return "Could I take your name, please?"
@@ -9636,6 +9758,10 @@ async def chat(
         in INACTIVE_BOOKING_REQUEST_STATUSES
     )
     current_state = prepare_conversation_for_resume(existing_conversation)
+    current_state = {
+        **current_state,
+        "source": request_source,
+    }
     effective_history = (
         []
         if resume_was_reset
