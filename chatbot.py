@@ -7894,6 +7894,61 @@ def load_active_payment_request(
     return response.data[0] if response.data else None
 
 
+def safe_sumup_error_details(response_body: str) -> tuple[str, str]:
+    """Return a safe dashboard reason and redacted diagnostic response body."""
+    cleaned_body = str(response_body or "").strip()
+    diagnostic_body = re.sub(
+        r"(?i)([\"']?(?:authorization|access[_ -]?token|api[_ -]?key|"
+        r"bearer|token|secret|password)"
+        r"[\"']?\s*[:=]\s*)[\"']?[^,\"'\s}]+",
+        r"\1[redacted]",
+        cleaned_body,
+    )[:2000]
+    diagnostic_body = re.sub(
+        r"(?i)\b(?:sup_sk_|sk_test_|sk_live_)[A-Za-z0-9._-]+",
+        "[redacted-key]",
+        diagnostic_body,
+    )
+    reason = ""
+
+    try:
+        parsed = json.loads(cleaned_body)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        for key in ("message", "error_message", "detail", "error", "code"):
+            value = parsed.get(key)
+
+            if isinstance(value, str) and value.strip():
+                reason = value.strip()
+                break
+
+            if isinstance(value, dict):
+                nested = value.get("message") or value.get("description")
+
+                if isinstance(nested, str) and nested.strip():
+                    reason = nested.strip()
+                    break
+
+    if not reason and cleaned_body and not cleaned_body.lstrip().startswith("<"):
+        reason = cleaned_body
+
+    reason = re.sub(
+        r"(?i)\b(?:sup_sk_|sk_test_|sk_live_)[A-Za-z0-9._-]+",
+        "[redacted-key]",
+        reason,
+    )
+    reason = re.sub(
+        r"(?i)(authorization|access[_ -]?token|api[_ -]?key|bearer|token|"
+        r"secret|password)\s*[:=]\s*\S+",
+        r"\1=[redacted]",
+        reason,
+    )
+    reason = re.sub(r"\s+", " ", reason).strip()[:300]
+    return reason, diagnostic_body or "[empty response body]"
+
+
 def create_sumup_hosted_checkout(
     checkout_reference: str,
     amount_pence: int,
@@ -7935,14 +7990,65 @@ def create_sumup_hosted_checkout(
         },
         method="POST",
     )
+    logger.info(
+        "SumUp checkout request: endpoint=%s checkout_reference=%s "
+        "amount=%s currency=%s merchant_code_present=%s "
+        "hosted_checkout_enabled=%s",
+        SUMUP_CHECKOUT_ENDPOINT,
+        checkout_reference,
+        payload["amount"],
+        payload["currency"],
+        str(merchant_code_present).lower(),
+        str(payload["hosted_checkout"]["enabled"]).lower(),
+    )
 
     try:
         with urllib_request.urlopen(checkout_request, timeout=20) as response:
-            checkout = json.loads(response.read().decode("utf-8"))
+            response_body = response.read().decode("utf-8", errors="replace")
+
+        try:
+            checkout = json.loads(response_body)
+        except json.JSONDecodeError as error:
+            _, diagnostic_body = safe_sumup_error_details(response_body)
+            logger.warning(
+                "SumUp checkout returned invalid JSON: endpoint=%s "
+                "response_body=%s checkout_reference=%s amount=%s currency=%s",
+                SUMUP_CHECKOUT_ENDPOINT,
+                diagnostic_body,
+                checkout_reference,
+                payload["amount"],
+                payload["currency"],
+            )
+            raise RuntimeError(
+                "Could not create SumUp deposit link: SumUp returned an invalid response."
+            ) from error
     except urllib_error.HTTPError as error:
-        error.close()
+        try:
+            response_body = error.read().decode("utf-8", errors="replace")
+        finally:
+            error.close()
+
+        safe_reason, diagnostic_body = safe_sumup_error_details(response_body)
+        logger.warning(
+            "SumUp checkout rejected: endpoint=%s http_status=%s "
+            "response_body=%s checkout_reference=%s amount=%s currency=%s "
+            "merchant_code_present=%s hosted_checkout_enabled=%s",
+            SUMUP_CHECKOUT_ENDPOINT,
+            error.code,
+            diagnostic_body,
+            checkout_reference,
+            payload["amount"],
+            payload["currency"],
+            str(merchant_code_present).lower(),
+            str(payload["hosted_checkout"]["enabled"]).lower(),
+        )
         raise RuntimeError(
-            f"SumUp rejected checkout creation (HTTP {error.code})."
+            "Could not create SumUp deposit link: "
+            + (
+                safe_reason
+                if safe_reason
+                else f"SumUp returned HTTP {error.code}."
+            )
         ) from error
     except (TimeoutError, urllib_error.URLError) as error:
         raise RuntimeError("SumUp checkout creation could not be reached.") from error
@@ -7954,7 +8060,24 @@ def create_sumup_hosted_checkout(
     hosted_checkout_url = checkout.get("hosted_checkout_url")
 
     if not checkout_id or not hosted_checkout_url:
-        raise RuntimeError("SumUp did not return a hosted checkout URL.")
+        _, diagnostic_body = safe_sumup_error_details(
+            json.dumps(checkout, ensure_ascii=False)
+        )
+        logger.warning(
+            "SumUp checkout response missing hosted checkout data: endpoint=%s "
+            "response_body=%s checkout_reference=%s amount=%s currency=%s "
+            "merchant_code_present=%s hosted_checkout_enabled=%s",
+            SUMUP_CHECKOUT_ENDPOINT,
+            diagnostic_body,
+            checkout_reference,
+            payload["amount"],
+            payload["currency"],
+            str(merchant_code_present).lower(),
+            str(payload["hosted_checkout"]["enabled"]).lower(),
+        )
+        raise RuntimeError(
+            "Could not create SumUp deposit link: SumUp did not return a hosted checkout URL."
+        )
 
     return {
         "provider_checkout_id": str(checkout_id),
@@ -8314,9 +8437,10 @@ async def request_booking_deposit(
         )
     except Exception as error:
         logger.warning(
-            "SumUp checkout creation failed for booking request %s: %s",
+            "SumUp checkout creation failed for booking request %s: %s: %s",
             booking_request_id,
             type(error).__name__,
+            str(error)[:500],
         )
         return confirmation_json_response(
             False,
