@@ -608,9 +608,42 @@
 
         .request-actions {
             display: flex;
+            flex-wrap: wrap;
             gap: 10px;
             align-items: center;
             margin-top: 12px;
+        }
+
+        .deposit-controls {
+            width: 100%;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            padding-top: 10px;
+            border-top: 1px solid var(--border);
+        }
+
+        .deposit-controls label {
+            color: var(--muted);
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+
+        .deposit-amount-input {
+            width: 110px;
+            padding: 8px 10px;
+        }
+
+        .payment-summary {
+            width: 100%;
+            display: grid;
+            gap: 4px;
+            padding: 10px;
+            border-radius: 10px;
+            background: #f0fdf4;
+            color: #166534;
+            font-size: 0.86rem;
         }
 
         .request-message {
@@ -1008,6 +1041,7 @@
         let currentPage = 1;
         let bookingRequestsBySession = new Map();
         let bookingItemsByRequest = new Map();
+        let paymentRequestsByBooking = new Map();
         let pendingActionsBySession = new Map();
         let channelContactsById = new Map();
         let openLeadSessionId = null;
@@ -1589,6 +1623,7 @@
             const [
                 requestResult,
                 itemResult,
+                paymentResult,
                 pendingResult,
                 contactResult
             ] = await Promise.all([
@@ -1601,6 +1636,10 @@
                     .select("id, booking_request_id, service_name, category, duration_minutes, price_pence, item_order")
                     .order("item_order", { ascending: true }),
                 supabaseClient
+                    .from("payment_requests")
+                    .select("id, booking_request_id, amount_pence, status, hold_expires_at, hosted_checkout_url, message_delivery_status, message_delivery_error, message_sent_at, created_at")
+                    .order("created_at", { ascending: false }),
+                supabaseClient
                     .from("pending_booking_actions")
                     .select("id, session_id, service_name, category, action_type, action_status, source_message, created_at")
                     .eq("action_status", "pending")
@@ -1612,6 +1651,7 @@
 
             if (requestResult.error) throw requestResult.error;
             if (itemResult.error) throw itemResult.error;
+            if (paymentResult.error) throw paymentResult.error;
             if (pendingResult.error) throw pendingResult.error;
             if (contactResult.error) throw contactResult.error;
 
@@ -1622,6 +1662,11 @@
 
             bookingItemsByRequest = groupRows(
                 itemResult.data || [],
+                "booking_request_id"
+            );
+
+            paymentRequestsByBooking = groupRows(
+                paymentResult.data || [],
                 "booking_request_id"
             );
 
@@ -1706,6 +1751,14 @@
             );
         }
 
+        function requestCanRequestDeposit(lead, request, requestItems) {
+            return Boolean(
+                requestCanBeConfirmed(lead, request, requestItems)
+                && lead?.phone
+                && Number(request.total_price_pence || 0) >= 100
+            );
+        }
+
         async function confirmAppointment(requestId, button, message) {
             button.disabled = true;
             button.textContent = "Confirming...";
@@ -1761,8 +1814,76 @@
             } catch (error) {
                 message.textContent = error.message;
                 button.disabled = false;
-                button.textContent = "Confirm appointment";
+                button.textContent = "Confirm without deposit";
             }
+        }
+
+        async function requestDeposit(requestId, amountInput, button, message) {
+            const amountPence = Math.round(Number(amountInput.value) * 100);
+
+            if (!Number.isInteger(amountPence) || amountPence < 100) {
+                message.textContent = "Enter a deposit amount of at least £1.00.";
+                return;
+            }
+
+            button.disabled = true;
+            amountInput.disabled = true;
+            button.textContent = "Creating link...";
+            message.textContent = "Rechecking availability and creating SumUp link...";
+
+            try {
+                const {
+                    data: { session }
+                } = await supabaseClient.auth.getSession();
+
+                if (!session?.access_token) {
+                    throw new Error("Your admin session has expired. Please sign in again.");
+                }
+
+                const response = await fetch(
+                    `${BACKEND_API_BASE_URL}/admin/booking-requests/${requestId}/request-deposit`,
+                    {
+                        method: "POST",
+                        headers: {
+                            "Authorization": `Bearer ${session.access_token}`,
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({ amount_pence: amountPence })
+                    }
+                );
+                const result = await response.json();
+
+                if (!response.ok || !result?.success) {
+                    throw new Error(result?.message || result?.detail || "Deposit link could not be created.");
+                }
+
+                message.textContent = result.delivery_message || result.message;
+                await loadLeads();
+            } catch (error) {
+                message.textContent = error.message;
+                button.disabled = false;
+                amountInput.disabled = false;
+                button.textContent = "Request deposit";
+            }
+        }
+
+        async function copyPaymentLink(url, message) {
+            try {
+                await navigator.clipboard.writeText(url);
+                message.textContent = "Payment link copied.";
+            } catch (error) {
+                message.textContent = "Could not copy the payment link. Open it and copy it manually.";
+            }
+        }
+
+        function activePendingPayment(requestId) {
+            const payments = paymentRequestsByBooking.get(String(requestId)) || [];
+            const now = Date.now();
+
+            return payments.find((payment) => (
+                payment.status === "pending"
+                && new Date(payment.hold_expires_at).getTime() > now
+            )) || null;
         }
 
         function instagramConfirmationRetryAvailable(lead, request) {
@@ -2002,6 +2123,7 @@
 
                 const actionMessage = document.createElement("span");
                 actionMessage.className = "request-message";
+                const activePayment = activePendingPayment(request.id);
 
                 if (request.request_status === "confirmed") {
                     actionMessage.textContent = confirmationMessageLabel(request);
@@ -2024,11 +2146,117 @@
                     const confirmButton = document.createElement("button");
                     confirmButton.className = "small-button";
                     confirmButton.type = "button";
-                    confirmButton.textContent = "Confirm appointment";
+                    confirmButton.textContent = "Confirm without deposit";
                     confirmButton.addEventListener("click", () => {
                         confirmAppointment(request.id, confirmButton, actionMessage);
                     });
                     actions.appendChild(confirmButton);
+
+                    if (activePayment) {
+                        const paymentSummary = document.createElement("div");
+                        paymentSummary.className = "payment-summary";
+
+                        const depositLabel = document.createElement("strong");
+                        depositLabel.textContent =
+                            `Deposit requested: ${formatMoneyPence(activePayment.amount_pence)}`;
+
+                        const paymentStatus = document.createElement("span");
+                        paymentStatus.textContent = "Payment status: Awaiting payment";
+
+                        const holdLabel = document.createElement("span");
+                        holdLabel.textContent =
+                            `Slot held until: ${formatDate(activePayment.hold_expires_at)}`;
+
+                        const deliveryLabel = document.createElement("span");
+
+                        if (activePayment.message_delivery_status === "sent") {
+                            deliveryLabel.textContent = "Deposit link sent by Instagram.";
+                        } else if (activePayment.message_delivery_status === "failed") {
+                            deliveryLabel.textContent =
+                                `Deposit link created, but Instagram delivery failed: ${safeText(activePayment.message_delivery_error)}`;
+                        } else if (activePayment.message_delivery_status === "reply_window_expired") {
+                            deliveryLabel.textContent =
+                                "Deposit link created, but the Instagram reply window has expired.";
+                        } else {
+                            deliveryLabel.textContent =
+                                "Deposit link created. Send or copy it manually.";
+                        }
+
+                        const paymentButtons = document.createElement("div");
+                        paymentButtons.className = "row-actions";
+
+                        if (activePayment.hosted_checkout_url) {
+                            const openLink = document.createElement("a");
+                            openLink.className = "small-button";
+                            openLink.href = activePayment.hosted_checkout_url;
+                            openLink.target = "_blank";
+                            openLink.rel = "noopener noreferrer";
+                            openLink.textContent = "Open payment link";
+
+                            const copyButton = document.createElement("button");
+                            copyButton.className = "small-button";
+                            copyButton.type = "button";
+                            copyButton.textContent = "Copy payment link";
+                            copyButton.addEventListener("click", () => {
+                                copyPaymentLink(
+                                    activePayment.hosted_checkout_url,
+                                    actionMessage
+                                );
+                            });
+                            paymentButtons.append(openLink, copyButton);
+                        }
+
+                        paymentSummary.append(
+                            depositLabel,
+                            paymentStatus,
+                            holdLabel,
+                            deliveryLabel,
+                            paymentButtons
+                        );
+                        actions.appendChild(paymentSummary);
+                    } else if (
+                        requestCanRequestDeposit(lead, request, requestItems)
+                    ) {
+                        const depositControls = document.createElement("div");
+                        depositControls.className = "deposit-controls";
+
+                        const depositLabel = document.createElement("label");
+                        depositLabel.textContent = "Deposit amount:";
+
+                        const amountInput = document.createElement("input");
+                        amountInput.className = "deposit-amount-input";
+                        amountInput.type = "number";
+                        amountInput.min = "1";
+                        amountInput.step = "0.01";
+                        amountInput.max = (
+                            Number(request.total_price_pence || 0) / 100
+                        ).toFixed(2);
+                        amountInput.value = Math.min(
+                            20,
+                            Number(request.total_price_pence || 0) / 100
+                        ).toFixed(2);
+                        amountInput.setAttribute("aria-label", "Deposit amount in pounds");
+
+                        const depositButton = document.createElement("button");
+                        depositButton.className = "small-button";
+                        depositButton.type = "button";
+                        depositButton.textContent = "Request deposit";
+                        depositButton.addEventListener("click", () => {
+                            requestDeposit(
+                                request.id,
+                                amountInput,
+                                depositButton,
+                                actionMessage
+                            );
+                        });
+
+                        depositControls.append(
+                            depositLabel,
+                            amountInput,
+                            depositButton
+                        );
+                        actions.appendChild(depositControls);
+                    }
                 }
 
                 actions.appendChild(actionMessage);

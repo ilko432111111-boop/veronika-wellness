@@ -1,6 +1,6 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 from groq import Groq
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -107,6 +107,14 @@ INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET")
 INSTAGRAM_VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN")
 INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v25.0")
 
+SUMUP_API_KEY = os.getenv("SUMUP_API_KEY")
+SUMUP_MERCHANT_CODE = os.getenv("SUMUP_MERCHANT_CODE")
+SUMUP_HOLD_MINUTES = read_positive_int_environment_variable(
+    "SUMUP_HOLD_MINUTES",
+    30,
+)
+SUMUP_CHECKOUT_ENDPOINT = "https://api.sumup.com/v0.1/checkouts"
+
 # Instagram session and moderation safeguards.
 # A completed or stale Instagram conversation starts a fresh lead session.
 INSTAGRAM_SESSION_IDLE_HOURS = 12
@@ -184,6 +192,10 @@ class ChatRequest(BaseModel):
 
 class ConfirmAppointmentRequest(BaseModel):
     booking_request_id: int
+
+
+class DepositRequest(BaseModel):
+    amount_pence: StrictInt
 
 
 def normalise_source(source: str | None) -> str:
@@ -6014,6 +6026,87 @@ def build_requested_slot(lead_data: dict):
         return None
 
 
+def expire_pending_payment_holds() -> None:
+    """Release elapsed holds without deleting their payment history."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        (
+            supabase.table("payment_requests")
+            .update({
+                "status": "expired",
+                "expired_at": now_iso,
+                "updated_at": now_iso,
+            })
+            .eq("status", "pending")
+            .lte("hold_expires_at", now_iso)
+            .execute()
+        )
+    except Exception as error:
+        logger.warning(
+            "Could not expire elapsed payment holds: %s",
+            type(error).__name__,
+        )
+
+
+def active_payment_hold_busy_periods(
+    start_time: datetime,
+    end_time: datetime,
+    exclude_booking_request_id: int | None = None,
+) -> list[dict]:
+    """Return active SumUp holds overlapping a requested interval."""
+    expire_pending_payment_holds()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        response = (
+            supabase.table("payment_requests")
+            .select(
+                "booking_request_id, hold_expires_at, held_start_at, held_end_at"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("status", "pending")
+            .gt("hold_expires_at", now_iso)
+            .execute()
+        )
+    except Exception as error:
+        logger.warning(
+            "Could not load active payment holds: %s",
+            type(error).__name__,
+        )
+        return []
+
+    busy_periods = []
+
+    for row in response.data or []:
+        request_id = row.get("booking_request_id")
+
+        if (
+            exclude_booking_request_id is not None
+            and str(request_id) == str(exclude_booking_request_id)
+        ):
+            continue
+
+        hold_start = parse_utc_datetime(row.get("held_start_at"))
+        hold_end = parse_utc_datetime(row.get("held_end_at"))
+
+        if not hold_start or not hold_end:
+            continue
+
+        hold_start = hold_start.astimezone(BUSINESS_TIMEZONE)
+        hold_end = hold_end.astimezone(BUSINESS_TIMEZONE)
+
+        if hold_start < end_time and hold_end > start_time:
+            busy_periods.append({
+                "start": hold_start.isoformat(),
+                "end": hold_end.isoformat(),
+                "source": "payment_hold",
+                "booking_request_id": request_id,
+            })
+
+    return busy_periods
+
+
 def query_google_freebusy(
     start_time: datetime,
     end_time: datetime,
@@ -6100,6 +6193,23 @@ def query_google_freebusy(
         set_google_calendar_diagnostic("unexpected_exception")
 
     return None
+
+
+def query_calendar_and_hold_busy_periods(
+    start_time: datetime,
+    end_time: datetime,
+    exclude_booking_request_id: int | None = None,
+) -> list[dict] | None:
+    calendar_busy = query_google_freebusy(start_time, end_time)
+
+    if calendar_busy is None:
+        return None
+
+    return calendar_busy + active_payment_hold_busy_periods(
+        start_time,
+        end_time,
+        exclude_booking_request_id=exclude_booking_request_id,
+    )
 
 
 def create_google_calendar_event(
@@ -6226,7 +6336,10 @@ def find_next_available_slots(
     search_start = max(search_start or now, now)
     search_end = search_start + timedelta(days=NEXT_SLOT_SEARCH_DAYS)
 
-    busy_periods = query_google_freebusy(search_start, search_end)
+    busy_periods = query_calendar_and_hold_busy_periods(
+        search_start,
+        search_end,
+    )
 
     if busy_periods is None:
         return None
@@ -6320,7 +6433,7 @@ def find_nearby_available_slots(
     open_time, close_time = opening_window
     same_day_start = max(open_time, now) if requested_start.date() == now.date() else open_time
 
-    busy_periods = query_google_freebusy(
+    busy_periods = query_calendar_and_hold_busy_periods(
         same_day_start,
         close_time,
     )
@@ -6433,6 +6546,7 @@ def add_calendar_alternatives(
 def check_requested_calendar_slot(
     lead_data: dict,
     latest_message: str,
+    exclude_booking_request_id: int | None = None,
 ) -> dict:
     duration_minutes = parse_duration_minutes(
         lead_data.get("duration")
@@ -6499,7 +6613,11 @@ def check_requested_calendar_slot(
             start_time,
         )
 
-    busy_periods = query_google_freebusy(start_time, end_time)
+    busy_periods = query_calendar_and_hold_busy_periods(
+        start_time,
+        end_time,
+        exclude_booking_request_id=exclude_booking_request_id,
+    )
 
     if busy_periods is None:
         return {
@@ -7760,6 +7878,520 @@ def existing_confirmation_delivery_result(
     }
 
 
+def load_active_payment_request(
+    booking_request_id: int,
+) -> dict | None:
+    expire_pending_payment_holds()
+
+    response = (
+        supabase.table("payment_requests")
+        .select("*")
+        .eq("booking_request_id", booking_request_id)
+        .eq("status", "pending")
+        .gt("hold_expires_at", datetime.now(timezone.utc).isoformat())
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def create_sumup_hosted_checkout(
+    checkout_reference: str,
+    amount_pence: int,
+    description: str,
+    valid_until: str,
+) -> dict:
+    if not SUMUP_API_KEY or not SUMUP_MERCHANT_CODE:
+        raise RuntimeError("SumUp sandbox configuration is incomplete.")
+
+    payload = {
+        "checkout_reference": checkout_reference,
+        "merchant_code": SUMUP_MERCHANT_CODE,
+        "amount": round(amount_pence / 100, 2),
+        "currency": "GBP",
+        "description": description[:255],
+        "valid_until": valid_until,
+        "hosted_checkout": {"enabled": True},
+    }
+    checkout_request = urllib_request.Request(
+        SUMUP_CHECKOUT_ENDPOINT,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {SUMUP_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "veronika-chatbot/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(checkout_request, timeout=20) as response:
+            checkout = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as error:
+        error.close()
+        raise RuntimeError(
+            f"SumUp rejected checkout creation (HTTP {error.code})."
+        ) from error
+    except (TimeoutError, urllib_error.URLError) as error:
+        raise RuntimeError("SumUp checkout creation could not be reached.") from error
+
+    if not isinstance(checkout, dict):
+        raise RuntimeError("SumUp returned an invalid checkout response.")
+
+    checkout_id = checkout.get("id")
+    hosted_checkout_url = checkout.get("hosted_checkout_url")
+
+    if not checkout_id or not hosted_checkout_url:
+        raise RuntimeError("SumUp did not return a hosted checkout URL.")
+
+    return {
+        "provider_checkout_id": str(checkout_id),
+        "hosted_checkout_url": str(hosted_checkout_url),
+    }
+
+
+def deposit_instagram_text(
+    booking_request: dict,
+    items: list[dict],
+    amount_pence: int,
+    hosted_checkout_url: str,
+) -> str:
+    treatment = " + ".join(
+        str(item.get("service_name"))
+        for item in items
+        if item.get("service_name")
+    ) or "your treatment"
+    amount = f"{amount_pence / 100:.2f}"
+    requested_date = format_customer_date(booking_request.get("preferred_date"))
+    requested_time = format_customer_time(booking_request.get("preferred_time"))
+    return (
+        f"Veronika has reviewed your appointment request for {treatment} on "
+        f"{requested_date} at {requested_time}.\n\n"
+        f"To secure the slot, please pay the £{amount} deposit using this "
+        f"secure SumUp link:\n{hosted_checkout_url}\n\n"
+        f"The slot will be held for {SUMUP_HOLD_MINUTES} minutes. Your "
+        "appointment will be confirmed once the deposit has been received."
+    )
+
+
+def update_payment_delivery_status(
+    payment_request_id: str,
+    status: str,
+    error_message: str | None = None,
+    sent_at: str | None = None,
+) -> None:
+    (
+        supabase.table("payment_requests")
+        .update({
+            "message_delivery_status": status,
+            "message_delivery_error": error_message,
+            "message_sent_at": sent_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("id", payment_request_id)
+        .execute()
+    )
+
+
+def deliver_deposit_link(
+    payment_request: dict,
+    booking_request: dict,
+    conversation: dict,
+    items: list[dict],
+) -> dict:
+    payment_request_id = str(payment_request["id"])
+
+    if normalise_source(conversation.get("source")) != "instagram":
+        update_payment_delivery_status(payment_request_id, "not_applicable")
+        return {
+            "delivery_status": "not_applicable",
+            "delivery_message": (
+                "Deposit link created. Copy the payment link from the dashboard."
+            ),
+        }
+
+    try:
+        contact = load_channel_contact(conversation)
+    except Exception:
+        logger.exception(
+            "Could not load Instagram contact for deposit request %s",
+            payment_request_id,
+        )
+        contact = {}
+
+    if not contact.get("external_user_id"):
+        error_message = "Instagram contact details are unavailable."
+        update_payment_delivery_status(
+            payment_request_id,
+            "failed",
+            error_message,
+        )
+        return {
+            "delivery_status": "failed",
+            "delivery_message": error_message,
+        }
+
+    if not instagram_reply_window_is_open(contact):
+        error_message = "Instagram reply window has expired."
+        update_payment_delivery_status(
+            payment_request_id,
+            "reply_window_expired",
+            error_message,
+        )
+        return {
+            "delivery_status": "reply_window_expired",
+            "delivery_message": error_message,
+        }
+
+    logger.info(
+        "Instagram deposit delivery attempted for booking request %s",
+        booking_request.get("id"),
+    )
+    send_result = send_instagram_text_message(
+        recipient_id=str(contact["external_user_id"]),
+        text=deposit_instagram_text(
+            booking_request,
+            items,
+            int(payment_request["amount_pence"]),
+            str(payment_request["hosted_checkout_url"]),
+        ),
+    )
+
+    if send_result.get("success"):
+        sent_at = datetime.now(timezone.utc).isoformat()
+        update_payment_delivery_status(
+            payment_request_id,
+            "sent",
+            sent_at=sent_at,
+        )
+        logger.info(
+            "Instagram deposit delivery succeeded for booking request %s",
+            booking_request.get("id"),
+        )
+        return {
+            "delivery_status": "sent",
+            "delivery_message": "Deposit link sent by Instagram.",
+        }
+
+    error_message = str(
+        send_result.get("message") or "Instagram delivery failed."
+    )[:500]
+    update_payment_delivery_status(
+        payment_request_id,
+        "failed",
+        error_message,
+    )
+    logger.warning(
+        "Instagram deposit delivery failed for booking request %s",
+        booking_request.get("id"),
+    )
+    return {
+        "delivery_status": "failed",
+        "delivery_message": error_message,
+    }
+
+
+@app.post("/admin/booking-requests/{booking_request_id}/request-deposit")
+async def request_booking_deposit(
+    booking_request_id: int,
+    deposit: DepositRequest,
+    request: Request,
+):
+    logger.info(
+        "Deposit request endpoint reached: booking_request_id=%s amount_pence=%s",
+        booking_request_id,
+        deposit.amount_pence,
+    )
+
+    try:
+        require_authenticated_admin(request)
+    except HTTPException as error:
+        return confirmation_json_response(
+            False,
+            "error",
+            str(error.detail),
+            error.status_code,
+        )
+
+    try:
+        booking_request, conversation, items = load_confirmation_context(
+            booking_request_id
+        )
+    except HTTPException as error:
+        return confirmation_json_response(
+            False,
+            "error",
+            str(error.detail),
+            error.status_code,
+        )
+    except Exception:
+        logger.exception(
+            "Could not load deposit context for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "The appointment request could not be loaded. Please try again.",
+            500,
+        )
+
+    if booking_request.get("request_status") not in {
+        "draft",
+        "ready_for_review",
+        "awaiting_owner_confirmation",
+    } or booking_request.get("calendar_event_id"):
+        return confirmation_json_response(
+            False,
+            "error",
+            "This appointment request is not eligible for a deposit request.",
+            409,
+        )
+
+    missing = confirmation_missing_fields(
+        booking_request,
+        conversation,
+        items,
+    )
+
+    if not conversation.get("phone"):
+        missing.append("phone")
+
+    if missing:
+        return confirmation_json_response(
+            False,
+            "error",
+            "Cannot request a deposit until these details are present: "
+            + ", ".join(dict.fromkeys(missing)),
+            400,
+        )
+
+    total_price_pence = int(booking_request.get("total_price_pence") or 0)
+
+    if (
+        not isinstance(deposit.amount_pence, int)
+        or deposit.amount_pence < 100
+        or not total_price_pence
+        or deposit.amount_pence > total_price_pence
+    ):
+        return confirmation_json_response(
+            False,
+            "error",
+            "Deposit must be at least £1.00 and no greater than the treatment total.",
+            400,
+        )
+
+    try:
+        existing_payment = load_active_payment_request(booking_request_id)
+    except Exception:
+        logger.exception(
+            "Could not check existing deposit request for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "Existing deposit requests could not be checked. Please try again.",
+            500,
+        )
+
+    if existing_payment:
+        return confirmation_json_response(
+            True,
+            "awaiting_deposit",
+            "An active deposit link already exists.",
+            extra={
+                "deposit_amount_pence": existing_payment.get("amount_pence"),
+                "hold_expires_at": existing_payment.get("hold_expires_at"),
+                "hosted_checkout_url": existing_payment.get("hosted_checkout_url"),
+                "delivery_status": existing_payment.get("message_delivery_status"),
+                "delivery_message": existing_payment.get("message_delivery_error"),
+            },
+        )
+
+    duration_minutes = int(booking_request["total_duration_minutes"])
+    confirmation_state = {
+        "preferred_date": booking_request["preferred_date"],
+        "preferred_time": booking_request["preferred_time"],
+        "duration": f"{duration_minutes} minutes",
+    }
+    slot = build_requested_slot(confirmation_state)
+
+    if not slot:
+        return confirmation_json_response(
+            False,
+            "error",
+            "The requested appointment time is invalid.",
+            400,
+        )
+
+    start_time, end_time, _ = slot
+
+    try:
+        availability = check_requested_calendar_slot(
+            confirmation_state,
+            "",
+            exclude_booking_request_id=booking_request_id,
+        )
+    except Exception:
+        logger.exception(
+            "Could not recheck deposit availability for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "Calendar availability could not be verified. Please try again.",
+            503,
+        )
+    logger.info(
+        "Deposit slot availability recheck: booking_request_id=%s status=%s",
+        booking_request_id,
+        availability.get("status") if isinstance(availability, dict) else "invalid",
+    )
+
+    if availability.get("status") == "busy":
+        competing_holds = active_payment_hold_busy_periods(
+            start_time,
+            end_time,
+            exclude_booking_request_id=booking_request_id,
+        )
+        message = (
+            "This slot is currently being held for another customer."
+            if competing_holds
+            else "This slot is no longer available. Please choose another time."
+        )
+        return confirmation_json_response(
+            False,
+            "slot_unavailable",
+            message,
+            409,
+        )
+
+    if availability.get("status") != "free":
+        return confirmation_json_response(
+            False,
+            "error",
+            "Calendar availability could not be verified. Please try again.",
+            503,
+        )
+
+    checkout_reference = (
+        f"{BUSINESS_SLUG}-deposit-{booking_request_id}-"
+        f"{secrets.token_hex(8)}"
+    )
+    hold_expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=SUMUP_HOLD_MINUTES)
+    ).isoformat()
+    service_names = " + ".join(
+        str(item.get("service_name"))
+        for item in items
+        if item.get("service_name")
+    ) or "appointment"
+    logger.info(
+        "SumUp checkout creation started for booking request %s",
+        booking_request_id,
+    )
+
+    try:
+        checkout = create_sumup_hosted_checkout(
+            checkout_reference,
+            deposit.amount_pence,
+            f"Deposit for {service_names}",
+            hold_expires_at,
+        )
+    except Exception as error:
+        logger.warning(
+            "SumUp checkout creation failed for booking request %s: %s",
+            booking_request_id,
+            type(error).__name__,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            str(error),
+            502,
+        )
+
+    logger.info(
+        "SumUp checkout created successfully for booking request %s",
+        booking_request_id,
+    )
+    try:
+        payment_response = (
+            supabase.table("payment_requests")
+            .insert({
+                "business_slug": BUSINESS_SLUG,
+                "booking_request_id": booking_request_id,
+                "provider": "sumup",
+                "payment_type": "deposit",
+                "amount_pence": deposit.amount_pence,
+                "currency": "GBP",
+                "provider_checkout_id": checkout["provider_checkout_id"],
+                "checkout_reference": checkout_reference,
+                "hosted_checkout_url": checkout["hosted_checkout_url"],
+                "status": "pending",
+                "held_start_at": start_time.isoformat(),
+                "held_end_at": end_time.isoformat(),
+                "hold_expires_at": hold_expires_at,
+            })
+            .execute()
+        )
+        payment_request = payment_response.data[0]
+    except Exception:
+        logger.exception(
+            "Could not save payment hold for booking request %s",
+            booking_request_id,
+        )
+        return confirmation_json_response(
+            False,
+            "error",
+            "The checkout was created, but the temporary hold could not be saved. Do not send the link; please try again.",
+            500,
+        )
+
+    logger.info(
+        "Temporary hold saved for booking request %s until %s",
+        booking_request_id,
+        hold_expires_at,
+    )
+
+    try:
+        delivery = deliver_deposit_link(
+            payment_request,
+            booking_request,
+            conversation,
+            items,
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected deposit-link delivery error for booking request %s",
+            booking_request_id,
+        )
+        delivery = {
+            "delivery_status": "failed",
+            "delivery_message": "Instagram delivery could not be processed.",
+        }
+
+    message = (
+        "Deposit link created and sent."
+        if delivery["delivery_status"] == "sent"
+        else "Deposit link created, but it was not sent automatically."
+    )
+    return confirmation_json_response(
+        True,
+        "awaiting_deposit",
+        message,
+        extra={
+            "deposit_amount_pence": deposit.amount_pence,
+            "hold_expires_at": hold_expires_at,
+            "hosted_checkout_url": checkout["hosted_checkout_url"],
+            **delivery,
+        },
+    )
+
+
 @app.post("/admin/confirm-appointment")
 async def confirm_appointment(
     confirmation: ConfirmAppointmentRequest,
@@ -7966,6 +8598,7 @@ async def confirm_appointment(
             availability = check_requested_calendar_slot(
                 confirmation_state,
                 "",
+                exclude_booking_request_id=booking_request_id,
             )
         except Exception:
             logger.exception(
