@@ -3,604 +3,887 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Veronika • Wellness & Aesthetics | Leeds</title>
+    <meta name="description" content="Massage, beauty and aesthetic treatments with Veronika in Leeds city centre.">
+    <title>Veronika Wellness &amp; Aesthetics | Leeds</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Inter:wght@400;500;600&display=swap');
-        
         :root {
-            --primary: #2C3E50;
-            --accent: #27AE60;
+            --ink: #26332f;
+            --muted: #64706b;
+            --cream: #f7f4ef;
+            --paper: #fffdf9;
+            --sage: #557b6d;
+            --sage-dark: #3e6256;
+            --sage-soft: #e6eee9;
+            --blush: #eadbd3;
+            --line: #dedfd9;
+            --shadow: 0 18px 50px rgba(38, 51, 47, 0.09);
+            --radius: 22px;
         }
-        
+
         * {
-            margin: 0;
-            padding: 0;
             box-sizing: border-box;
         }
-        
+
+        html {
+            scroll-behavior: smooth;
+        }
+
         body {
-            font-family: 'Inter', system_ui, sans-serif;
+            margin: 0;
+            overflow-x: hidden;
+            background: var(--paper);
+            color: var(--ink);
+            font-family: Arial, Helvetica, sans-serif;
             line-height: 1.6;
-            color: #333;
         }
-        
-        h1, h2, h3 {
-            font-family: 'Playfair Display', Georgia, serif;
-            font-weight: 700;
+
+        button,
+        input {
+            font: inherit;
         }
-        
+
+        button,
+        a {
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        a {
+            color: inherit;
+        }
+
         .container {
-            max-width: 1200px;
+            width: min(1120px, calc(100% - 40px));
             margin: 0 auto;
-            padding: 0 20px;
         }
-        
-        header {
-            background: white;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+
+        .site-header {
             position: sticky;
             top: 0;
             z-index: 100;
+            border-bottom: 1px solid rgba(222, 223, 217, 0.8);
+            background: rgba(255, 253, 249, 0.94);
+            backdrop-filter: blur(14px);
         }
-        
-        nav {
+
+        .site-nav {
+            min-height: 72px;
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            padding: 20px 0;
+            justify-content: space-between;
+            gap: 24px;
         }
-        
-        .logo {
-            font-size: 28px;
+
+        .brand {
+            text-decoration: none;
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 1.3rem;
             font-weight: 700;
-            color: var(--primary);
+            letter-spacing: -0.02em;
         }
-        
+
         .nav-links {
             display: flex;
-            gap: 30px;
+            align-items: center;
+            gap: 24px;
         }
-        
+
         .nav-links a {
+            color: var(--muted);
+            font-size: 0.92rem;
+            font-weight: 700;
             text-decoration: none;
-            color: #555;
-            font-weight: 500;
-            transition: color 0.3s;
         }
-        
-        .nav-links a:hover {
-            color: var(--accent);
+
+        .nav-links a:hover,
+        .nav-links a:focus-visible {
+            color: var(--sage-dark);
         }
-        
-        .btn {
-            background: var(--accent);
+
+        .button {
+            min-height: 48px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 12px 22px;
+            border: 1px solid transparent;
+            border-radius: 999px;
+            background: var(--sage);
             color: white;
-            padding: 12px 28px;
-            border-radius: 50px;
+            cursor: pointer;
+            font-weight: 700;
+            text-align: center;
             text-decoration: none;
-            font-weight: 600;
-            transition: all 0.3s;
-            display: inline-block;
+            transition: background-color 160ms ease, border-color 160ms ease, transform 160ms ease;
         }
-        
-        .btn:hover {
-            background: #219653;
-            transform: translateY(-2px);
+
+        .button:hover,
+        .button:focus-visible {
+            background: var(--sage-dark);
+            transform: translateY(-1px);
         }
-        
-        .hero {
-            background: linear-gradient(rgba(44, 62, 80, 0.85), rgba(44, 62, 80, 0.85)), url('https://picsum.photos/id/1015/2000/1200');
-            background-size: cover;
-            background-position: center;
-            color: white;
-            padding: 120px 0 100px;
-            text-align: center;
+
+        .button-secondary {
+            border-color: var(--sage);
+            background: transparent;
+            color: var(--sage-dark);
         }
-        
-        .hero h1 {
-            font-size: 3.2rem;
-            margin-bottom: 20px;
-            line-height: 1.1;
+
+        .button-secondary:hover,
+        .button-secondary:focus-visible {
+            background: var(--sage-soft);
         }
-        
-        .hero p {
-            font-size: 1.25rem;
-            max-width: 600px;
-            margin: 0 auto 30px;
-            opacity: 0.95;
-        }
-        
-        .services {
-            padding: 80px 0;
-            background: #f8f9fa;
-        }
-        
-        .section-title {
-            text-align: center;
-            margin-bottom: 50px;
-        }
-        
-        .section-title h2 {
-            font-size: 2.5rem;
-            color: var(--primary);
-        }
-        
-        .category {
-            margin-bottom: 50px;
-        }
-        
-        .category h3 {
-            font-size: 1.5rem;
-            color: var(--accent);
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 3px solid #eee;
-        }
-        
-        .service-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-        }
-        
-        .service-card {
+
+        .button-light {
             background: white;
-            padding: 25px;
-            border-radius: 12px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.06);
-            transition: transform 0.3s;
+            color: var(--sage-dark);
         }
-        
-        .service-card:hover {
-            transform: translateY(-5px);
+
+        .button-light:hover,
+        .button-light:focus-visible {
+            background: var(--cream);
         }
-        
-        .service-name {
-            font-weight: 600;
-            font-size: 1.1rem;
-            margin-bottom: 8px;
+
+        .hero {
+            position: relative;
+            isolation: isolate;
+            padding: 92px 0 82px;
+            background:
+                radial-gradient(circle at 85% 25%, rgba(234, 219, 211, 0.95), transparent 32%),
+                linear-gradient(135deg, var(--cream), var(--sage-soft));
         }
-        
-        .service-details {
+
+        .hero::after {
+            content: "";
+            position: absolute;
+            z-index: -1;
+            right: -80px;
+            bottom: -100px;
+            width: 310px;
+            height: 310px;
+            border: 1px solid rgba(85, 123, 109, 0.24);
+            border-radius: 50%;
+        }
+
+        .hero-grid {
+            display: grid;
+            grid-template-columns: 1.2fr 0.8fr;
+            gap: 70px;
+            align-items: center;
+        }
+
+        .eyebrow {
+            margin: 0 0 14px;
+            color: var(--sage-dark);
+            font-size: 0.78rem;
+            font-weight: 800;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+        }
+
+        h1,
+        h2,
+        h3 {
+            margin-top: 0;
+            font-family: Georgia, "Times New Roman", serif;
+            line-height: 1.15;
+        }
+
+        h1 {
+            max-width: 760px;
+            margin-bottom: 20px;
+            font-size: clamp(2.7rem, 6vw, 5rem);
+            letter-spacing: -0.05em;
+        }
+
+        h2 {
+            margin-bottom: 14px;
+            font-size: clamp(2rem, 4vw, 3.2rem);
+            letter-spacing: -0.035em;
+        }
+
+        h3 {
+            margin-bottom: 9px;
+            font-size: 1.25rem;
+        }
+
+        .hero-copy {
+            max-width: 680px;
+            margin: 0 0 30px;
+            color: var(--muted);
+            font-size: 1.12rem;
+        }
+
+        .hero-actions,
+        .cta-actions {
             display: flex;
-            justify-content: space-between;
-            color: #666;
-            font-size: 0.95rem;
+            flex-wrap: wrap;
+            gap: 12px;
         }
-        
+
+        .hero-note {
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.8);
+            border-radius: var(--radius);
+            background: rgba(255, 253, 249, 0.72);
+            box-shadow: var(--shadow);
+        }
+
+        .hero-note strong {
+            display: block;
+            margin-bottom: 10px;
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 1.55rem;
+        }
+
+        .hero-note p {
+            margin: 0;
+            color: var(--muted);
+        }
+
+        section {
+            padding: 82px 0;
+            scroll-margin-top: 70px;
+        }
+
+        .section-heading {
+            max-width: 720px;
+            margin-bottom: 38px;
+        }
+
+        .section-heading p {
+            margin: 0;
+            color: var(--muted);
+        }
+
+        .services,
         .reviews {
-            padding: 80px 0;
+            background: var(--cream);
         }
-        
+
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 18px;
+        }
+
+        .card {
+            min-height: 190px;
+            padding: 25px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--paper);
+            box-shadow: 0 8px 30px rgba(38, 51, 47, 0.04);
+        }
+
+        .card-number {
+            width: 38px;
+            height: 38px;
+            display: grid;
+            place-items: center;
+            margin-bottom: 22px;
+            border-radius: 50%;
+            background: var(--sage-soft);
+            color: var(--sage-dark);
+            font-weight: 800;
+        }
+
+        .card p {
+            margin: 0;
+            color: var(--muted);
+            font-size: 0.94rem;
+        }
+
+        .inline-cta {
+            margin-top: 34px;
+            padding: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 20px;
+            border-radius: var(--radius);
+            background: var(--ink);
+            color: white;
+        }
+
+        .inline-cta p {
+            margin: 0;
+            color: rgba(255, 255, 255, 0.76);
+        }
+
+        .benefit-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 18px;
+        }
+
+        .benefit {
+            padding: 25px 0;
+            border-top: 2px solid var(--blush);
+        }
+
+        .benefit p {
+            margin: 0;
+            color: var(--muted);
+        }
+
         .review-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-            gap: 25px;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
         }
-        
+
         .review-card {
-            background: white;
-            padding: 30px;
-            border-radius: 16px;
-            box-shadow: 0 8px 25px rgba(0,0,0,0.08);
+            padding: 28px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--paper);
         }
-        
-        .review-stars {
-            color: #f4c430;
-            margin-bottom: 15px;
+
+        .stars {
+            margin-bottom: 16px;
+            color: #a97636;
+            letter-spacing: 0.14em;
         }
-        
-        .review-text {
-            font-style: italic;
-            margin-bottom: 20px;
-            line-height: 1.7;
+
+        .review-card blockquote {
+            margin: 0 0 20px;
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 1.08rem;
+            line-height: 1.6;
         }
-        
-        .review-author {
-            font-weight: 600;
-            color: var(--primary);
+
+        .review-card cite {
+            color: var(--muted);
+            font-style: normal;
+            font-weight: 700;
         }
-        
-        .location {
-            background: var(--primary);
+
+        .instagram {
+            background: var(--blush);
+        }
+
+        .instagram-panel {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 32px;
+        }
+
+        .instagram-panel p {
+            max-width: 650px;
+            margin: 0;
+            color: #5f554f;
+        }
+
+        .contact {
+            background: var(--ink);
             color: white;
-            padding: 80px 0;
         }
-        
-        .location-content {
+
+        .contact-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 60px;
-            align-items: center;
+            gap: 70px;
         }
-        
-        .location h2 {
-            color: white;
-            margin-bottom: 25px;
+
+        .contact-copy {
+            color: rgba(255, 255, 255, 0.72);
         }
-        
-        .contact-info p {
-            margin-bottom: 12px;
-            font-size: 1.05rem;
+
+        .contact-details {
+            display: grid;
+            gap: 16px;
         }
-        
-        footer {
-            background: #1a252f;
-            color: #aaa;
-            padding: 40px 0;
-            text-align: center;
-            font-size: 0.9rem;
+
+        .contact-item {
+            padding: 20px 0;
+            border-top: 1px solid rgba(255, 255, 255, 0.18);
         }
-        
-        @media (max-width: 768px) {
-            .hero h1 {
-                font-size: 2.4rem;
-            }
-            
-            .location-content {
-                grid-template-columns: 1fr;
-            }
+
+        .contact-item strong {
+            display: block;
+            margin-bottom: 4px;
         }
-        
-        /* Chat Widget */
-        #chat-widget {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            z-index: 1000;
+
+        .contact-item p,
+        .contact-item address {
+            margin: 0;
+            color: rgba(255, 255, 255, 0.74);
+            font-style: normal;
         }
-        
-        #chat-button {
-            background: #27AE60;
-            color: white;
-            padding: 15px 25px;
-            border-radius: 50px;
-            cursor: pointer;
-            font-weight: 600;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-            display: flex;
-            align-items: center;
-            gap: 8px;
+
+        .site-footer {
+            padding: 35px 0 100px;
+            background: #1e2926;
+            color: rgba(255, 255, 255, 0.64);
+            font-size: 0.86rem;
         }
-        
-        #chat-window {
-            position: absolute;
-            bottom: 70px;
-            right: 0;
-            width: 350px;
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            overflow: hidden;
-        }
-        
-        #chat-header {
-            background: #2C3E50;
-            color: white;
-            padding: 15px 20px;
+
+        .footer-inner {
             display: flex;
             justify-content: space-between;
+            gap: 30px;
+        }
+
+        .footer-inner p {
+            max-width: 720px;
+            margin: 0;
+        }
+
+        /* Existing chatbot widget, restyled for the new public page. */
+        #chat-widget {
+            position: fixed;
+            right: 20px;
+            bottom: 20px;
+            z-index: 1000;
+        }
+
+        #chat-button {
+            min-height: 54px;
+            display: flex;
             align-items: center;
-            font-weight: 600;
+            justify-content: center;
+            padding: 14px 22px;
+            border: 0;
+            border-radius: 999px;
+            background: var(--sage);
+            box-shadow: 0 10px 28px rgba(38, 51, 47, 0.24);
+            color: white;
+            cursor: pointer;
+            font-weight: 800;
         }
-        
+
+        #chat-window {
+            position: absolute;
+            right: 0;
+            bottom: 68px;
+            width: min(380px, calc(100vw - 32px));
+            overflow: hidden;
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            background: white;
+            box-shadow: 0 22px 65px rgba(25, 36, 32, 0.26);
+        }
+
+        #chat-header {
+            min-height: 58px;
+            padding: 14px 18px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--ink);
+            color: white;
+            font-weight: 800;
+        }
+
+        .chat-close {
+            width: 38px;
+            height: 38px;
+            border: 0;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.12);
+            color: white;
+            cursor: pointer;
+            font-size: 1.15rem;
+        }
+
         #chat-messages {
-            height: 300px;
-            padding: 15px;
+            height: min(360px, 48vh);
+            padding: 16px;
             overflow-y: auto;
-            background: #f8f9fa;
+            background: var(--cream);
         }
-        
+
         .message {
+            max-width: 84%;
             margin-bottom: 12px;
             padding: 10px 14px;
-            border-radius: 18px;
-            max-width: 80%;
+            border-radius: 17px;
             white-space: pre-wrap;
             overflow-wrap: anywhere;
         }
-        
+
         .user-message {
-            background: #27AE60;
-            color: white;
             margin-left: auto;
             border-bottom-right-radius: 5px;
+            background: var(--sage);
+            color: white;
         }
-        
+
         .bot-message {
-            background: #e9ecef;
-            color: #333;
             margin-right: auto;
             border-bottom-left-radius: 5px;
+            background: white;
+            color: var(--ink);
         }
-        
+
+        .chat-privacy {
+            padding: 9px 14px;
+            border-top: 1px solid var(--line);
+            background: white;
+            color: var(--muted);
+            font-size: 0.7rem;
+            line-height: 1.4;
+        }
+
         #chat-input-area {
             display: flex;
+            gap: 8px;
             padding: 12px;
+            border-top: 1px solid var(--line);
             background: white;
-            border-top: 1px solid #eee;
         }
-        
+
         #chat-input {
+            min-width: 0;
+            min-height: 44px;
             flex: 1;
-            padding: 10px 15px;
-            border: 1px solid #ddd;
-            border-radius: 25px;
+            padding: 10px 14px;
+            border: 1px solid var(--line);
+            border-radius: 999px;
             outline: none;
+            font-size: 16px;
         }
-        
+
+        #chat-input:focus {
+            border-color: var(--sage);
+            box-shadow: 0 0 0 3px var(--sage-soft);
+        }
+
         #chat-input-area button {
-            background: #27AE60;
+            min-width: 68px;
+            min-height: 44px;
+            border: 0;
+            border-radius: 999px;
+            background: var(--sage);
             color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 25px;
-            margin-left: 8px;
             cursor: pointer;
+            font-weight: 800;
+        }
+
+        @media (max-width: 900px) {
+            .nav-links {
+                display: none;
+            }
+
+            .hero-grid,
+            .contact-grid {
+                grid-template-columns: 1fr;
+                gap: 34px;
+            }
+
+            .hero-note {
+                max-width: 580px;
+            }
+
+            .card-grid,
+            .benefit-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .review-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 620px) {
+            .container {
+                width: min(100% - 28px, 1120px);
+            }
+
+            .site-nav {
+                min-height: 64px;
+            }
+
+            .site-nav > .button {
+                display: none;
+            }
+
+            .brand {
+                font-size: 1.08rem;
+            }
+
+            .hero {
+                padding: 60px 0 56px;
+            }
+
+            .hero-actions,
+            .cta-actions {
+                flex-direction: column;
+            }
+
+            .hero-actions .button,
+            .cta-actions .button {
+                width: 100%;
+            }
+
+            section {
+                padding: 60px 0;
+            }
+
+            .card-grid,
+            .benefit-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .card {
+                min-height: auto;
+            }
+
+            .inline-cta,
+            .instagram-panel,
+            .footer-inner {
+                align-items: stretch;
+                flex-direction: column;
+            }
+
+            #chat-widget {
+                right: 12px;
+                bottom: max(12px, env(safe-area-inset-bottom));
+            }
+
+            #chat-button {
+                min-height: 50px;
+                padding: 12px 17px;
+                font-size: 0.88rem;
+            }
+
+            #chat-window {
+                position: fixed;
+                right: 8px;
+                bottom: max(72px, calc(env(safe-area-inset-bottom) + 66px));
+                left: 8px;
+                width: auto;
+                max-height: calc(100dvh - 88px);
+            }
+
+            #chat-messages {
+                height: min(390px, calc(100dvh - 270px));
+                min-height: 180px;
+            }
         }
     </style>
 </head>
 <body>
-    <!-- Header -->
-    <header>
+    <header class="site-header">
         <div class="container">
-            <nav>
-                <div class="logo">Veronika</div>
+            <nav class="site-nav" aria-label="Main navigation">
+                <a class="brand" href="#top">Veronika Wellness &amp; Aesthetics</a>
                 <div class="nav-links">
-                    <a href="#services">Services</a>
+                    <a href="#treatments">Treatments</a>
                     <a href="#reviews">Reviews</a>
-                    <a href="#location">Location</a>
+                    <a href="#contact">Contact</a>
                 </div>
-                <a href="#location" class="btn">Book Now</a>
+                <button class="button" type="button" onclick="toggleChat()">Ask the Assistant</button>
             </nav>
         </div>
     </header>
 
-    <!-- Hero -->
-    <section class="hero">
-        <div class="container">
-            <h1>Expert Wellness &<br>Aesthetics in Leeds</h1>
-            <p>Professional treatments with a personal touch.<br>Over 380 five-star reviews.</p>
-            <a href="#location" class="btn" style="font-size: 1.1rem; padding: 16px 36px;">Book Your Appointment</a>
-        </div>
-    </section>
-
-    <!-- Services -->
-    <section id="services" class="services">
-        <div class="container">
-            <div class="section-title">
-                <h2>Our Treatments</h2>
-                <p style="max-width: 600px; margin: 15px auto 0; color: #666;">Professional care with visible results</p>
-            </div>
-
-            <!-- Body Treatments -->
-            <div class="category">
-                <h3>Body Treatments</h3>
-                <div class="service-grid">
-                    <div class="service-card">
-                        <div class="service-name">Body Sculpting Treatment</div>
-                        <div class="service-details">
-                            <span>45 minutes</span>
-                            <span><strong>£45</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Ultrasound Therapy</div>
-                        <div class="service-details">
-                            <span>1 hour 15 min</span>
-                            <span><strong>£50</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Electronic Muscle Stimulation (EMS)</div>
-                        <div class="service-details">
-                            <span>1 hour</span>
-                            <span><strong>£200</strong></span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Face Treatments -->
-            <div class="category">
-                <h3>Face Treatments</h3>
-                <div class="service-grid">
-                    <div class="service-card">
-                        <div class="service-name">Microneedling (1 Area)</div>
-                        <div class="service-details">
-                            <span>1 hour 15 min</span>
-                            <span><strong>from £60</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Deep Facial Cleanse</div>
-                        <div class="service-details">
-                            <span>1 hour</span>
-                            <span><strong>£60</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Radio Frequency Facial</div>
-                        <div class="service-details">
-                            <span>1 hour</span>
-                            <span><strong>£60</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Hyaluronic Acid Lip Filler</div>
-                        <div class="service-details">
-                            <span>1 hour 15 min</span>
-                            <span><strong>£90</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Hydrafacial (60 min)</div>
-                        <div class="service-details">
-                            <span>1 hour</span>
-                            <span><strong>£60</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Hydrafacial (90 min)</div>
-                        <div class="service-details">
-                            <span>1 hour 30 min</span>
-                            <span><strong>£80</strong></span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Massage Treatments -->
-            <div class="category">
-                <h3>Massage Treatments</h3>
-                <div class="service-grid">
-                    <div class="service-card">
-                        <div class="service-name">Relaxing Massage</div>
-                        <div class="service-details">
-                            <span>30 / 60 / 90 / 120 min</span>
-                            <span><strong>£35 – £95</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Swedish Massage</div>
-                        <div class="service-details">
-                            <span>30 / 60 / 90 / 120 min</span>
-                            <span><strong>£35 – £95</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Deep Tissue Massage</div>
-                        <div class="service-details">
-                            <span>30 / 60 / 90 / 120 min</span>
-                            <span><strong>£40 – £95</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Hot Stone Massage</div>
-                        <div class="service-details">
-                            <span>60 / 90 / 120 min</span>
-                            <span><strong>£55 – £95</strong></span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Medical Aesthetics -->
-            <div class="category">
-                <h3>Medical Aesthetics</h3>
-                <div class="service-grid">
-                    <div class="service-card">
-                        <div class="service-name">Dermal Filler</div>
-                        <div class="service-details">
-                            <span>1 – 1.5 hours</span>
-                            <span><strong>£100</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">Fat-Dissolving Injections</div>
-                        <div class="service-details">
-                            <span>45 min – 1 hr 45 min</span>
-                            <span><strong>from £60</strong></span>
-                        </div>
-                    </div>
-                    <div class="service-card">
-                        <div class="service-name">B12 / Vitamin C Shots</div>
-                        <div class="service-details">
-                            <span>15 minutes</span>
-                            <span><strong>£20 each</strong></span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Reviews -->
-    <section id="reviews" class="reviews">
-        <div class="container">
-            <div class="section-title">
-                <h2>Real Results. Real People.</h2>
-                <p style="max-width: 500px; margin: 15px auto 0;">Over 380 five-star reviews from happy clients</p>
-            </div>
-
-            <div class="review-grid">
-                <div class="review-card">
-                    <div class="review-stars">★★★★★</div>
-                    <div class="review-text">"Veronika is absolutely incredible! Such a great masseuse. A relaxing space too!"</div>
-                    <div class="review-author">— Sarah T.</div>
-                </div>
-                <div class="review-card">
-                    <div class="review-stars">★★★★★</div>
-                    <div class="review-text">"I love my results! Thank you Veronika, you're the best. My skin has never looked better!"</div>
-                    <div class="review-author">— Emma R.</div>
-                </div>
-                <div class="review-card">
-                    <div class="review-stars">★★★★★</div>
-                    <div class="review-text">"Always the best service by Veronika. She makes you super comfortable and the results are amazing."</div>
-                    <div class="review-author">— James K.</div>
-                </div>
-            </div>
-            
-            <p style="text-align: center; margin-top: 40px; color: #666;">
-                <strong>382 five-star reviews</strong> • 4.98/5 average rating
-            </p>
-        </div>
-    </section>
-
-    <!-- Location -->
-    <section id="location" class="location">
-        <div class="container">
-            <div class="location-content">
+    <main id="top">
+        <section class="hero">
+            <div class="container hero-grid">
                 <div>
+                    <p class="eyebrow">Veronika Wellness &amp; Aesthetics</p>
+                    <h1>Massage, Beauty &amp; Aesthetic Treatments in Leeds</h1>
+                    <p class="hero-copy">Professional treatments with a personal, welcoming approach in Leeds city centre. Explore the options, ask questions and request an appointment through Veronika's assistant.</p>
+                    <div class="hero-actions">
+                        <button class="button" type="button" onclick="toggleChat()">Chat with Veronika's Assistant</button>
+                        <a class="button button-secondary" href="#treatments">View Treatments</a>
+                        <a class="button button-secondary" href="INSERT_VERONIKA_INSTAGRAM_PROFILE_URL_HERE" target="_blank" rel="noopener noreferrer">Follow on Instagram</a>
+                    </div>
+                </div>
+                <aside class="hero-note" aria-label="Appointment enquiry information">
+                    <p class="eyebrow">Here to help</p>
+                    <strong>Find the right treatment at your own pace.</strong>
+                    <p>Ask the assistant about treatments, prices, durations and appointment availability whenever you are ready.</p>
+                </aside>
+            </div>
+        </section>
+
+        <section id="treatments" class="services">
+            <div class="container">
+                <div class="section-heading">
+                    <p class="eyebrow">Treatments</p>
+                    <h2>Care tailored to what you need</h2>
+                    <p>Browse the main treatment categories, then ask the assistant for current prices, durations and availability.</p>
+                </div>
+                <div class="card-grid">
+                    <article class="card">
+                        <div class="card-number">01</div>
+                        <h3>Massage</h3>
+                        <p>Relaxing, Swedish, Hot Stone and Deep Tissue massage.</p>
+                    </article>
+                    <article class="card">
+                        <div class="card-number">02</div>
+                        <h3>Facials</h3>
+                        <p>Deep Cleanse, Radio Frequency, Hydraface and Hydrafacial treatments.</p>
+                    </article>
+                    <article class="card">
+                        <div class="card-number">03</div>
+                        <h3>Dermal Fillers</h3>
+                        <p>Lip filler, marionette lines, nasolabial folds and other areas.</p>
+                    </article>
+                    <article class="card">
+                        <div class="card-number">04</div>
+                        <h3>Microneedling</h3>
+                        <p>Targeted microneedling options for different treatment areas.</p>
+                    </article>
+                    <article class="card">
+                        <div class="card-number">05</div>
+                        <h3>Ultrasound</h3>
+                        <p>Ultrasound therapy options selected around your treatment goals.</p>
+                    </article>
+                    <article class="card">
+                        <div class="card-number">06</div>
+                        <h3>Body Treatments</h3>
+                        <p>Body sculpting, EMS and other focused body treatments.</p>
+                    </article>
+                    <article class="card">
+                        <div class="card-number">07</div>
+                        <h3>Vitamin Shots</h3>
+                        <p>B12 and Vitamin C shots with simple appointment enquiries.</p>
+                    </article>
+                    <article class="card">
+                        <div class="card-number">08</div>
+                        <h3>Fat-Dissolving Injections</h3>
+                        <p>Options for different treatment areas and amounts.</p>
+                    </article>
+                </div>
+                <div class="inline-cta">
+                    <div>
+                        <h3>Not sure which treatment is right for you?</h3>
+                        <p>Ask the assistant for clear treatment information, prices and availability.</p>
+                    </div>
+                    <button class="button button-light" type="button" onclick="toggleChat()">Ask the Assistant</button>
+                </div>
+            </div>
+        </section>
+
+        <section aria-labelledby="why-heading">
+            <div class="container">
+                <div class="section-heading">
+                    <p class="eyebrow">Why Veronika</p>
+                    <h2 id="why-heading">A straightforward, personal experience</h2>
+                </div>
+                <div class="benefit-grid">
+                    <article class="benefit">
+                        <h3>Personalised treatments</h3>
+                        <p>Explore options that fit your preferences and treatment goals.</p>
+                    </article>
+                    <article class="benefit">
+                        <h3>Professional and welcoming</h3>
+                        <p>A comfortable approach focused on genuine care and clear information.</p>
+                    </article>
+                    <article class="benefit">
+                        <h3>Leeds city-centre location</h3>
+                        <p>Conveniently located at 25 Albion Place in central Leeds.</p>
+                    </article>
+                    <article class="benefit">
+                        <h3>Easy appointment enquiries</h3>
+                        <p>Ask questions and request an appointment through the assistant.</p>
+                    </article>
+                </div>
+            </div>
+        </section>
+
+        <section id="reviews" class="reviews">
+            <div class="container">
+                <div class="section-heading">
+                    <p class="eyebrow">Client reviews</p>
+                    <h2>Kind words from Veronika's clients</h2>
+                </div>
+                <div class="review-grid">
+                    <article class="review-card">
+                        <div class="stars" aria-label="Five stars">★★★★★</div>
+                        <blockquote>"Veronika is absolutely incredible! Such a great masseuse. A relaxing space too!"</blockquote>
+                        <cite>Sarah T.</cite>
+                    </article>
+                    <article class="review-card">
+                        <div class="stars" aria-label="Five stars">★★★★★</div>
+                        <blockquote>"I love my results! Thank you Veronika, you're the best. My skin has never looked better!"</blockquote>
+                        <cite>Emma R.</cite>
+                    </article>
+                    <article class="review-card">
+                        <div class="stars" aria-label="Five stars">★★★★★</div>
+                        <blockquote>"Always the best service by Veronika. She makes you super comfortable and the results are amazing."</blockquote>
+                        <cite>James K.</cite>
+                    </article>
+                </div>
+            </div>
+        </section>
+
+        <section class="instagram" aria-labelledby="instagram-heading">
+            <div class="container instagram-panel">
+                <div>
+                    <p class="eyebrow">Instagram</p>
+                    <h2 id="instagram-heading">Follow Veronika on Instagram</h2>
+                    <p>See treatment updates and keep up with Veronika Wellness &amp; Aesthetics.</p>
+                </div>
+                <!-- Replace this placeholder with Veronika's real Instagram profile URL. -->
+                <a class="button" href="INSERT_VERONIKA_INSTAGRAM_PROFILE_URL_HERE" target="_blank" rel="noopener noreferrer">Visit Instagram</a>
+            </div>
+        </section>
+
+        <section id="contact" class="contact">
+            <div class="container contact-grid">
+                <div>
+                    <p class="eyebrow">Location &amp; contact</p>
                     <h2>Visit Veronika in Leeds</h2>
-                    <div class="contact-info">
-                        <p><strong>📍</strong> 25 Albion Place, Leeds, LS1 6JS</p>
-                        <p><strong>🕐</strong> Mon–Fri: 9am – 8pm<br>Saturday: 10am – 6pm</p>
-                        <p><strong>🚗</strong> Free parking available</p>
-                        <p><strong>📞</strong> 07943319617</p>
+                    <p class="contact-copy">Find treatment information and request an appointment through the assistant, or contact Veronika using the details provided.</p>
+                    <div class="cta-actions">
+                        <button class="button button-light" type="button" onclick="toggleChat()">Open the Assistant</button>
+                        <a class="button button-secondary" href="tel:07943319617">Call 07943 319617</a>
                     </div>
-                    
-                    <a href="#" class="btn" style="margin-top: 25px; background: white; color: #2C3E50;">Book Your Appointment</a>
                 </div>
-                
-                <div>
-                    <p style="font-size: 1.1rem; opacity: 0.9;">
-                        "Veronika has magic hands. The perfect pressure, and I left feeling light as a feather!"<br><br>
-                        <strong>— Over 380 happy clients</strong>
-                    </p>
+                <div class="contact-details">
+                    <div class="contact-item">
+                        <strong>Address</strong>
+                        <address>25 Albion Place, Leeds, LS1 6JS</address>
+                    </div>
+                    <div class="contact-item">
+                        <strong>Opening hours</strong>
+                        <p>Monday-Friday: 9am-8pm<br>Saturday: 10am-6pm</p>
+                    </div>
+                    <div class="contact-item">
+                        <strong>Phone</strong>
+                        <p><a href="tel:07943319617">07943 319617</a></p>
+                    </div>
+                    <div class="contact-item">
+                        <strong>Instagram</strong>
+                        <!-- Replace this placeholder with Veronika's real Instagram profile URL. -->
+                        <p><a href="INSERT_VERONIKA_INSTAGRAM_PROFILE_URL_HERE" target="_blank" rel="noopener noreferrer">Open Instagram profile</a></p>
+                    </div>
                 </div>
             </div>
-        </div>
-    </section>
+        </section>
+    </main>
 
-    <footer>
-        <div class="container">
-            <p>© 2026 Veronika Wellness & Aesthetics • Leeds</p>
-            <p style="margin-top: 8px; font-size: 0.85rem;">Professional treatments • Real results • Genuine care</p>
+    <footer class="site-footer">
+        <div class="container footer-inner">
+            <p>Chat messages and contact details may be stored so Veronika can respond to your enquiry. Do not share sensitive medical information in the chat.</p>
+            <p>Website and AI assistant built by Ilko</p>
         </div>
     </footer>
 
-    <!-- Chat Widget -->
+    <!-- Existing chatbot widget behavior is preserved below. -->
     <div id="chat-widget">
-        <div id="chat-button" onclick="toggleChat()">
-            💬 Chat with Veronika
-        </div>
-        
-        <div id="chat-window" style="display: none;">
+        <button id="chat-button" type="button" onclick="toggleChat()" aria-label="Open Veronika's assistant">Chat with Veronika</button>
+
+        <div id="chat-window" style="display: none;" aria-label="Veronika's assistant chat">
             <div id="chat-header">
                 <span>Veronika's Assistant</span>
-                <span onclick="toggleChat()" style="cursor: pointer;">✕</span>
+                <button class="chat-close" type="button" onclick="toggleChat()" aria-label="Close chat">×</button>
             </div>
-            
-            <div id="chat-messages"></div>
 
-<div style="padding: 10px 14px; font-size: 12px; color: #666; background: #fff; border-top: 1px solid #eee;">
-    By using this chat, you agree that your messages and contact details may be stored so Veronika can respond to your enquiry.
-</div>
-            
+            <div id="chat-messages" aria-live="polite"></div>
+
+            <div class="chat-privacy">
+                By using this chat, you agree that your messages and contact details may be stored so Veronika can respond to your enquiry.
+            </div>
+
             <div id="chat-input-area">
-                <input type="text" id="chat-input" placeholder="Type your message..." onkeypress="if (event.key === 'Enter') sendMessage()">
-                <button onclick="sendMessage()">Send</button>
+                <input type="text" id="chat-input" placeholder="Type your message..." aria-label="Chat message" onkeypress="if (event.key === 'Enter') sendMessage()">
+                <button type="button" onclick="sendMessage()">Send</button>
             </div>
         </div>
     </div>
@@ -613,27 +896,25 @@
             const chatWindow = document.getElementById('chat-window');
             chatWindow.style.display = chatWindow.style.display === 'none' ? 'block' : 'none';
         }
-        
+
         function sendMessage() {
             const input = document.getElementById('chat-input');
             const messages = document.getElementById('chat-messages');
-            
+
             if (!input.value.trim()) return;
-if (!sessionId) {
-    sessionId = window.crypto?.randomUUID
-        ? crypto.randomUUID()
-        : `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-            
+            if (!sessionId) {
+                sessionId = window.crypto?.randomUUID
+                    ? crypto.randomUUID()
+                    : `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            }
+
             const userInput = input.value;
 
-            // Add user message to the screen
             const userMsg = document.createElement('div');
             userMsg.className = 'message user-message';
             userMsg.textContent = userInput;
             messages.appendChild(userMsg);
 
-            // Save customer message to short-term chat memory
             chatHistory.push({
                 role: "customer",
                 content: userInput
@@ -642,37 +923,34 @@ if (!sessionId) {
             input.value = '';
             messages.scrollTop = messages.scrollHeight;
 
-// Show typing message while waiting for the AI reply
-const typingMsg = document.createElement("div");
-typingMsg.className = "message bot-message";
-typingMsg.textContent = "Veronika's assistant is typing...";
-messages.appendChild(typingMsg);
-messages.scrollTop = messages.scrollHeight;
+            const typingMsg = document.createElement("div");
+            typingMsg.className = "message bot-message";
+            typingMsg.textContent = "Veronika's assistant is typing...";
+            messages.appendChild(typingMsg);
+            messages.scrollTop = messages.scrollHeight;
 
-// Convert escaped line-break text returned by the backend into real line breaks
-function cleanBotReply(reply) {
-    return String(reply ?? "")
-        .replace(/\\n/g, "\n")
-        .replace(/^\s{0,3}#{1,6}\s+/gm, "")
-        .replace(/^\s*[-*+]\s+/gm, "")
-        .replace(/\*\*(.+?)\*\*/g, "$1")
-        .replace(/__(.+?)__/g, "$1")
-        .replace(/`([^`\n]+)`/g, "$1")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-}
+            function cleanBotReply(reply) {
+                return String(reply ?? "")
+                    .replace(/\\n/g, "\n")
+                    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+                    .replace(/^\s*[-*+]\s+/gm, "")
+                    .replace(/\*\*(.+?)\*\*/g, "$1")
+                    .replace(/__(.+?)__/g, "$1")
+                    .replace(/`([^`\n]+)`/g, "$1")
+                    .replace(/\n{3,}/g, "\n\n")
+                    .trim();
+            }
 
-// Send latest message + conversation history to backend
-fetch("https://veronika-chatbot-api.onrender.com/chat", {
+            fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
                 },
                 body: JSON.stringify({
-    session_id: sessionId,
-    message: userInput,
-    history: chatHistory
-})
+                    session_id: sessionId,
+                    message: userInput,
+                    history: chatHistory
+                })
             })
             .then(response => {
                 if (!response.ok) {
@@ -681,7 +959,6 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 return response.json();
             })
             .then(data => {
-                // Remove the temporary typing message before showing the real reply
                 typingMsg.remove();
 
                 const cleanedReply = cleanBotReply(data.reply);
@@ -691,19 +968,15 @@ fetch("https://veronika-chatbot-api.onrender.com/chat", {
                 botMsg.textContent = cleanedReply || "Sorry, I couldn't generate a reply. Please try again.";
                 messages.appendChild(botMsg);
 
-                // Save cleaned assistant reply to short-term chat memory
                 chatHistory.push({
                     role: "assistant",
                     content: cleanedReply
                 });
 
-                // Keep only the latest 12 messages so it does not get too long
                 chatHistory = chatHistory.slice(-12);
-
                 messages.scrollTop = messages.scrollHeight;
             })
             .catch(() => {
-                // Remove the temporary typing message if the request fails
                 typingMsg.remove();
 
                 const errorMsg = document.createElement('div');
