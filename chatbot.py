@@ -653,6 +653,228 @@ def parse_time_from_text(message: str) -> str | None:
     return None
 
 
+SCHEDULE_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sauturday": 5,
+    "satarday": 5,
+    "saterday": 5,
+    "sunday": 6,
+}
+
+SCHEDULE_MONTH_NAMES = (
+    "january|february|march|april|may|june|july|august|"
+    "september|october|november|december"
+)
+
+
+def weekday_number_from_text(message: str) -> int | None:
+    cleaned = str(message or "").lower()
+
+    for name, number in SCHEDULE_WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", cleaned):
+            return number
+
+    return None
+
+
+def has_explicit_calendar_date_signal(message: str) -> bool:
+    cleaned = str(message or "").lower()
+    return bool(
+        re.search(r"\b20\d{2}-\d{2}-\d{2}\b", cleaned)
+        or re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]20\d{2})?\b", cleaned)
+        or re.search(
+            rf"\b(?:\d{{1,2}}(?:st|nd|rd|th)?(?:\s+of)?\s+"
+            rf"(?:{SCHEDULE_MONTH_NAMES})|(?:{SCHEDULE_MONTH_NAMES})\s+"
+            r"\d{1,2}(?:st|nd|rd|th)?)\b",
+            cleaned,
+        )
+    )
+
+
+def parse_validated_date_from_text(
+    message: str,
+    reference_date: str | None = None,
+) -> str | None:
+    parsed = parse_relative_date_from_text(
+        message,
+        reference_date=reference_date,
+    )
+
+    if not parsed:
+        return None
+
+    named_weekday = weekday_number_from_text(message)
+
+    if named_weekday is None or not has_explicit_calendar_date_signal(message):
+        return parsed
+
+    try:
+        parsed_date = datetime.fromisoformat(parsed).date()
+    except ValueError:
+        return None
+
+    return parsed if parsed_date.weekday() == named_weekday else None
+
+
+def bare_hour_from_schedule_reply(message: str) -> int | None:
+    cleaned = str(message or "").strip().lower()
+    cleaned = re.sub(
+        r"\b(?:next\s+week\s+|next\s+)?(?:"
+        + "|".join(SCHEDULE_WEEKDAYS)
+        + r")\b",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"[\s?!.]+", " ", cleaned).strip()
+    match = re.fullmatch(r"(?:at\s+)?(1[0-2]|0?[1-9])", cleaned)
+    return int(match.group(1)) if match else None
+
+
+def format_bare_hour_for_business(hour: int) -> str:
+    if 1 <= hour <= 7:
+        hour += 12
+
+    return f"{hour:02d}:00"
+
+
+def format_ordinal_day(day: int) -> str:
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+    return f"{day}{suffix}"
+
+
+def resolve_schedule_input(
+    latest_message: str,
+    existing_state: dict,
+) -> dict:
+    """Resolve date/time input using the detail Python most recently asked."""
+    pending = existing_state.get("next_required_detail")
+    date_source = str(latest_message or "")
+    time_source = str(latest_message or "")
+    bare_hour = bare_hour_from_schedule_reply(latest_message)
+    named_weekday = weekday_number_from_text(latest_message)
+    explicit_time_signal = bool(re.search(
+        r"\b(?:at|around)\b|\b(?:am|pm)\b|\d[:.]\d",
+        str(latest_message or "").lower(),
+    ))
+    parsed_time = parse_time_from_text(time_source)
+    parsed_date = parse_validated_date_from_text(
+        date_source,
+        reference_date=existing_state.get("preferred_date"),
+    )
+    clarification = None
+
+    if (
+        named_weekday is not None
+        and has_explicit_calendar_date_signal(date_source)
+        and parsed_date is None
+    ):
+        clarification = (
+            "That weekday and calendar date do not match. "
+            "Which date did you mean?"
+        )
+        parsed_time = None
+
+    if pending == "preferred_time" and clarification is None:
+        if parsed_time is None and bare_hour is not None:
+            parsed_time = format_bare_hour_for_business(bare_hour)
+
+        if (
+            named_weekday is not None
+            and bare_hour is not None
+            and existing_state.get("preferred_date") not in [None, ""]
+            and not explicit_time_signal
+        ):
+            try:
+                existing_date = datetime.fromisoformat(
+                    str(existing_state.get("preferred_date"))
+                ).date()
+            except ValueError:
+                existing_date = None
+
+            if existing_date and existing_date.weekday() == named_weekday:
+                parsed_date = None
+
+    elif pending == "preferred_date" and clarification is None:
+        if bare_hour is not None and named_weekday is not None and not explicit_time_signal:
+            clarification = (
+                f"Do you mean {format_customer_weekday(named_weekday)} at "
+                f"{format_bare_hour_for_business(bare_hour)}, or "
+                f"{format_customer_weekday(named_weekday)} the "
+                f"{format_ordinal_day(bare_hour)}?"
+            )
+            parsed_date = None
+            parsed_time = None
+        elif (
+            bare_hour is not None
+            and named_weekday is None
+            and not explicit_time_signal
+        ):
+            clarification = (
+                f"Do you mean {format_bare_hour_for_business(bare_hour)}, "
+                f"or the {format_ordinal_day(bare_hour)}?"
+            )
+            parsed_date = None
+            parsed_time = None
+
+    elif (
+        clarification is None
+        and bare_hour is not None
+        and named_weekday is not None
+        and not explicit_time_signal
+    ):
+        if existing_state.get("preferred_date") not in [None, ""]:
+            parsed_date = None
+            parsed_time = format_bare_hour_for_business(bare_hour)
+        else:
+            clarification = (
+                f"Do you mean {format_customer_weekday(named_weekday)} at "
+                f"{format_bare_hour_for_business(bare_hour)}, or "
+                f"{format_customer_weekday(named_weekday)} the "
+                f"{format_ordinal_day(bare_hour)}?"
+            )
+            parsed_date = None
+            parsed_time = None
+
+    return {
+        "preferred_date": parsed_date,
+        "preferred_time": parsed_time,
+        "clarification": clarification,
+        "schedule_input_detected": bool(
+            parsed_date
+            or parsed_time
+            or clarification
+            or (
+                pending in {"preferred_date", "preferred_time"}
+                and (
+                    named_weekday is not None
+                    or has_explicit_calendar_date_signal(latest_message)
+                )
+            )
+        ),
+    }
+
+
+def format_customer_weekday(weekday_number: int) -> str:
+    return [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ][weekday_number]
+
+
 def parse_phone_from_text(message: str) -> str | None:
     digit_groups = re.findall(r"\+?\d[\d\s()-]{6,}\d", message)
 
@@ -721,8 +943,20 @@ def recover_schedule_from_customer_history(
     recovered_time = None
 
     for message in reversed(customer_messages):
+        ambiguous_weekday_number = (
+            weekday_number_from_text(message) is not None
+            and bare_hour_from_schedule_reply(message) is not None
+            and not re.search(
+                r"\b(?:at|around)\b|\b(?:am|pm)\b|\d[:.]\d",
+                str(message or "").lower(),
+            )
+        )
+
+        if ambiguous_weekday_number:
+            continue
+
         if recovered_date is None:
-            recovered_date = parse_relative_date_from_text(
+            recovered_date = parse_validated_date_from_text(
                 message
             )
 
@@ -8543,17 +8777,19 @@ def apply_validated_state_patch(
 
     patch = extractor_result.get("state_patch") or {}
 
-    # Deterministic parsers are a backup and validator for the extractor.
-    date_expression = (
-        patch.get("preferred_date_expression")
-        or latest_message
+    # Date and time are calendar-critical fields. Resolve them deterministically
+    # using the workflow detail Python most recently requested.
+    schedule_resolution = resolve_schedule_input(
+        latest_message,
+        result,
     )
-    parsed_date = parse_relative_date_from_text(
-        str(date_expression),
-        reference_date=result.get("preferred_date"),
+    parsed_date = schedule_resolution.get("preferred_date")
+    parsed_time = schedule_resolution.get("preferred_time")
+    extractor_result["schedule_clarification"] = schedule_resolution.get(
+        "clarification"
     )
-    parsed_time = parse_time_from_text(
-        str(patch.get("preferred_time") or latest_message)
+    extractor_result["schedule_input_detected"] = schedule_resolution.get(
+        "schedule_input_detected"
     )
     parsed_phone = parse_phone_from_text(
         str(patch.get("phone") or latest_message)
@@ -8640,11 +8876,12 @@ def apply_validated_state_patch(
 
     # Recover previously supplied customer schedule details after a later
     # variant choice. Assistant suggestions are never used as saved facts.
-    result = recover_schedule_from_customer_history(
-        result,
-        compact_recent_history(history),
-        latest_message,
-    )
+    if not extractor_result.get("schedule_clarification"):
+        result = recover_schedule_from_customer_history(
+            result,
+            compact_recent_history(history),
+            latest_message,
+        )
     result = recover_duration_from_customer_history(
         result,
         compact_recent_history(history),
@@ -9176,6 +9413,7 @@ Write a short, warm and natural reply to the customer's newest message.
 IMPORTANT LOCKED RULES:
 - The saved state below is authoritative.
 - Never mention, paraphrase, invent, or calculate availability, calendar results, dates, weekdays, times, or slots.
+- Never echo or acknowledge the customer's raw date or time wording. Python validates and writes all customer-facing schedule wording.
 - Never mention handoff, contacting Veronika, confirmation, review, follow-up, or passing the request on. Python will append final handoff wording if eligible.
 - Never imply the business will proceed or finish the request. Do not say "we'll take care of the rest", "we'll take care of the next steps", "we'll get everything set up", "we'll make sure everything is ready", "we'll arrange the remaining details", or similar.
 - Never claim that an appointment is confirmed.
@@ -9502,6 +9740,25 @@ def strip_unverified_calendar_claims(
     return collapse_repeated_reply_content(" ".join(safe_sentences))
 
 
+def strip_model_schedule_wording(reply: str) -> str:
+    """Remove model-authored schedule wording after Python parsed the input."""
+    schedule_pattern = re.compile(
+        r"(?i)\b(?:"
+        + "|".join(SCHEDULE_WEEKDAYS)
+        + "|"
+        + SCHEDULE_MONTH_NAMES
+        + r"|today|tomorrow|noon|midday|midnight)\b"
+        r"|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+        r"|\b\d{1,2}(?:st|nd|rd|th)\b"
+    )
+
+    return collapse_repeated_reply_content(" ".join(
+        sentence
+        for sentence in split_customer_sentences(reply)
+        if not schedule_pattern.search(sentence)
+    ))
+
+
 def compose_verified_customer_reply(
     state: dict,
     extractor_result: dict,
@@ -9517,6 +9774,13 @@ def compose_verified_customer_reply(
         next_required_detail,
     )
     next_question = full_next_question
+    schedule_clarification = str(
+        extractor_result.get("schedule_clarification") or ""
+    ).strip()
+
+    if schedule_clarification:
+        return schedule_clarification
+
     booking_flow_active = (
         state.get("conversation_mode") == "booking_request"
         or next_required_detail is not None
@@ -9560,6 +9824,11 @@ def compose_verified_customer_reply(
             information_body = strip_questions_from_response(
                 information_body
             )
+
+            if extractor_result.get("schedule_input_detected"):
+                information_body = strip_model_schedule_wording(
+                    information_body
+                )
 
             if reply_is_meaningful(information_body):
                 parts.append(information_body)
@@ -9614,6 +9883,9 @@ def compose_verified_customer_reply(
         body,
         calendar_result,
     )
+
+    if extractor_result.get("schedule_input_detected"):
+        body = strip_model_schedule_wording(body)
 
     if next_question:
         body = strip_questions_from_response(body)
