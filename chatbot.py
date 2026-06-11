@@ -107,10 +107,6 @@ INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET")
 INSTAGRAM_VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN")
 INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v25.0")
 
-SUMUP_HOLD_MINUTES = read_positive_int_environment_variable(
-    "SUMUP_HOLD_MINUTES",
-    30,
-)
 SUMUP_CHECKOUT_ENDPOINT = "https://api.sumup.com/v0.1/checkouts"
 
 # Instagram session and moderation safeguards.
@@ -7894,6 +7890,32 @@ def load_active_payment_request(
     return response.data[0] if response.data else None
 
 
+def load_sumup_config() -> dict:
+    """Load required SumUp credentials and hold settings at request time."""
+    api_key = str(os.getenv("SUMUP_API_KEY") or "").strip()
+    merchant_code = str(os.getenv("SUMUP_MERCHANT_CODE") or "").strip()
+    api_key_present = bool(api_key)
+    merchant_code_present = bool(merchant_code)
+
+    logger.info(
+        "SumUp config check: api_key_present=%s, merchant_code_present=%s",
+        str(api_key_present).lower(),
+        str(merchant_code_present).lower(),
+    )
+
+    if not api_key_present or not merchant_code_present:
+        raise RuntimeError("SumUp sandbox configuration is incomplete.")
+
+    return {
+        "api_key": api_key,
+        "merchant_code": merchant_code,
+        "hold_minutes": read_positive_int_environment_variable(
+            "SUMUP_HOLD_MINUTES",
+            30,
+        ),
+    }
+
+
 def safe_sumup_error_details(response_body: str) -> tuple[str, str]:
     """Return a safe dashboard reason and redacted diagnostic response body."""
     cleaned_body = str(response_body or "").strip()
@@ -7965,21 +7987,10 @@ def create_sumup_hosted_checkout(
     description: str,
     valid_until: str,
 ) -> dict:
-    sumup_api_key = str(os.getenv("SUMUP_API_KEY") or "").strip()
-    sumup_merchant_code = str(
-        os.getenv("SUMUP_MERCHANT_CODE") or ""
-    ).strip()
-    api_key_present = bool(sumup_api_key)
+    sumup_config = load_sumup_config()
+    sumup_api_key = sumup_config["api_key"]
+    sumup_merchant_code = sumup_config["merchant_code"]
     merchant_code_present = bool(sumup_merchant_code)
-
-    logger.info(
-        "SumUp config check: api_key_present=%s, merchant_code_present=%s",
-        str(api_key_present).lower(),
-        str(merchant_code_present).lower(),
-    )
-
-    if not api_key_present or not merchant_code_present:
-        raise RuntimeError("SumUp sandbox configuration is incomplete.")
 
     payload = {
         "checkout_reference": checkout_reference,
@@ -8126,12 +8137,13 @@ def deposit_instagram_text(
     amount = f"{amount_pence / 100:.2f}"
     requested_date = format_customer_date(booking_request.get("preferred_date"))
     requested_time = format_customer_time(booking_request.get("preferred_time"))
+    hold_minutes = load_sumup_config()["hold_minutes"]
     return (
         f"Veronika has reviewed your appointment request for {treatment} on "
         f"{requested_date} at {requested_time}.\n\n"
         f"To secure the slot, please pay the £{amount} deposit using this "
         f"secure SumUp link:\n{hosted_checkout_url}\n\n"
-        f"The slot will be held for {SUMUP_HOLD_MINUTES} minutes. Your "
+        f"The slot will be held for {hold_minutes} minutes. Your "
         "appointment will be confirmed once the deposit has been received."
     )
 
@@ -8442,8 +8454,19 @@ async def request_booking_deposit(
         f"{BUSINESS_SLUG}-deposit-{booking_request_id}-"
         f"{secrets.token_hex(8)}"
     )
+    try:
+        sumup_config = load_sumup_config()
+    except RuntimeError as error:
+        return confirmation_json_response(
+            False,
+            "error",
+            str(error),
+            502,
+        )
+
     hold_expires_at = (
-        datetime.now(timezone.utc) + timedelta(minutes=SUMUP_HOLD_MINUTES)
+        datetime.now(timezone.utc)
+        + timedelta(minutes=sumup_config["hold_minutes"])
     ).isoformat()
     service_names = " + ".join(
         str(item.get("service_name"))
