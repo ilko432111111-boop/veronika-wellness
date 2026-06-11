@@ -107,8 +107,6 @@ INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET")
 INSTAGRAM_VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN")
 INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v25.0")
 
-SUMUP_API_KEY = os.getenv("SUMUP_API_KEY")
-SUMUP_MERCHANT_CODE = os.getenv("SUMUP_MERCHANT_CODE")
 SUMUP_HOLD_MINUTES = read_positive_int_environment_variable(
     "SUMUP_HOLD_MINUTES",
     30,
@@ -7902,12 +7900,25 @@ def create_sumup_hosted_checkout(
     description: str,
     valid_until: str,
 ) -> dict:
-    if not SUMUP_API_KEY or not SUMUP_MERCHANT_CODE:
+    sumup_api_key = str(os.getenv("SUMUP_API_KEY") or "").strip()
+    sumup_merchant_code = str(
+        os.getenv("SUMUP_MERCHANT_CODE") or ""
+    ).strip()
+    api_key_present = bool(sumup_api_key)
+    merchant_code_present = bool(sumup_merchant_code)
+
+    logger.info(
+        "SumUp config check: api_key_present=%s, merchant_code_present=%s",
+        str(api_key_present).lower(),
+        str(merchant_code_present).lower(),
+    )
+
+    if not api_key_present or not merchant_code_present:
         raise RuntimeError("SumUp sandbox configuration is incomplete.")
 
     payload = {
         "checkout_reference": checkout_reference,
-        "merchant_code": SUMUP_MERCHANT_CODE,
+        "merchant_code": sumup_merchant_code,
         "amount": round(amount_pence / 100, 2),
         "currency": "GBP",
         "description": description[:255],
@@ -7918,7 +7929,7 @@ def create_sumup_hosted_checkout(
         SUMUP_CHECKOUT_ENDPOINT,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {SUMUP_API_KEY}",
+            "Authorization": f"Bearer {sumup_api_key}",
             "Content-Type": "application/json",
             "User-Agent": "veronika-chatbot/1.0",
         },
