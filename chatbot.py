@@ -7941,6 +7941,144 @@ def build_authoritative_services_context() -> str:
     )
 
 
+def migrated_structured_service_catalogue() -> list[dict]:
+    """
+    Return service identities backed by live public.services rows.
+
+    Fallback catalogues keep booking operational during a Supabase outage, but
+    must not hide documents for services that may not have been migrated yet.
+    """
+    catalogue = []
+    loaders = [
+        ("massage", load_massage_services),
+        ("vitamin_shots", load_vitamin_shot_services),
+        ("ultrasound", load_ultrasound_services),
+        ("body_treatments", load_body_treatment_services),
+        ("microneedling", load_microneedling_services),
+        ("facials", load_facial_services),
+        ("dermal_fillers", load_dermal_filler_services),
+    ]
+
+    for category, loader in loaders:
+        services, from_supabase = loader()
+
+        if not from_supabase:
+            continue
+
+        for service in services:
+            catalogue.append({
+                "category": category,
+                "service_name": service.get("service_name"),
+                "aliases": list(service.get("aliases") or []),
+            })
+
+    return catalogue
+
+
+def normalise_catalogue_document_text(value: str | None) -> str:
+    """Normalise catalogue prose for conservative service-name matching."""
+    cleaned = str(value or "").lower()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def catalogue_document_contains_phrase(
+    normalised_content: str,
+    phrase: str | None,
+) -> bool:
+    normalised_phrase = normalise_catalogue_document_text(phrase)
+
+    if not normalised_phrase:
+        return False
+
+    return f" {normalised_phrase} " in f" {normalised_content} "
+
+
+def is_legacy_catalogue_document(
+    content: str,
+    structured_catalogue: list[dict],
+) -> bool:
+    """
+    Identify clear legacy price/duration catalogue rows duplicated by services.
+
+    Category mentions alone are deliberately insufficient so FAQs, policies,
+    and useful descriptions remain available to the responder.
+    """
+    normalised = normalise_catalogue_document_text(content)
+
+    if not normalised or not structured_catalogue:
+        return False
+
+    has_price = bool(
+        re.search(r"(?:£|Â£)\s*\d", content)
+        or re.search(r"\b(?:pounds?|gbp)\b", normalised)
+    )
+    has_duration = bool(re.search(
+        r"\b(?:\d+(?:\.\d+)?\s*)?"
+        r"(?:minutes?|mins?|hours?|hrs?|sessions?)\b",
+        normalised,
+    ))
+    migrated_categories = {
+        str(service.get("category") or "")
+        for service in structured_catalogue
+    }
+
+    if has_price and has_duration:
+        for service in structured_catalogue:
+            names = [
+                service.get("service_name"),
+                *(service.get("aliases") or []),
+            ]
+
+            if any(
+                catalogue_document_contains_phrase(normalised, name)
+                for name in names
+            ):
+                return True
+
+    if has_price and "microneedling" in migrated_categories:
+        microneedling_summary_markers = [
+            "stretch marks",
+            "face and neck",
+            "selected area",
+            "1 area",
+            "one area",
+        ]
+
+        if (
+            catalogue_document_contains_phrase(normalised, "microneedling")
+            and sum(
+                catalogue_document_contains_phrase(normalised, marker)
+                for marker in microneedling_summary_markers
+            ) >= 2
+        ):
+            return True
+
+    if has_price and "dermal_fillers" in migrated_categories:
+        filler_area_markers = [
+            "lip filler",
+            "marionette lines",
+            "nasolabial folds",
+        ]
+
+        if (
+            catalogue_document_contains_phrase(normalised, "dermal filler")
+            and (
+                sum(
+                    catalogue_document_contains_phrase(normalised, marker)
+                    for marker in filler_area_markers
+                ) >= 2
+                or (
+                    catalogue_document_contains_phrase(normalised, "0.5 ml")
+                    and catalogue_document_contains_phrase(normalised, "1 ml")
+                )
+            )
+        ):
+            return True
+
+    return False
+
+
 def load_business_documents_context() -> str:
     try:
         response = (
@@ -7950,8 +8088,11 @@ def load_business_documents_context() -> str:
         )
 
         rows = []
+        document_rows = response.data or []
+        structured_catalogue = migrated_structured_service_catalogue()
+        legacy_catalogue_filtered = 0
 
-        for item in response.data or []:
+        for item in document_rows:
             content = str(item.get("content") or "").strip()
 
             if not content:
@@ -7962,7 +8103,19 @@ def load_business_documents_context() -> str:
             if re.match(r"(?i)^\s*opening\s+hours\s*:", content):
                 continue
 
+            if is_legacy_catalogue_document(content, structured_catalogue):
+                legacy_catalogue_filtered += 1
+                continue
+
             rows.append(content)
+
+        logger.info(
+            "business_documents_loaded total=%d "
+            "legacy_catalogue_filtered=%d retained=%d",
+            len(document_rows),
+            legacy_catalogue_filtered,
+            len(rows),
+        )
 
         return "\n".join(rows)
 
