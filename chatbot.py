@@ -743,6 +743,68 @@ def recover_schedule_from_customer_history(
     return result
 
 
+def recover_duration_from_customer_history(
+    lead_data: dict,
+    conversation_history: str,
+    latest_message: str,
+) -> dict:
+    """
+    Recover a duration supplied before the exact treatment was resolved.
+
+    The newest explicit customer duration wins, but it is applied only when
+    valid for the currently resolved treatment. Assistant messages are never
+    treated as customer facts.
+    """
+    result = dict(lead_data)
+
+    if (
+        result.get("duration") not in [None, ""]
+        and duration_is_valid_for_treatment(
+            result.get("treatment"),
+            result.get("duration"),
+        )
+    ):
+        return result
+
+    customer_messages = []
+
+    for line in str(conversation_history or "").splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if lower.startswith(("customer:", "user:")):
+            customer_messages.append(
+                stripped.split(":", 1)[1].strip()
+            )
+
+    if (
+        not customer_messages
+        or customer_messages[-1].strip()
+        != str(latest_message or "").strip()
+    ):
+        customer_messages.append(
+            str(latest_message or "").strip()
+        )
+
+    for message in reversed(customer_messages):
+        minutes = parse_duration_minutes(message)
+
+        if minutes is None:
+            continue
+
+        candidate = format_minutes_as_duration(minutes)
+
+        if duration_is_valid_for_treatment(
+            result.get("treatment"),
+            candidate,
+        ):
+            result["duration"] = candidate
+
+        break
+
+    return result
+
+
 def explicit_duration_minutes_from_reply(
     latest_message: str,
     previous_assistant_message: str = "",
@@ -1029,13 +1091,28 @@ def allowed_durations_for_treatment(
 ) -> set[int] | None:
     service = find_massage_service(treatment)
 
-    if not service:
+    if service:
+        return {
+            int(value)
+            for value in service.get("allowed_durations_minutes") or []
+        }
+
+    metadata = authoritative_service_metadata(treatment)
+
+    if not metadata:
         return None
 
-    return {
+    allowed = {
         int(value)
-        for value in service.get("allowed_durations_minutes") or []
+        for value in metadata.get("allowed_durations_minutes") or []
     }
+
+    fixed_minutes = metadata.get("fixed_duration_minutes")
+
+    if fixed_minutes not in [None, ""]:
+        allowed.add(int(fixed_minutes))
+
+    return allowed or None
 
 
 def apply_dynamic_massage_details(
@@ -5632,8 +5709,22 @@ def parse_duration_minutes(value: str | None) -> int | None:
     cleaned = str(value).strip().lower()
     total_minutes = 0
 
+    if re.search(r"\bhalf\s+(?:an?|one)\s+hour\b", cleaned):
+        total_minutes += 30
+        cleaned = re.sub(
+            r"\bhalf\s+(?:an?|one)\s+hour\b",
+            "",
+            cleaned,
+            count=1,
+        )
+
     hours_match = re.search(
         r"(\d+(?:\.\d+)?)\s*(?:hour|hours|hr|hrs)\b",
+        cleaned,
+    )
+
+    word_hours_match = re.search(
+        r"\b(an|one|two)\s+hours?\b",
         cleaned,
     )
 
@@ -5644,6 +5735,13 @@ def parse_duration_minutes(value: str | None) -> int | None:
 
     if hours_match:
         total_minutes += round(float(hours_match.group(1)) * 60)
+
+    if word_hours_match:
+        total_minutes += (
+            120
+            if word_hours_match.group(1) == "two"
+            else 60
+        )
 
     if minutes_match:
         total_minutes += int(minutes_match.group(1))
@@ -8514,6 +8612,8 @@ def apply_validated_state_patch(
             candidate_duration,
         ):
             result["duration"] = candidate_duration
+        else:
+            result["duration"] = None
 
     if (
         previous_treatment
@@ -8541,6 +8641,11 @@ def apply_validated_state_patch(
     # Recover previously supplied customer schedule details after a later
     # variant choice. Assistant suggestions are never used as saved facts.
     result = recover_schedule_from_customer_history(
+        result,
+        compact_recent_history(history),
+        latest_message,
+    )
+    result = recover_duration_from_customer_history(
         result,
         compact_recent_history(history),
         latest_message,
@@ -9173,8 +9278,8 @@ def sentence_contains_forbidden_booking_claim(sentence: str) -> bool:
         r"(?i)\b(?:we(?:['\u2019]ll| will)|i(?:['\u2019]ll| will))\s+pass\s+your\s+request\s+on\b",
         r"(?i)\b(?:i(?:['\u2019]ll| will)|i have|i['\u2019]ve)\s+let\s+veronika\s+know\b",
         r"(?i)\b(?:we|i)(?:['\u2019]ll| will)\s+take care of\b",
-        r"(?i)\bwe(?:['\u2019]ll| will)\s+get everything set up\b",
-        r"(?i)\bwe(?:['\u2019]ll| will)\s+make sure everything is ready\b",
+        r"(?i)\bwe(?:['\u2019]ll| will)\s+get\b[^.!?]{0,60}\bset up\b",
+        r"(?i)\bwe(?:['\u2019]ll| will)\s+make sure\b[^.!?]{0,60}\b(?:ready|set for you)\b",
         r"(?i)\b(?:we|i)(?:['\u2019]ll| will)\s+arrange (?:the )?(?:remaining )?details\b",
         r"(?i)\bi(?:['\u2019]ve| have) noted (?:your|the)\s+(?:request|preference|details?)[^.!?]{0,80}\b(?:and\s+)?(?:i|we)?\s*(?:will|['\u2019]ll)\s+take care of\b",
         r"(?i)\bi(?:['\u2019]ll| will)\s+look into suitable times and get back to you\b",
@@ -9503,6 +9608,7 @@ def compose_verified_customer_reply(
 
     parts = []
 
+    had_body_before_sanitise = bool(str(body or "").strip())
     body = sanitise_natural_responder_body(body)
     body = strip_unverified_calendar_claims(
         body,
@@ -9525,6 +9631,9 @@ def compose_verified_customer_reply(
 
     if not reply_is_meaningful(body):
         body = ""
+
+    if not body and had_body_before_sanitise and next_question:
+        body = "I've noted that."
 
     if (
         not body
