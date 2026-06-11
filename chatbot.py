@@ -7909,6 +7909,11 @@ def safe_sumup_error_details(response_body: str) -> tuple[str, str]:
         "[redacted-key]",
         diagnostic_body,
     )
+    diagnostic_body = re.sub(
+        r"(?i)([\"']?merchant_code[\"']?\s*[:=]\s*)[\"']?[^,\"'\s}]+",
+        r"\1[redacted]",
+        diagnostic_body,
+    )
     reason = ""
 
     try:
@@ -7943,6 +7948,11 @@ def safe_sumup_error_details(response_body: str) -> tuple[str, str]:
         r"(?i)(authorization|access[_ -]?token|api[_ -]?key|bearer|token|"
         r"secret|password)\s*[:=]\s*\S+",
         r"\1=[redacted]",
+        reason,
+    )
+    reason = re.sub(
+        r"(?i)merchant_code\s*[:=]\s*\S+",
+        "merchant_code=[redacted]",
         reason,
     )
     reason = re.sub(r"\s+", " ", reason).strip()[:300]
@@ -8004,20 +8014,40 @@ def create_sumup_hosted_checkout(
 
     try:
         with urllib_request.urlopen(checkout_request, timeout=20) as response:
+            response_status = response.getcode()
             response_body = response.read().decode("utf-8", errors="replace")
+
+        _, diagnostic_body = safe_sumup_error_details(response_body)
+        logger.info(
+            "SumUp checkout response: endpoint=%s http_status=%s "
+            "response_body=%s checkout_reference=%s amount=%s currency=%s "
+            "merchant_code_present=%s hosted_checkout_enabled=%s",
+            SUMUP_CHECKOUT_ENDPOINT,
+            response_status,
+            diagnostic_body,
+            checkout_reference,
+            payload["amount"],
+            payload["currency"],
+            str(merchant_code_present).lower(),
+            str(payload["hosted_checkout"]["enabled"]).lower(),
+        )
 
         try:
             checkout = json.loads(response_body)
         except json.JSONDecodeError as error:
-            _, diagnostic_body = safe_sumup_error_details(response_body)
             logger.warning(
                 "SumUp checkout returned invalid JSON: endpoint=%s "
-                "response_body=%s checkout_reference=%s amount=%s currency=%s",
+                "http_status=%s response_body=%s checkout_reference=%s "
+                "amount=%s currency=%s merchant_code_present=%s "
+                "hosted_checkout_enabled=%s",
                 SUMUP_CHECKOUT_ENDPOINT,
+                response_status,
                 diagnostic_body,
                 checkout_reference,
                 payload["amount"],
                 payload["currency"],
+                str(merchant_code_present).lower(),
+                str(payload["hosted_checkout"]["enabled"]).lower(),
             )
             raise RuntimeError(
                 "Could not create SumUp deposit link: SumUp returned an invalid response."
@@ -8043,12 +8073,9 @@ def create_sumup_hosted_checkout(
             str(payload["hosted_checkout"]["enabled"]).lower(),
         )
         raise RuntimeError(
-            "Could not create SumUp deposit link: "
-            + (
-                safe_reason
-                if safe_reason
-                else f"SumUp returned HTTP {error.code}."
-            )
+            f"Could not create SumUp deposit link. SumUp returned HTTP "
+            f"{error.code}"
+            + (f": {safe_reason}" if safe_reason else ".")
         ) from error
     except (TimeoutError, urllib_error.URLError) as error:
         raise RuntimeError("SumUp checkout creation could not be reached.") from error
@@ -8076,7 +8103,7 @@ def create_sumup_hosted_checkout(
             str(payload["hosted_checkout"]["enabled"]).lower(),
         )
         raise RuntimeError(
-            "Could not create SumUp deposit link: SumUp did not return a hosted checkout URL."
+            "SumUp created the checkout but did not return a hosted payment URL."
         )
 
     return {
