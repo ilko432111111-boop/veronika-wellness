@@ -1637,7 +1637,7 @@
                     .order("item_order", { ascending: true }),
                 supabaseClient
                     .from("payment_requests")
-                    .select("id, booking_request_id, amount_pence, status, hold_expires_at, hosted_checkout_url, message_delivery_status, message_delivery_error, message_sent_at, created_at")
+                    .select("id, booking_request_id, amount_pence, status, hold_expires_at, hosted_checkout_url, message_delivery_status, message_delivery_error, message_sent_at, calendar_hold_event_id, calendar_hold_status, calendar_hold_error, calendar_hold_created_at, calendar_hold_deleted_at, created_at")
                     .order("created_at", { ascending: false }),
                 supabaseClient
                     .from("pending_booking_actions")
@@ -1857,7 +1857,10 @@
                     throw new Error(result?.message || result?.detail || "Deposit link could not be created.");
                 }
 
-                message.textContent = result.delivery_message || result.message;
+                message.textContent =
+                    result.calendar_hold_message
+                    || result.delivery_message
+                    || result.message;
                 await loadLeads();
             } catch (error) {
                 message.textContent = error.message;
@@ -2124,6 +2127,9 @@
                 const actionMessage = document.createElement("span");
                 actionMessage.className = "request-message";
                 const activePayment = activePendingPayment(request.id);
+                const latestPayment = (
+                    paymentRequestsByBooking.get(String(request.id)) || []
+                )[0] || null;
 
                 if (request.request_status === "confirmed") {
                     actionMessage.textContent = confirmationMessageLabel(request);
@@ -2168,6 +2174,21 @@
                             `Slot held until: ${formatDate(activePayment.hold_expires_at)}`;
 
                         const deliveryLabel = document.createElement("span");
+                        const calendarHoldLabel = document.createElement("span");
+
+                        if (
+                            activePayment.calendar_hold_event_id
+                            && activePayment.calendar_hold_status === "active"
+                        ) {
+                            calendarHoldLabel.textContent =
+                                "Temporary Google Calendar hold added.";
+                        } else if (activePayment.calendar_hold_status === "failed") {
+                            calendarHoldLabel.textContent =
+                                "Slot reserved in the system, but Google Calendar hold could not be added.";
+                        } else {
+                            calendarHoldLabel.textContent =
+                                "Temporary Google Calendar hold is being added.";
+                        }
 
                         if (activePayment.message_delivery_status === "sent") {
                             deliveryLabel.textContent = "Deposit link sent by Instagram.";
@@ -2210,6 +2231,7 @@
                             depositLabel,
                             paymentStatus,
                             holdLabel,
+                            calendarHoldLabel,
                             deliveryLabel,
                             paymentButtons
                         );
@@ -2217,6 +2239,13 @@
                     } else if (
                         requestCanRequestDeposit(lead, request, requestItems)
                     ) {
+                        if (latestPayment?.status === "expired") {
+                            const expiredHoldLabel = document.createElement("span");
+                            expiredHoldLabel.textContent =
+                                "Deposit link expired. Temporary calendar hold released.";
+                            actions.appendChild(expiredHoldLabel);
+                        }
+
                         const depositControls = document.createElement("div");
                         depositControls.className = "deposit-controls";
 

@@ -6023,8 +6023,17 @@ def build_requested_slot(lead_data: dict):
 def expire_pending_payment_holds() -> None:
     """Release elapsed holds without deleting their payment history."""
     now_iso = datetime.now(timezone.utc).isoformat()
+    logger.info("Expired payment hold cleanup started")
 
     try:
+        cleanup_response = (
+            supabase.table("payment_requests")
+            .select("id, status, calendar_hold_event_id, calendar_hold_status")
+            .in_("status", ["pending", "expired"])
+            .lte("hold_expires_at", now_iso)
+            .eq("calendar_hold_status", "active")
+            .execute()
+        )
         (
             supabase.table("payment_requests")
             .update({
@@ -6041,6 +6050,55 @@ def expire_pending_payment_holds() -> None:
             "Could not expire elapsed payment holds: %s",
             type(error).__name__,
         )
+        return
+
+    for payment_request in cleanup_response.data or []:
+        event_id = payment_request.get("calendar_hold_event_id")
+
+        if not event_id:
+            continue
+
+        payment_request_id = str(payment_request["id"])
+
+        try:
+            delete_google_calendar_event(str(event_id))
+            (
+                supabase.table("payment_requests")
+                .update({
+                    "calendar_hold_status": "deleted",
+                    "calendar_hold_deleted_at": now_iso,
+                    "calendar_hold_error": None,
+                    "updated_at": now_iso,
+                })
+                .eq("id", payment_request_id)
+                .execute()
+            )
+            logger.info(
+                "Temporary calendar event deletion succeeded; event_id_present=true"
+            )
+        except Exception as error:
+            if isinstance(error, urllib_error.HTTPError):
+                error.close()
+            logger.warning(
+                "Temporary calendar event deletion failed: %s",
+                type(error).__name__,
+            )
+            try:
+                (
+                    supabase.table("payment_requests")
+                    .update({
+                        "calendar_hold_error": (
+                            "Google Calendar temporary hold could not be deleted."
+                        ),
+                        "updated_at": now_iso,
+                    })
+                    .eq("id", payment_request_id)
+                    .execute()
+                )
+            except Exception:
+                logger.exception(
+                    "Could not save temporary calendar deletion failure"
+                )
 
 
 def active_payment_hold_busy_periods(
@@ -6211,9 +6269,10 @@ def create_google_calendar_event(
     end_time: datetime,
     title: str,
     description: str,
-    booking_request_id: int,
+    booking_request_id: int | None = None,
+    private_properties: dict[str, str] | None = None,
 ) -> dict:
-    """Create one owner-confirmed appointment on the connected calendar."""
+    """Create one busy event on the connected calendar."""
     access_token = refresh_google_access_token()
 
     if not access_token:
@@ -6223,9 +6282,18 @@ def create_google_calendar_event(
         GOOGLE_CALENDAR_ID,
         safe="",
     )
+    event_private_properties = private_properties or {}
+
+    if booking_request_id is not None:
+        event_private_properties.setdefault(
+            "bookingRequestId",
+            str(booking_request_id),
+        )
+
     payload = {
         "summary": title,
         "description": description,
+        "transparency": "opaque",
         "start": {
             "dateTime": start_time.isoformat(),
             "timeZone": "Europe/London",
@@ -6235,9 +6303,7 @@ def create_google_calendar_event(
             "timeZone": "Europe/London",
         },
         "extendedProperties": {
-            "private": {
-                "bookingRequestId": str(booking_request_id),
-            },
+            "private": event_private_properties,
         },
     }
     event_request = urllib_request.Request(
@@ -6260,10 +6326,11 @@ def create_google_calendar_event(
     return event
 
 
-def find_google_calendar_event_for_request(
-    booking_request_id: int,
+def find_google_calendar_event_by_private_property(
+    property_name: str,
+    property_value: str,
 ) -> dict | None:
-    """Find a previously created event after a partial confirmation failure."""
+    """Find a previously created event after a partial persistence failure."""
     access_token = refresh_google_access_token()
 
     if not access_token:
@@ -6271,7 +6338,7 @@ def find_google_calendar_event_for_request(
 
     calendar_id = urllib_parse.quote(GOOGLE_CALENDAR_ID, safe="")
     query = urllib_parse.urlencode({
-        "privateExtendedProperty": f"bookingRequestId={booking_request_id}",
+        "privateExtendedProperty": f"{property_name}={property_value}",
         "singleEvents": "true",
         "maxResults": "1",
     })
@@ -6289,6 +6356,46 @@ def find_google_calendar_event_for_request(
 
     items = result.get("items") if isinstance(result, dict) else None
     return items[0] if items else None
+
+
+def find_google_calendar_event_for_request(
+    booking_request_id: int,
+) -> dict | None:
+    return find_google_calendar_event_by_private_property(
+        "bookingRequestId",
+        str(booking_request_id),
+    )
+
+
+def delete_google_calendar_event(event_id: str) -> None:
+    """Delete one event from the connected owner calendar."""
+    access_token = refresh_google_access_token()
+
+    if not access_token:
+        raise RuntimeError("Google Calendar is not connected.")
+
+    calendar_id = urllib_parse.quote(GOOGLE_CALENDAR_ID, safe="")
+    encoded_event_id = urllib_parse.quote(event_id, safe="")
+    event_request = urllib_request.Request(
+        (
+            "https://www.googleapis.com/calendar/v3/calendars/"
+            f"{calendar_id}/events/{encoded_event_id}"
+        ),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "receptionist-chatbot/1.0",
+        },
+        method="DELETE",
+    )
+
+    try:
+        with urllib_request.urlopen(event_request, timeout=15):
+            pass
+    except urllib_error.HTTPError as error:
+        if error.code in {404, 410}:
+            error.close()
+            return
+        raise
 
 
 def parse_google_datetime(value: str) -> datetime:
@@ -8265,6 +8372,198 @@ def deliver_deposit_link(
     }
 
 
+def temporary_calendar_hold_details(
+    payment_request: dict,
+    booking_request: dict,
+    conversation: dict,
+    items: list[dict],
+) -> tuple[str, str]:
+    treatment = " + ".join(
+        str(item.get("service_name"))
+        for item in items
+        if item.get("service_name")
+    ) or "appointment"
+    customer_name = str(conversation.get("name") or "Customer")
+    duration_minutes = int(booking_request["total_duration_minutes"])
+    amount = f"{int(payment_request['amount_pence']) / 100:.2f}"
+    title = f"TEMP HOLD \u2014 awaiting deposit \u2014 {customer_name}"
+    description = "\n".join([
+        "Temporary deposit hold.",
+        f"Treatment: {treatment}",
+        f"Duration: {duration_minutes} minutes",
+        f"Deposit requested: \u00a3{amount}",
+        f"Hold expires: {payment_request.get('hold_expires_at')}",
+        f"Customer phone: {conversation.get('phone')}",
+        f"Booking request ID: {booking_request.get('id')}",
+        "",
+        "This is not a confirmed appointment.",
+    ])
+    return title, description
+
+
+def ensure_temporary_calendar_hold(
+    payment_request: dict,
+    booking_request: dict,
+    conversation: dict,
+    items: list[dict],
+    creation_claimed: bool = False,
+) -> dict:
+    """Create or recover one temporary calendar event for a payment hold."""
+    payment_request_id = str(payment_request["id"])
+
+    if (
+        payment_request.get("calendar_hold_event_id")
+        and payment_request.get("calendar_hold_status") == "active"
+    ):
+        return {
+            "calendar_hold_status": "active",
+            "calendar_hold_event_id": payment_request["calendar_hold_event_id"],
+            "calendar_hold_message": "Temporary Google Calendar hold added.",
+        }
+
+    if not creation_claimed:
+        logger.info(
+            "Temporary calendar hold retry attempted; payment_request_id_present=true"
+        )
+        try:
+            existing_event = find_google_calendar_event_by_private_property(
+                "paymentRequestId",
+                payment_request_id,
+            )
+        except Exception:
+            logger.exception("Could not check for an existing temporary event")
+            existing_event = None
+
+        if existing_event and existing_event.get("id"):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            update_response = (
+                supabase.table("payment_requests")
+                .update({
+                    "calendar_hold_event_id": existing_event["id"],
+                    "calendar_hold_created_at": now_iso,
+                    "calendar_hold_status": "active",
+                    "calendar_hold_error": None,
+                    "updated_at": now_iso,
+                })
+                .eq("id", payment_request_id)
+                .execute()
+            )
+
+            if not update_response.data:
+                raise RuntimeError("Recovered temporary event could not be saved.")
+
+            return {
+                "calendar_hold_status": "active",
+                "calendar_hold_event_id": existing_event["id"],
+                "calendar_hold_message": "Temporary Google Calendar hold added.",
+            }
+
+        claim_response = (
+            supabase.table("payment_requests")
+            .update({
+                "calendar_hold_status": "creating",
+                "calendar_hold_error": None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", payment_request_id)
+            .is_("calendar_hold_event_id", "null")
+            .in_("calendar_hold_status", ["failed", "active"])
+            .execute()
+        )
+
+        if not claim_response.data:
+            return {
+                "calendar_hold_status": (
+                    payment_request.get("calendar_hold_status") or "creating"
+                ),
+                "calendar_hold_event_id": None,
+                "calendar_hold_message": (
+                    "Deposit link created. Temporary Google Calendar hold "
+                    "creation is already in progress."
+                ),
+            }
+
+    logger.info(
+        "Temporary calendar hold creation started; payment_request_id_present=true"
+    )
+    safe_error = "Google Calendar temporary hold could not be added."
+
+    try:
+        start_time = parse_utc_datetime(payment_request.get("held_start_at"))
+        end_time = parse_utc_datetime(payment_request.get("held_end_at"))
+
+        if not start_time or not end_time:
+            raise RuntimeError("Payment hold interval is invalid.")
+
+        title, description = temporary_calendar_hold_details(
+            payment_request,
+            booking_request,
+            conversation,
+            items,
+        )
+        event = create_google_calendar_event(
+            start_time.astimezone(BUSINESS_TIMEZONE),
+            end_time.astimezone(BUSINESS_TIMEZONE),
+            title,
+            description,
+            private_properties={"paymentRequestId": payment_request_id},
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        update_response = (
+            supabase.table("payment_requests")
+            .update({
+                "calendar_hold_event_id": event["id"],
+                "calendar_hold_created_at": now_iso,
+                "calendar_hold_status": "active",
+                "calendar_hold_error": None,
+                "updated_at": now_iso,
+            })
+            .eq("id", payment_request_id)
+            .execute()
+        )
+
+        if not update_response.data:
+            raise RuntimeError("Temporary calendar event ID could not be saved.")
+
+        logger.info(
+            "Temporary calendar hold created; calendar_hold_event_id_present=true"
+        )
+        return {
+            "calendar_hold_status": "active",
+            "calendar_hold_event_id": event["id"],
+            "calendar_hold_message": "Temporary Google Calendar hold added.",
+        }
+    except Exception as error:
+        if isinstance(error, urllib_error.HTTPError):
+            error.close()
+        logger.warning(
+            "Temporary calendar hold creation failed: %s",
+            type(error).__name__,
+        )
+        try:
+            (
+                supabase.table("payment_requests")
+                .update({
+                    "calendar_hold_status": "failed",
+                    "calendar_hold_error": safe_error,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("id", payment_request_id)
+                .execute()
+            )
+        except Exception:
+            logger.exception("Could not save temporary calendar hold failure")
+
+        return {
+            "calendar_hold_status": "failed",
+            "calendar_hold_event_id": None,
+            "calendar_hold_message": (
+                "Deposit link created, but the temporary Google Calendar hold "
+                "could not be added. The slot is still reserved in the system."
+            ),
+        }
+
+
 @app.post("/admin/booking-requests/{booking_request_id}/request-deposit")
 async def request_booking_deposit(
     booking_request_id: int,
@@ -8370,6 +8669,26 @@ async def request_booking_deposit(
         )
 
     if existing_payment:
+        try:
+            calendar_hold = ensure_temporary_calendar_hold(
+                existing_payment,
+                booking_request,
+                conversation,
+                items,
+            )
+        except Exception:
+            logger.exception(
+                "Could not retry temporary calendar hold for booking request %s",
+                booking_request_id,
+            )
+            calendar_hold = {
+                "calendar_hold_status": "failed",
+                "calendar_hold_event_id": None,
+                "calendar_hold_message": (
+                    "Slot reserved in the system, but Google Calendar hold "
+                    "could not be added."
+                ),
+            }
         return confirmation_json_response(
             True,
             "awaiting_deposit",
@@ -8380,6 +8699,7 @@ async def request_booking_deposit(
                 "hosted_checkout_url": existing_payment.get("hosted_checkout_url"),
                 "delivery_status": existing_payment.get("message_delivery_status"),
                 "delivery_message": existing_payment.get("message_delivery_error"),
+                **calendar_hold,
             },
         )
 
@@ -8520,6 +8840,7 @@ async def request_booking_deposit(
                 "held_start_at": start_time.isoformat(),
                 "held_end_at": end_time.isoformat(),
                 "hold_expires_at": hold_expires_at,
+                "calendar_hold_status": "creating",
             })
             .execute()
         )
@@ -8542,6 +8863,14 @@ async def request_booking_deposit(
         hold_expires_at,
     )
 
+    calendar_hold = ensure_temporary_calendar_hold(
+        payment_request,
+        booking_request,
+        conversation,
+        items,
+        creation_claimed=True,
+    )
+
     try:
         delivery = deliver_deposit_link(
             payment_request,
@@ -8559,11 +8888,14 @@ async def request_booking_deposit(
             "delivery_message": "Instagram delivery could not be processed.",
         }
 
-    message = (
-        "Deposit link created and sent."
-        if delivery["delivery_status"] == "sent"
-        else "Deposit link created, but it was not sent automatically."
-    )
+    if calendar_hold["calendar_hold_status"] == "failed":
+        message = calendar_hold["calendar_hold_message"]
+    else:
+        message = (
+            "Deposit link created and sent."
+            if delivery["delivery_status"] == "sent"
+            else "Deposit link created, but it was not sent automatically."
+        )
     return confirmation_json_response(
         True,
         "awaiting_deposit",
@@ -8573,6 +8905,7 @@ async def request_booking_deposit(
             "hold_expires_at": hold_expires_at,
             "hosted_checkout_url": checkout["hosted_checkout_url"],
             **delivery,
+            **calendar_hold,
         },
     )
 
