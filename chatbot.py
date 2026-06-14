@@ -1,6 +1,6 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr
 from groq import Groq
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -190,6 +190,20 @@ class ConfirmAppointmentRequest(BaseModel):
 
 class DepositRequest(BaseModel):
     amount_pence: StrictInt
+
+
+class AdminServicePayload(BaseModel):
+    category_key: StrictStr | None = None
+    service_name: StrictStr | None = None
+    variant_name: StrictStr | None = None
+    description: StrictStr | None = None
+    duration_minutes: StrictInt | None = None
+    price_pence: StrictInt | None = None
+    is_active: StrictBool | None = None
+    aliases: list[StrictStr] | None = None
+    requires_duration_choice: StrictBool | None = None
+    sort_order: StrictInt | None = None
+    duration_prices: dict[str, StrictInt] | None = None
 
 
 def normalise_source(source: str | None) -> str:
@@ -1254,6 +1268,9 @@ def load_massage_services() -> tuple[list[dict], bool]:
             })
             return rows, True
 
+        _MASSAGE_SERVICE_CACHE.update({"loaded_at": now, "rows": [], "from_supabase": True})
+        return [], True
+
     except Exception as error:
         print(f"Could not load massage services from Supabase: {error}")
 
@@ -1591,6 +1608,9 @@ def load_vitamin_shot_services() -> tuple[list[dict], bool]:
             })
             return rows, True
 
+        _VITAMIN_SHOT_SERVICE_CACHE.update({"loaded_at": now, "rows": [], "from_supabase": True})
+        return [], True
+
     except Exception as error:
         print(f"Could not load vitamin-shot services from Supabase: {error}")
 
@@ -1888,6 +1908,9 @@ def load_ultrasound_services() -> tuple[list[dict], bool]:
                 "from_supabase": True,
             })
             return rows, True
+
+        _ULTRASOUND_SERVICE_CACHE.update({"loaded_at": now, "rows": [], "from_supabase": True})
+        return [], True
 
     except Exception as error:
         print(f"Could not load ultrasound services from Supabase: {error}")
@@ -2247,6 +2270,9 @@ def load_body_treatment_services() -> tuple[list[dict], bool]:
             })
             return rows, True
 
+        _BODY_TREATMENT_SERVICE_CACHE.update({"loaded_at": now, "rows": [], "from_supabase": True})
+        return [], True
+
     except Exception as error:
         print(f"Could not load body treatments from Supabase: {error}")
 
@@ -2504,6 +2530,9 @@ def load_microneedling_services() -> tuple[list[dict], bool]:
                 "from_supabase": True,
             })
             return rows, True
+
+        _MICRONEEDLING_SERVICE_CACHE.update({"loaded_at": now, "rows": [], "from_supabase": True})
+        return [], True
 
     except Exception as error:
         print(f"Could not load microneedling services from Supabase: {error}")
@@ -2875,6 +2904,9 @@ def load_facial_services() -> tuple[list[dict], bool]:
                 "from_supabase": True,
             })
             return rows, True
+
+        _FACIAL_SERVICE_CACHE.update({"loaded_at": now, "rows": [], "from_supabase": True})
+        return [], True
 
     except Exception as error:
         print(f"Could not load facial services from Supabase: {error}")
@@ -3265,6 +3297,9 @@ def load_dermal_filler_services() -> tuple[list[dict], bool]:
                 "from_supabase": True,
             })
             return rows, True
+
+        _DERMAL_FILLER_SERVICE_CACHE.update({"loaded_at": now, "rows": [], "from_supabase": True})
+        return [], True
 
     except Exception as error:
         print(f"Could not load dermal-filler services from Supabase: {error}")
@@ -4199,14 +4234,43 @@ def authoritative_service_metadata(
     Prefer public.services. Fall back to older hardcoded fixed-treatment
     metadata only for services that have not yet been migrated.
     """
-    return (
-        load_service_metadata_from_table(
-            treatment
+    configured = load_service_metadata_from_table(treatment)
+
+    if configured:
+        return configured
+
+    if inactive_service_matches(treatment):
+        return None
+
+    return fixed_treatment_metadata(treatment)
+
+
+def inactive_service_matches(value: str | None) -> bool:
+    """Prevent legacy fallbacks from resurrecting owner-deactivated services."""
+    cleaned = normalise_service_match_text(value)
+
+    if not cleaned:
+        return False
+
+    try:
+        response = (
+            supabase.table("services")
+            .select("service_name, aliases")
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("is_active", False)
+            .execute()
         )
-        or fixed_treatment_metadata(
-            treatment
+
+        return any(
+            service_metadata_match_score(
+                value,
+                row.get("service_name"),
+                list(row.get("aliases") or []),
+            )
+            for row in response.data or []
         )
-    )
+    except Exception:
+        return False
 
 
 def metadata_match_tokens(
@@ -4371,6 +4435,9 @@ def resolve_service_metadata_from_message(
             "Could not resolve service aliases from public.services: "
             f"{error}"
         )
+
+    if inactive_service_matches(message):
+        return None
 
     for item in FIXED_TREATMENT_DETAILS:
         score = service_metadata_match_score(
@@ -7637,6 +7704,242 @@ def require_authenticated_admin(request: Request):
         raise HTTPException(status_code=401, detail="Admin sign-in required.")
 
 
+ADMIN_SERVICE_EDITABLE_FIELDS = {
+    "category_key",
+    "service_name",
+    "variant_name",
+    "description",
+    "duration_minutes",
+    "price_pence",
+    "is_active",
+    "aliases",
+    "requires_duration_choice",
+    "sort_order",
+    "duration_prices",
+}
+
+
+def clean_admin_service_payload(values: dict, require_all: bool = True) -> dict:
+    """Validate owner-edited services before any database write."""
+    cleaned = {
+        key: value
+        for key, value in values.items()
+        if key in ADMIN_SERVICE_EDITABLE_FIELDS
+    }
+
+    def clean_text(key: str, maximum: int, required: bool = False):
+        value = cleaned.get(key)
+
+        if value is None and not required:
+            return None
+
+        value = str(value or "").strip()
+
+        if required and not value:
+            raise HTTPException(status_code=422, detail=f"{key} is required.")
+        if len(value) > maximum:
+            raise HTTPException(status_code=422, detail=f"{key} is too long.")
+        if re.search(r"[<>]", value):
+            raise HTTPException(status_code=422, detail=f"{key} cannot contain HTML markup.")
+        return value or None
+
+    service_name = clean_text("service_name", 80, require_all)
+    category_key = clean_text("category_key", 80, require_all)
+    variant_name = clean_text("variant_name", 80)
+    description = clean_text("description", 500)
+
+    if service_name is not None and len(service_name) < 2:
+        raise HTTPException(status_code=422, detail="service_name must be at least 2 characters.")
+    if category_key is not None and not re.fullmatch(r"[a-z0-9_]+", category_key):
+        raise HTTPException(status_code=422, detail="category_key must use lowercase letters, numbers, and underscores only.")
+
+    aliases = cleaned.get("aliases")
+    if aliases is None:
+        aliases = []
+    if not isinstance(aliases, list):
+        raise HTTPException(status_code=422, detail="aliases must be a list.")
+    clean_aliases = []
+    for alias in aliases:
+        alias = str(alias or "").strip()
+        if not alias:
+            continue
+        if len(alias) > 60:
+            raise HTTPException(status_code=422, detail="Each alias must be 60 characters or fewer.")
+        if re.search(r"[<>]", alias):
+            raise HTTPException(status_code=422, detail="Aliases cannot contain HTML markup.")
+        if alias not in clean_aliases:
+            clean_aliases.append(alias)
+
+    requires_choice = cleaned.get("requires_duration_choice")
+    if require_all and not isinstance(requires_choice, bool):
+        raise HTTPException(status_code=422, detail="requires_duration_choice must be true or false.")
+    requires_choice = bool(requires_choice)
+
+    duration = cleaned.get("duration_minutes")
+    if not requires_choice and (not isinstance(duration, int) or not 5 <= duration <= 300):
+        raise HTTPException(status_code=422, detail="duration_minutes must be an integer between 5 and 300.")
+    if duration is not None and (not isinstance(duration, int) or not 5 <= duration <= 300):
+        raise HTTPException(status_code=422, detail="duration_minutes must be an integer between 5 and 300.")
+
+    price = cleaned.get("price_pence")
+    if not isinstance(price, int) or not 0 <= price <= 100000:
+        raise HTTPException(status_code=422, detail="price_pence must be an integer between 0 and 100000.")
+
+    sort_order = cleaned.get("sort_order", 0)
+    if not isinstance(sort_order, int) or not 0 <= sort_order <= 9999:
+        raise HTTPException(status_code=422, detail="sort_order must be an integer between 0 and 9999.")
+
+    is_active = cleaned.get("is_active", True)
+    if not isinstance(is_active, bool):
+        raise HTTPException(status_code=422, detail="is_active must be true or false.")
+
+    duration_prices = cleaned.get("duration_prices") or {}
+    if not isinstance(duration_prices, dict):
+        raise HTTPException(status_code=422, detail="duration_prices must be an object.")
+    clean_duration_prices = {}
+    for minutes, amount in duration_prices.items():
+        if not str(minutes).isdigit() or not 5 <= int(minutes) <= 300:
+            raise HTTPException(status_code=422, detail="Duration price keys must be minutes between 5 and 300.")
+        if not isinstance(amount, int) or not 0 <= amount <= 100000:
+            raise HTTPException(status_code=422, detail="Duration prices must be between 0 and 100000 pence.")
+        clean_duration_prices[str(int(minutes))] = amount
+
+    booking_mode = "choose_duration" if requires_choice else "fixed_duration"
+    allowed_durations = sorted(int(value) for value in clean_duration_prices)
+
+    return {
+        "business_slug": BUSINESS_SLUG,
+        "category_key": category_key,
+        "category": category_key,
+        "service_name": service_name,
+        "variant_name": variant_name,
+        "description": description,
+        "duration_minutes": duration,
+        "fixed_duration_minutes": None if requires_choice else duration,
+        "price_pence": price,
+        "is_active": is_active,
+        "aliases": clean_aliases,
+        "requires_duration_choice": requires_choice,
+        "booking_mode": booking_mode,
+        "sort_order": sort_order,
+        "display_order": sort_order,
+        "allowed_durations_minutes": allowed_durations if requires_choice else [duration],
+        "price_by_duration": clean_duration_prices if requires_choice else None,
+    }
+
+
+def invalidate_service_caches() -> None:
+    for name, value in globals().items():
+        if name.endswith("_SERVICE_CACHE") and isinstance(value, dict):
+            value["loaded_at"] = 0.0
+            value["rows"] = None
+
+
+def admin_service_response(row: dict) -> dict:
+    result = dict(row)
+    duration_prices = row.get("price_by_duration") or {}
+    fallback_price = next(iter(duration_prices.values()), None)
+    result["category_key"] = row.get("category_key") or row.get("category")
+    result["duration_minutes"] = row.get("duration_minutes") or row.get("fixed_duration_minutes")
+    result["requires_duration_choice"] = bool(
+        row.get("requires_duration_choice")
+        if row.get("requires_duration_choice") is not None
+        else row.get("booking_mode") == "choose_duration"
+    )
+    result["sort_order"] = row.get("sort_order") or row.get("display_order") or 0
+    result["duration_prices"] = duration_prices
+    result["price_pence"] = row.get("price_pence") if row.get("price_pence") is not None else fallback_price
+    result["display_price"] = format_price_pence(result["price_pence"])
+    return result
+
+
+@app.get("/admin/services")
+async def list_admin_services(request: Request):
+    require_authenticated_admin(request)
+    response = (
+        supabase.table("services")
+        .select("*")
+        .eq("business_slug", BUSINESS_SLUG)
+        .execute()
+    )
+    rows = sorted(
+        (admin_service_response(row) for row in response.data or []),
+        key=lambda row: (
+            str(row.get("category_key") or ""),
+            int(row.get("sort_order") or 0),
+            str(row.get("service_name") or ""),
+            str(row.get("variant_name") or ""),
+        ),
+    )
+    return {"services": rows}
+
+
+@app.post("/admin/services")
+async def create_admin_service(payload: AdminServicePayload, request: Request):
+    require_authenticated_admin(request)
+    values = payload.model_dump(exclude_unset=True)
+    cleaned = clean_admin_service_payload(values, require_all=True)
+    response = supabase.table("services").insert(cleaned).execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Service could not be created.")
+    invalidate_service_caches()
+    return {"service": admin_service_response(response.data[0])}
+
+
+@app.patch("/admin/services/{service_id}")
+async def update_admin_service(service_id: int, payload: AdminServicePayload, request: Request):
+    require_authenticated_admin(request)
+    existing = (
+        supabase.table("services")
+        .select("*")
+        .eq("business_slug", BUSINESS_SLUG)
+        .eq("id", service_id)
+        .limit(1)
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Service not found.")
+    current = admin_service_response(existing.data[0])
+    current.update(payload.model_dump(exclude_unset=True))
+    cleaned = clean_admin_service_payload(current, require_all=True)
+    response = (
+        supabase.table("services")
+        .update(cleaned)
+        .eq("business_slug", BUSINESS_SLUG)
+        .eq("id", service_id)
+        .execute()
+    )
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Service could not be updated.")
+    invalidate_service_caches()
+    return {"service": admin_service_response(response.data[0])}
+
+
+async def set_admin_service_active(service_id: int, active: bool, request: Request):
+    require_authenticated_admin(request)
+    response = (
+        supabase.table("services")
+        .update({"is_active": active})
+        .eq("business_slug", BUSINESS_SLUG)
+        .eq("id", service_id)
+        .execute()
+    )
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Service not found.")
+    invalidate_service_caches()
+    return {"service": admin_service_response(response.data[0])}
+
+
+@app.patch("/admin/services/{service_id}/deactivate")
+async def deactivate_admin_service(service_id: int, request: Request):
+    return await set_admin_service_active(service_id, False, request)
+
+
+@app.patch("/admin/services/{service_id}/activate")
+async def activate_admin_service(service_id: int, request: Request):
+    return await set_admin_service_active(service_id, True, request)
+
+
 def load_confirmation_context(booking_request_id: int) -> tuple[dict, dict, list[dict]]:
     request_response = (
         supabase.table("booking_requests")
@@ -9453,11 +9756,78 @@ def build_authoritative_services_context() -> str:
         format_live_microneedling_services_context()[0],
         format_live_facial_services_context()[0],
         format_live_dermal_filler_services_context()[0],
+        format_generic_active_services_context(),
     ]
 
     return "\n\n".join(
         block for block in blocks if block
     )
+
+
+def format_generic_active_services_context() -> str:
+    """Include valid active owner-edited services, including new categories."""
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "service_name, category, booking_mode, fixed_duration_minutes, "
+                "allowed_durations_minutes, price_pence, price_by_duration, is_active"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("is_active", True)
+            .execute()
+        )
+    except Exception as error:
+        print(f"Could not load generic active services context: {error}")
+        return ""
+
+    lines = ["All active owner-edited services (authoritative):"]
+
+    for row in response.data or []:
+        name = str(row.get("service_name") or "").strip()
+        mode = row.get("booking_mode")
+        fixed = row.get("fixed_duration_minutes")
+        allowed = row.get("allowed_durations_minutes") or []
+
+        if not 2 <= len(name) <= 80:
+            print("Skipped invalid active service row: invalid service_name")
+            continue
+
+        if mode == "choose_duration":
+            durations = [
+                int(value) for value in allowed
+                if str(value).isdigit() and 5 <= int(value) <= 300
+            ]
+            if not durations:
+                print(f"Skipped invalid active service row: {name}")
+                continue
+            duration_text = format_duration_options(set(durations))
+            prices = row.get("price_by_duration") or {}
+            price_text = ", ".join(
+                f"{minutes} minutes {format_price_pence(prices.get(str(minutes)))}"
+                for minutes in durations
+                if prices.get(str(minutes)) not in [None, ""]
+            )
+        else:
+            if fixed in [None, ""] or not 5 <= int(fixed) <= 300:
+                print(f"Skipped invalid active service row: {name}")
+                continue
+            duration_text = format_minutes_as_duration(int(fixed))
+            price_text = format_price_pence(row.get("price_pence")) or ""
+
+        lines.append(
+            f"- {name} [{row.get('category') or 'other'}]: "
+            f"{duration_text}; {price_text}".rstrip("; ")
+        )
+
+    if len(lines) == 1:
+        return (
+            "No valid active owner-edited services are currently available. "
+            "Do not invent or recommend a service; apologise and ask the "
+            "customer to contact the business."
+        )
+
+    return "\n".join(lines)
 
 
 def migrated_structured_service_catalogue() -> list[dict]:

@@ -498,6 +498,12 @@
             font-weight: 700;
         }
 
+        .history-summary {
+            margin: 8px 0 0;
+            color: var(--muted);
+            font-size: 0.88rem;
+        }
+
         .history-list {
             display: grid;
             gap: 10px;
@@ -699,7 +705,47 @@
             color: var(--text);
         }
 
-        @media (max-width: 760px) {
+        .service-toolbar,
+        .service-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .service-toolbar input { max-width: 320px; }
+        .service-toolbar select { max-width: 190px; }
+        .service-groups { display: grid; gap: 10px; margin-top: 14px; }
+        .service-group {
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 0 12px 12px;
+        }
+        .service-group summary { cursor: pointer; padding: 12px 0; font-weight: 700; }
+        .service-card {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            padding: 12px 0;
+            border-top: 1px solid var(--border);
+        }
+        .service-card.inactive { opacity: 0.65; }
+        .service-card label { margin: 0; font-size: 0.78rem; color: var(--muted); }
+        .service-card input,
+        .service-card textarea,
+        .service-card select { margin-top: 5px; width: 100%; }
+        .service-card textarea {
+            min-height: 76px;
+            resize: vertical;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            font: inherit;
+        }
+        .service-wide { grid-column: 1 / -1; }
+        .service-message { min-height: 1em; color: var(--muted); }
+
+        @media (max-width: 700px) {
             header {
                 align-items: flex-start;
                 flex-direction: column;
@@ -714,7 +760,7 @@
             }
 
             .lead-summary-grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
+                grid-template-columns: 1fr;
             }
 
             .hours-row {
@@ -728,6 +774,26 @@
             }
 
             main { padding: 12px; }
+            .header-actions,
+            .settings-actions,
+            .service-toolbar,
+            .service-actions,
+            .request-actions,
+            .deposit-controls,
+            .note-actions { width: 100%; flex-direction: column; align-items: stretch; }
+            button, .primary-button, .secondary-button, .small-button { min-height: 42px; }
+            .modal-backdrop { padding: 0; place-items: stretch; }
+            .modal { width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
+            .modal-header { padding: 14px; }
+            .close-button { min-width: 44px; min-height: 44px; }
+            .modal-body { padding: 12px; }
+            .request-header { flex-direction: column; }
+            .deposit-amount-input { width: 100%; }
+            .message { max-width: 94%; overflow-wrap: anywhere; }
+            .service-card { grid-template-columns: 1fr; }
+            .service-wide { grid-column: auto; }
+            .service-toolbar input, .service-toolbar select { max-width: none; }
+            .table-toolbar, .pagination-bar { align-items: stretch; flex-direction: column; }
         }
     </style>
 </head>
@@ -842,6 +908,22 @@
                     </button>
                     <span id="hours-message" class="settings-message"></span>
                 </div>
+            </div>
+
+            <div class="settings-card">
+                <h2>Services &amp; Prices</h2>
+                <p>Owner test editor. Changes are validated by the backend and used by the chatbot.</p>
+                <div class="service-toolbar">
+                    <input id="service-search" type="search" placeholder="Search services or categories">
+                    <select id="service-active-filter">
+                        <option value="all">Active and inactive</option>
+                        <option value="active">Active only</option>
+                        <option value="inactive">Inactive only</option>
+                    </select>
+                    <button id="add-service-button" class="secondary-button" type="button">Add service</button>
+                    <span id="services-message" class="service-message"></span>
+                </div>
+                <div id="service-groups" class="service-groups"></div>
             </div>
 
             <div class="table-card">
@@ -963,8 +1045,9 @@
                     </div>
                 </section>
                 <section class="detail-section">
-                    <details class="history-details" open>
-                        <summary>Customer history</summary>
+                    <details id="customer-history-details" class="history-details">
+                        <summary>View full customer history</summary>
+                        <p id="customer-history-summary" class="history-summary"></p>
                         <div id="customer-history" class="history-list"></div>
                     </details>
                 </section>
@@ -1005,6 +1088,11 @@
         const hoursList = document.getElementById("hours-list");
         const saveHoursButton = document.getElementById("save-hours-button");
         const hoursMessage = document.getElementById("hours-message");
+        const serviceSearch = document.getElementById("service-search");
+        const serviceActiveFilter = document.getElementById("service-active-filter");
+        const addServiceButton = document.getElementById("add-service-button");
+        const servicesMessage = document.getElementById("services-message");
+        const serviceGroups = document.getElementById("service-groups");
         const aiStatusFilter = document.getElementById("ai-status-filter");
         const ownerStatusFilter = document.getElementById("owner-status-filter");
         const sourceFilter = document.getElementById("source-filter");
@@ -1024,6 +1112,8 @@
         const saveInternalNoteButton = document.getElementById("save-internal-note-button");
         const internalNoteMessage = document.getElementById("internal-note-message");
         const customerHistory = document.getElementById("customer-history");
+        const customerHistoryDetails = document.getElementById("customer-history-details");
+        const customerHistorySummary = document.getElementById("customer-history-summary");
 
         const WEEKDAY_NAMES = [
             "Monday",
@@ -1045,6 +1135,8 @@
         let pendingActionsBySession = new Map();
         let channelContactsById = new Map();
         let openLeadSessionId = null;
+        let adminServices = [];
+        let historyLoadedForSession = null;
 
         function showLogin() {
             loginPage.classList.remove("hidden");
@@ -1058,6 +1150,176 @@
 
         function safeText(value, fallback = "—") {
             return value ? String(value) : fallback;
+        }
+
+        async function adminApi(path, options = {}) {
+            const { data: { session } } = await supabaseClient.auth.getSession();
+            if (!session?.access_token) throw new Error("Your admin session has expired.");
+            const response = await fetch(`${BACKEND_API_BASE_URL}${path}`, {
+                ...options,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${session.access_token}`,
+                    ...(options.headers || {})
+                }
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(result?.detail || "Request failed.");
+            return result;
+        }
+
+        function poundsToPence(value) {
+            const cleaned = String(value ?? "").trim();
+            if (!/^\d+(?:\.\d{1,2})?$/.test(cleaned)) throw new Error("Price must be a non-negative number.");
+            return Math.round(Number(cleaned) * 100);
+        }
+
+        function durationPricesFromText(value) {
+            const result = {};
+            for (const line of String(value || "").split(/\n+/)) {
+                if (!line.trim()) continue;
+                const match = line.trim().match(/^(\d{1,3})\s*:\s*(\d+(?:\.\d{1,2})?)$/);
+                if (!match) throw new Error("Use duration prices like 60:55, one per line.");
+                result[String(Number(match[1]))] = poundsToPence(match[2]);
+            }
+            return result;
+        }
+
+        function serviceControl(labelText, field, value, type = "text") {
+            const label = document.createElement("label");
+            label.textContent = labelText;
+            const input = type === "textarea" ? document.createElement("textarea") : document.createElement("input");
+            if (type !== "textarea") input.type = type;
+            input.dataset.field = field;
+            if (type === "checkbox") input.checked = Boolean(value);
+            else input.value = value ?? "";
+            if (type === "number") input.min = "0";
+            label.appendChild(input);
+            return label;
+        }
+
+        function durationPricesText(service) {
+            return Object.entries(service.duration_prices || {})
+                .sort((a, b) => Number(a[0]) - Number(b[0]))
+                .map(([minutes, pence]) => `${minutes}:${(Number(pence) / 100).toFixed(2)}`)
+                .join("\n");
+        }
+
+        function servicePayload(card) {
+            const get = (field) => card.querySelector(`[data-field="${field}"]`);
+            const requiresChoice = get("requires_duration_choice").checked;
+            const durationPrices = durationPricesFromText(get("duration_prices").value);
+            if (requiresChoice && !Object.keys(durationPrices).length) throw new Error("Add at least one selectable duration price.");
+            return {
+                category_key: get("category_key").value.trim(),
+                service_name: get("service_name").value.trim(),
+                variant_name: get("variant_name").value.trim() || null,
+                description: get("description").value.trim() || null,
+                duration_minutes: requiresChoice ? null : Number(get("duration_minutes").value),
+                price_pence: requiresChoice ? Object.values(durationPrices)[0] : poundsToPence(get("price").value),
+                aliases: get("aliases").value.split(",").map((item) => item.trim()).filter(Boolean),
+                requires_duration_choice: requiresChoice,
+                sort_order: Number(get("sort_order").value || 0),
+                is_active: card.dataset.active !== "false",
+                duration_prices: durationPrices
+            };
+        }
+
+        function renderServiceCard(service, isNew = false) {
+            const card = document.createElement("article");
+            card.className = `service-card${service.is_active === false ? " inactive" : ""}`;
+            card.dataset.active = service.is_active === false ? "false" : "true";
+            const fields = [
+                ["Category key", "category_key", service.category_key],
+                ["Service name", "service_name", service.service_name],
+                ["Variant name", "variant_name", service.variant_name],
+                ["Sort order", "sort_order", service.sort_order || 0, "number"],
+                ["Fixed duration (minutes)", "duration_minutes", service.duration_minutes, "number"],
+                ["Fixed price (£)", "price", service.price_pence == null ? "" : (Number(service.price_pence) / 100).toFixed(2), "number"],
+                ["Aliases, comma separated", "aliases", (service.aliases || []).join(", ")]
+            ];
+            fields.forEach(([label, field, value, type]) => card.appendChild(serviceControl(label, field, value, type)));
+            card.appendChild(serviceControl("Customer chooses duration", "requires_duration_choice", service.requires_duration_choice, "checkbox"));
+            const description = serviceControl("Description", "description", service.description, "textarea");
+            const prices = serviceControl("Selectable prices, minutes:pounds", "duration_prices", durationPricesText(service), "textarea");
+            description.className = prices.className = "service-wide";
+            card.append(description, prices);
+
+            const actions = document.createElement("div");
+            actions.className = "service-actions service-wide";
+            const save = document.createElement("button");
+            save.type = "button";
+            save.className = "small-button";
+            save.textContent = isNew ? "Create service" : "Save changes";
+            const toggle = document.createElement("button");
+            toggle.type = "button";
+            toggle.className = service.is_active === false ? "secondary-button" : "danger-button";
+            toggle.textContent = service.is_active === false ? "Activate" : "Deactivate";
+            const message = document.createElement("span");
+            message.className = "service-message";
+            save.addEventListener("click", async () => {
+                save.disabled = true;
+                try {
+                    await adminApi(isNew ? "/admin/services" : `/admin/services/${service.id}`, {
+                        method: isNew ? "POST" : "PATCH",
+                        body: JSON.stringify(servicePayload(card))
+                    });
+                    await loadAdminServices();
+                } catch (error) {
+                    message.textContent = `Failed to save: ${error.message}`;
+                } finally {
+                    save.disabled = false;
+                }
+            });
+            toggle.addEventListener("click", async () => {
+                const activate = service.is_active === false;
+                if (!activate && !confirm(`Deactivate ${service.service_name}?`)) return;
+                try {
+                    await adminApi(`/admin/services/${service.id}/${activate ? "activate" : "deactivate"}`, { method: "PATCH" });
+                    await loadAdminServices();
+                } catch (error) {
+                    message.textContent = error.message;
+                }
+            });
+            actions.append(save);
+            if (!isNew) actions.append(toggle);
+            actions.append(message);
+            card.appendChild(actions);
+            return card;
+        }
+
+        function renderAdminServices() {
+            serviceGroups.innerHTML = "";
+            const query = serviceSearch.value.trim().toLowerCase();
+            const active = serviceActiveFilter.value;
+            const visible = adminServices.filter((service) =>
+                (!query || `${service.category_key} ${service.service_name} ${service.variant_name || ""}`.toLowerCase().includes(query))
+                && (active === "all" || (active === "active") === Boolean(service.is_active))
+            );
+            const grouped = groupRows(visible, "category_key");
+            for (const [category, services] of grouped.entries()) {
+                const details = document.createElement("details");
+                details.className = "service-group";
+                details.open = Boolean(query);
+                const summary = document.createElement("summary");
+                summary.textContent = `${category || "other"} (${services.length})`;
+                details.appendChild(summary);
+                services.forEach((service) => details.appendChild(renderServiceCard(service)));
+                serviceGroups.appendChild(details);
+            }
+            if (!visible.length) serviceGroups.textContent = "No services match this filter.";
+        }
+
+        async function loadAdminServices() {
+            servicesMessage.textContent = "Loading services...";
+            try {
+                const result = await adminApi("/admin/services");
+                adminServices = result.services || [];
+                renderAdminServices();
+                servicesMessage.textContent = `${adminServices.length} services loaded`;
+            } catch (error) {
+                servicesMessage.textContent = `Could not load services: ${error.message}`;
+            }
         }
 
         function plainTranscriptText(value) {
@@ -2402,6 +2664,7 @@
             }
 
             if (!previousConversations.length) {
+                customerHistorySummary.textContent = "No previous conversations or confirmed appointments.";
                 customerHistory.textContent =
                     "No previous enquiries found for this customer.";
                 return;
@@ -2416,7 +2679,17 @@
                 "booking_request_id"
             );
 
-            for (const conversation of previousConversations) {
+            const confirmedCount = historyRequests.filter(
+                (request) => request.request_status === "confirmed"
+            ).length;
+            const latestRequest = historyRequests[0] || {};
+            const latestItems = itemsByRequest.get(String(latestRequest.id)) || [];
+            customerHistorySummary.textContent =
+                `${previousConversations.length} previous conversations · ${confirmedCount} confirmed appointments`
+                + (latestRequest.preferred_date ? ` · Latest: ${formatRequestedSlot(latestRequest.preferred_date, latestRequest.preferred_time)}` : "")
+                + (latestItems[0]?.service_name ? ` · ${latestItems[0].service_name}` : "");
+
+            for (const conversation of previousConversations.slice(0, 5)) {
                 const requests = requestsBySession.get(
                     String(conversation.session_id)
                 ) || [];
@@ -2467,6 +2740,13 @@
 
                 customerHistory.appendChild(card);
             }
+
+            if (previousConversations.length > 5) {
+                const more = document.createElement("p");
+                more.className = "muted";
+                more.textContent = "Showing the latest 5 history items.";
+                customerHistory.appendChild(more);
+            }
         }
 
         async function loadCustomerHistory(lead) {
@@ -2476,13 +2756,15 @@
             }
 
             customerHistory.textContent = "Loading customer history...";
+            customerHistorySummary.textContent = "Loading compact history...";
 
             const conversationResult = await supabaseClient
                 .from("conversations")
                 .select("session_id, source, status, treatment, internal_notes, created_at, updated_at")
                 .eq("channel_contact_id", lead.channel_contact_id)
                 .neq("session_id", lead.session_id)
-                .order("updated_at", { ascending: false });
+                .order("updated_at", { ascending: false })
+                .limit(6);
 
             if (conversationResult.error) {
                 customerHistory.textContent =
@@ -2544,7 +2826,10 @@
             modalTitle.textContent = "Lead details";
             leadOverview.innerHTML = "<p>Loading appointment requests...</p>";
             transcript.innerHTML = "<p>Loading transcript...</p>";
-            customerHistory.textContent = "Loading customer history...";
+            customerHistory.textContent = "";
+            customerHistorySummary.textContent = "Loading compact history...";
+            customerHistoryDetails.open = false;
+            historyLoadedForSession = sessionId;
             internalNoteMessage.textContent = "";
             modalBackdrop.classList.remove("hidden");
 
@@ -2645,7 +2930,8 @@
             await Promise.all([
                 loadLeads(),
                 loadChatbotSettings(),
-                loadBusinessHours()
+                loadBusinessHours(),
+                loadAdminServices()
             ]);
         });
 
@@ -2653,13 +2939,41 @@
             await Promise.all([
                 loadLeads(),
                 loadChatbotSettings(),
-                loadBusinessHours()
+                loadBusinessHours(),
+                loadAdminServices()
             ]);
         });
 
         saveSettingsButton.addEventListener("click", saveChatbotSettings);
         saveHoursButton.addEventListener("click", saveBusinessHours);
         saveInternalNoteButton.addEventListener("click", saveInternalNote);
+        serviceSearch.addEventListener("input", renderAdminServices);
+        serviceActiveFilter.addEventListener("change", renderAdminServices);
+        addServiceButton.addEventListener("click", () => {
+            const details = document.createElement("details");
+            details.className = "service-group";
+            details.open = true;
+            const summary = document.createElement("summary");
+            summary.textContent = "New service";
+            details.append(summary, renderServiceCard({
+                category_key: "other",
+                service_name: "",
+                aliases: [],
+                duration_minutes: 60,
+                price_pence: 0,
+                requires_duration_choice: false,
+                sort_order: 0,
+                is_active: true,
+                duration_prices: {}
+            }, true));
+            serviceGroups.prepend(details);
+        });
+        customerHistoryDetails.addEventListener("toggle", async () => {
+            if (!customerHistoryDetails.open || !openLeadSessionId || historyLoadedForSession === openLeadSessionId) return;
+            historyLoadedForSession = openLeadSessionId;
+            const lead = allLeads.find((item) => item.session_id === openLeadSessionId) || {};
+            await loadCustomerHistory(lead);
+        });
 
         aiStatusFilter.addEventListener("change", () => applyFilters());
         ownerStatusFilter.addEventListener("change", () => applyFilters());
@@ -2721,7 +3035,8 @@
             await Promise.all([
                 loadLeads(),
                 loadChatbotSettings(),
-                loadBusinessHours()
+                loadBusinessHours(),
+                loadAdminServices()
             ]);
         } else {
             showLogin();

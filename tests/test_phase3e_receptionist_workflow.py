@@ -421,6 +421,78 @@ class Phase3ERemainingWorkflowTests(unittest.TestCase):
                     price,
                 )
 
+    def test_owner_service_editor_validation_rejects_bad_input(self):
+        valid = {
+            "category_key": "massage",
+            "service_name": "Swedish Massage",
+            "duration_minutes": 60,
+            "price_pence": 5500,
+            "is_active": True,
+            "aliases": ["swedish"],
+            "requires_duration_choice": False,
+            "sort_order": 10,
+        }
+        invalid_cases = [
+            {**valid, "price_pence": -1},
+            {**valid, "service_name": ""},
+            {**valid, "duration_minutes": 999999},
+            {**valid, "service_name": "<script>alert(1)</script>"},
+            {**valid, "category_key": "Not Safe"},
+        ]
+
+        for payload in invalid_cases:
+            with self.subTest(payload=payload), self.assertRaises(
+                self.chatbot.HTTPException
+            ):
+                self.chatbot.clean_admin_service_payload(payload)
+
+    def test_owner_service_editor_maps_selectable_duration_prices(self):
+        cleaned = self.chatbot.clean_admin_service_payload({
+            "category_key": "massage",
+            "service_name": "Swedish Massage",
+            "duration_minutes": None,
+            "price_pence": 3500,
+            "is_active": True,
+            "aliases": ["swedish"],
+            "requires_duration_choice": True,
+            "sort_order": 10,
+            "duration_prices": {"30": 3500, "60": 5500, "90": 7500},
+        })
+
+        self.assertEqual(cleaned["booking_mode"], "choose_duration")
+        self.assertEqual(cleaned["allowed_durations_minutes"], [30, 60, 90])
+        self.assertEqual(cleaned["price_by_duration"]["60"], 5500)
+
+    def test_successful_empty_active_service_query_does_not_restore_fallbacks(self):
+        class EmptyResponse:
+            data = []
+
+        class EmptyQuery:
+            def select(self, *args, **kwargs):
+                return self
+
+            def eq(self, *args, **kwargs):
+                return self
+
+            def order(self, *args, **kwargs):
+                return self
+
+            def execute(self):
+                return EmptyResponse()
+
+        class EmptySupabase:
+            def table(self, name):
+                return EmptyQuery()
+
+        self.chatbot._MASSAGE_SERVICE_CACHE["rows"] = None
+        self.chatbot._MASSAGE_SERVICE_CACHE["loaded_at"] = 0
+
+        with patch.object(self.chatbot, "supabase", EmptySupabase()):
+            services, from_supabase = self.chatbot.load_massage_services()
+
+        self.assertTrue(from_supabase)
+        self.assertEqual(services, [])
+
     def test_duration_validation_uses_generic_service_metadata(self):
         with patch.object(
             self.chatbot,
