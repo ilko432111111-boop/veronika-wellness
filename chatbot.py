@@ -1058,56 +1058,48 @@ def explicit_duration_minutes_from_reply(
     message asked how long the treatment should be and the number matches one
     of the configured durations for that treatment.
     """
-    direct = parse_duration_minutes(
-        latest_message
+    return duration_reply_resolution(
+        latest_message,
+        previous_assistant_message,
+        treatment,
+    ).get("minutes")
+
+
+def duration_reply_resolution(
+    latest_message: str,
+    previous_assistant_message: str = "",
+    treatment: str | None = None,
+) -> dict:
+    """Resolve the newest duration reply without guessing between choices."""
+    lower_previous = str(previous_assistant_message or "").lower()
+    allowed = allowed_durations_for_treatment(treatment)
+    duration_was_requested = (
+        "how long" in lower_previous
+        or "duration" in lower_previous
+    )
+    bare_options = allowed if allowed and (
+        duration_was_requested or len(allowed) > 1
+    ) else None
+    candidates = duration_candidates_from_text(
+        latest_message,
+        allowed_bare_minutes=bare_options,
+    )
+    valid_candidates = (
+        candidates & allowed
+        if allowed
+        else candidates
     )
 
-    if direct is not None:
-        return direct
-
-    word_hour_match = re.search(
-        r"\b(?:an|one|two)\s+hours?\b",
-        str(latest_message or "").lower(),
-    )
-
-    if word_hour_match:
-        word_hour_minutes = (
-            120
-            if word_hour_match.group(0).startswith("two")
-            else 60
-        )
-        allowed = allowed_durations_for_treatment(treatment)
-
-        if not allowed or word_hour_minutes in allowed:
-            return word_hour_minutes
-
-    lower_previous = str(
-        previous_assistant_message or ""
-    ).lower()
-
-    if (
-        "how long" not in lower_previous
-        and "duration" not in lower_previous
-    ):
-        return None
-
-    allowed = allowed_durations_for_treatment(
-        treatment
-    )
-
-    if not allowed:
-        allowed = {30, 45, 60, 75, 90, 105, 120}
-
-    for match in re.finditer(
-        r"(?<!\d)(\d{1,3})(?!\d)",
-        str(latest_message or ""),
-    ):
-        value = int(match.group(1))
-
-        if value in allowed:
-            return value
-
-    return None
+    return {
+        "minutes": (
+            next(iter(valid_candidates))
+            if len(valid_candidates) == 1 and len(candidates) == 1
+            else None
+        ),
+        "ambiguous": len(candidates) > 1,
+        "candidates": sorted(candidates),
+        "explicit_invalid": len(candidates) == 1 and not valid_candidates,
+    }
 
 
 def message_looks_like_schedule_input(
@@ -5074,11 +5066,16 @@ def save_conversation_overview(
     source: str = "website",
 ) -> bool:
     try:
+        persisted_lead_data = {
+            key: value
+            for key, value in lead_data.items()
+            if not str(key).startswith("_")
+        }
         payload = {
             "session_id": session_id,
             "source": normalise_source(source),
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            **lead_data,
+            **persisted_lead_data,
         }
 
         supabase.table("conversations").upsert(
@@ -5943,56 +5940,92 @@ def load_business_hours() -> dict:
 
 
 def parse_duration_minutes(value: str | None) -> int | None:
-    if value in [None, ""]:
-        return None
+    candidates = duration_candidates_from_text(value)
 
-    cleaned = str(value).strip().lower()
-    total_minutes = 0
-
-    if re.search(r"\bhalf\s+(?:an?|one)\s+hour\b", cleaned):
-        total_minutes += 30
-        cleaned = re.sub(
-            r"\bhalf\s+(?:an?|one)\s+hour\b",
-            "",
-            cleaned,
-            count=1,
-        )
-
-    hours_match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(?:hour|hours|hr|hrs)\b",
-        cleaned,
-    )
-
-    word_hours_match = re.search(
-        r"\b(an|one|two)\s+hours?\b",
-        cleaned,
-    )
-
-    minutes_match = re.search(
-        r"(\d+)\s*(?:minute|minutes|min|mins)\b",
-        cleaned,
-    )
-
-    if hours_match:
-        total_minutes += round(float(hours_match.group(1)) * 60)
-
-    if word_hours_match:
-        total_minutes += (
-            120
-            if word_hours_match.group(1) == "two"
-            else 60
-        )
-
-    if minutes_match:
-        total_minutes += int(minutes_match.group(1))
-
-    if total_minutes > 0:
-        return total_minutes
-
-    if re.fullmatch(r"\d+", cleaned):
-        return int(cleaned)
+    if len(candidates) == 1:
+        return next(iter(candidates))
 
     return None
+
+
+def duration_candidates_from_text(
+    value: str | None,
+    allowed_bare_minutes: set[int] | None = None,
+) -> set[int]:
+    """Return every explicit duration in text; multiple values stay ambiguous."""
+    if value in [None, ""]:
+        return set()
+
+    cleaned = str(value).strip().lower()
+    candidates: set[int] = set()
+    occupied: list[tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(start < used_end and end > used_start for used_start, used_end in occupied)
+
+    def add(minutes: int, match: re.Match) -> None:
+        if minutes > 0:
+            candidates.add(minutes)
+            occupied.append(match.span())
+
+    for match in re.finditer(
+        r"\b(?:either\s+)?(\d{1,3})\s*(?:or|/)\s*(\d{1,3})"
+        r"\s*(?:minutes?|mins?|min|hours?|hrs?|hr|h)?\b",
+        cleaned,
+    ):
+        candidates.update({int(match.group(1)), int(match.group(2))})
+        occupied.append(match.span())
+
+    for pattern, minutes in [
+        (r"\bhour\s+and\s+a\s+half\b", 90),
+        (r"\bhalf\s+(?:an?|one)\s+hour\b", 30),
+    ]:
+        for match in re.finditer(pattern, cleaned):
+            if not overlaps(*match.span()):
+                add(minutes, match)
+
+    hour_pattern = re.compile(
+        r"\b(?P<hours>\d+(?:\.\d+)?|an?|one|two)[\s-]*"
+        r"(?:hours?|hrs?|hr|h)(?![a-z])"
+        r"(?:\s*(?:and\s+)?(?P<minutes>\d{1,2})"
+        r"\s*(?:minutes?|mins?|min|m)?\b)?"
+    )
+    for match in hour_pattern.finditer(cleaned):
+        if overlaps(*match.span()):
+            continue
+
+        hours_value = match.group("hours")
+        hours = (
+            2.0
+            if hours_value == "two"
+            else 1.0
+            if hours_value in {"a", "an", "one"}
+            else float(hours_value)
+        )
+        add(round(hours * 60) + int(match.group("minutes") or 0), match)
+
+    for match in re.finditer(
+        r"(?<![\d:])(\d{1,3})[\s-]*(?:minutes?|mins?|min)\b",
+        cleaned,
+    ):
+        if not overlaps(*match.span()):
+            add(int(match.group(1)), match)
+
+    for match in re.finditer(r"\bhour\b", cleaned):
+        if not overlaps(*match.span()):
+            add(60, match)
+
+    if re.fullmatch(r"\d{1,3}", cleaned):
+        candidates.add(int(cleaned))
+
+    if allowed_bare_minutes:
+        for match in re.finditer(r"(?<![\d:£$])(\d{1,3})(?![\d:])", cleaned):
+            value_minutes = int(match.group(1))
+
+            if value_minutes in allowed_bare_minutes and not overlaps(*match.span()):
+                candidates.add(value_minutes)
+
+    return candidates
 
 
 def build_requested_slot(lead_data: dict):
@@ -9947,12 +9980,6 @@ def apply_validated_state_patch(
     )
     # Duration is a calendar-critical field. Accept it only when the newest
     # customer message explicitly supplies it; never trust an extractor guess.
-    parsed_duration = explicit_duration_minutes_from_reply(
-        latest_message,
-        previous_assistant_message=latest_assistant_reply(history),
-        treatment=result.get("treatment"),
-    )
-
     if parsed_date:
         result["preferred_date"] = parsed_date
 
@@ -9988,6 +10015,16 @@ def apply_validated_state_patch(
         result,
         latest_message,
     )
+    duration_resolution = duration_reply_resolution(
+        latest_message,
+        previous_assistant_message=latest_assistant_reply(history),
+        treatment=result.get("treatment"),
+    )
+    parsed_duration = duration_resolution.get("minutes")
+    extractor_result["duration_resolution"] = duration_resolution
+
+    if duration_resolution.get("ambiguous"):
+        result["_duration_ambiguous"] = True
 
     if parsed_duration is not None:
         candidate_duration = format_minutes_as_duration(
@@ -10001,6 +10038,8 @@ def apply_validated_state_patch(
             result["duration"] = candidate_duration
         else:
             result["duration"] = None
+    elif duration_resolution.get("explicit_invalid"):
+        result["duration"] = None
 
     if (
         previous_treatment
@@ -10033,11 +10072,12 @@ def apply_validated_state_patch(
             compact_recent_history(history),
             latest_message,
         )
-    result = recover_duration_from_customer_history(
-        result,
-        compact_recent_history(history),
-        latest_message,
-    )
+    if not result.get("_duration_ambiguous"):
+        result = recover_duration_from_customer_history(
+            result,
+            compact_recent_history(history),
+            latest_message,
+        )
 
     return result
 
@@ -10086,7 +10126,7 @@ def compute_next_required_detail(
     ):
         return "service_variant"
 
-    if state.get("duration") in [None, ""]:
+    if state.get("_duration_ambiguous") or state.get("duration") in [None, ""]:
         return "duration"
 
     if state.get("preferred_date") in [None, ""]:
@@ -10300,6 +10340,8 @@ def verified_calendar_result_for_state(
     )
 
     if (
+        state.get("_duration_ambiguous")
+        or
         state.get("treatment") in [None, ""]
         or state.get("preferred_date") in [None, ""]
         or state.get("preferred_time") in [None, ""]
@@ -10563,6 +10605,7 @@ Write a short, warm and natural reply to the customer's newest message.
 
 IMPORTANT LOCKED RULES:
 - The saved state below is authoritative.
+- Mention a duration only when it exactly matches the duration in saved state.
 - Never mention, paraphrase, invent, or calculate availability, calendar results, dates, weekdays, times, or slots.
 - Never echo or acknowledge the customer's raw date or time wording. Python validates and writes all customer-facing schedule wording.
 - Never mention handoff, contacting Veronika, confirmation, review, follow-up, or passing the request on. Python will append final handoff wording if eligible.
@@ -10932,6 +10975,9 @@ def compose_verified_customer_reply(
     if schedule_clarification:
         return schedule_clarification
 
+    if state.get("_duration_ambiguous"):
+        return render_next_question(state, "duration")
+
     booking_flow_active = (
         state.get("conversation_mode") == "booking_request"
         or next_required_detail is not None
@@ -10991,8 +11037,11 @@ def compose_verified_customer_reply(
         )
         parts.append(alternative_reply)
 
-        return collapse_repeated_reply_content(
-            "\n\n".join(parts)
+        return enforce_response_duration_consistency(
+            collapse_repeated_reply_content(
+                "\n\n".join(parts)
+            ),
+            state,
         )
 
     if customer_asks_if_booked(latest_message):
@@ -11113,11 +11162,73 @@ def compose_verified_customer_reply(
         else:
             parts.append("Thanks.")
 
-    return strip_customer_markdown(
-        collapse_repeated_reply_content(
-            "\n\n".join(parts)
-        )
+    return enforce_response_duration_consistency(
+        strip_customer_markdown(
+            collapse_repeated_reply_content(
+                "\n\n".join(parts)
+            )
+        ),
+        state,
     )
+
+
+def enforce_response_duration_consistency(reply: str, state: dict) -> str:
+    """Remove model wording that contradicts canonical duration-linked state."""
+    canonical_minutes = parse_duration_minutes(state.get("duration"))
+
+    if not canonical_minutes:
+        return reply
+
+    metadata = authoritative_service_metadata(state.get("treatment"))
+    canonical_price_pence = simple_request_price_pence(
+        metadata,
+        canonical_minutes,
+    )
+    safe_sentences = []
+    conflict_found = False
+
+    for sentence in split_customer_sentences(reply):
+        mentioned = duration_candidates_from_text(sentence)
+        mentioned_prices = response_price_pence_values(sentence)
+
+        if (
+            len(mentioned) == 1
+            and canonical_minutes not in mentioned
+        ) or (
+            canonical_price_pence is not None
+            and len(mentioned) <= 1
+            and mentioned_prices
+            and mentioned_prices != {canonical_price_pence}
+        ):
+            conflict_found = True
+            continue
+
+        safe_sentences.append(sentence)
+
+    if not conflict_found:
+        return reply
+
+    safe_sentences.insert(
+        0,
+        f"I've noted the {format_minutes_as_duration(canonical_minutes)} duration.",
+    )
+    return collapse_repeated_reply_content(" ".join(safe_sentences))
+
+
+def response_price_pence_values(value: str) -> set[int]:
+    """Extract explicit customer-visible pound prices from response text."""
+    prices = set()
+
+    for match in re.finditer(
+        r"(?:£|Â£)\s*(\d+(?:\.\d{1,2})?)"
+        r"|\b(\d+(?:\.\d{1,2})?)\s+pounds?\b",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    ):
+        amount = match.group(1) or match.group(2)
+        prices.add(round(float(amount) * 100))
+
+    return prices
 
 
 def add_manual_multi_treatment_note(
@@ -11238,6 +11349,10 @@ def sync_simple_single_request_projection(
     """
     if not booking_flow_active:
         print("projection_skipped_inactive_booking_flow")
+        return False
+
+    if state.get("_duration_ambiguous"):
+        print("projection_skipped_ambiguous_duration")
         return False
 
     metadata = authoritative_service_metadata(

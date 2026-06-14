@@ -200,6 +200,11 @@ class Phase3ERemainingWorkflowTests(unittest.TestCase):
             "one hour": 60,
             "half an hour": 30,
             "1.5 hours": 90,
+            "1 hour 30": 90,
+            "1h30": 90,
+            "1 hr 30 min": 90,
+            "hour and a half": 90,
+            "hour": 60,
         }
 
         for value, expected in cases.items():
@@ -207,6 +212,145 @@ class Phase3ERemainingWorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     self.chatbot.parse_duration_minutes(value),
                     expected,
+                )
+
+    def test_soft_duration_reply_replaces_stale_massage_duration(self):
+        history = [
+            self.chatbot.ChatMessage(
+                role="assistant",
+                content="How long would you like the session for: 30, 60, 90, or 120 minutes?",
+            ),
+        ]
+
+        with patch.object(
+            self.chatbot,
+            "apply_structured_service_resolution",
+            side_effect=lambda state, message: state,
+        ), patch.object(
+            self.chatbot,
+            "hydrate_configured_service_defaults",
+            side_effect=lambda state: state,
+        ), patch.object(
+            self.chatbot,
+            "allowed_durations_for_treatment",
+            return_value={30, 60, 90, 120},
+        ):
+            for message in [
+                "60 minutes possibly",
+                "60mins",
+                "1 hour",
+                "one hour",
+            ]:
+                with self.subTest(message=message):
+                    state = self.chatbot.apply_validated_state_patch(
+                        existing_state={
+                            "treatment": "Swedish Massage",
+                            "duration": "1 hour 30 minutes",
+                        },
+                        extractor_result=self.chatbot.empty_extractor_result(),
+                        latest_message=message,
+                        history=history,
+                    )
+                    self.assertEqual(state["duration"], "1 hour")
+
+    def test_conflicting_duration_reply_requires_clarification(self):
+        history = [
+            self.chatbot.ChatMessage(
+                role="assistant",
+                content="How long would you like the session for?",
+            ),
+        ]
+        extractor = self.chatbot.empty_extractor_result()
+
+        with patch.object(
+            self.chatbot,
+            "apply_structured_service_resolution",
+            side_effect=lambda state, message: state,
+        ), patch.object(
+            self.chatbot,
+            "hydrate_configured_service_defaults",
+            side_effect=lambda state: state,
+        ), patch.object(
+            self.chatbot,
+            "allowed_durations_for_treatment",
+            return_value={30, 60, 90, 120},
+        ):
+            state = self.chatbot.apply_validated_state_patch(
+                existing_state={
+                    "treatment": "Swedish Massage",
+                    "duration": "1 hour 30 minutes",
+                    "preferred_date": "2099-01-01",
+                    "preferred_time": "12:00",
+                },
+                extractor_result=extractor,
+                latest_message="maybe 60 or 90",
+                history=history,
+            )
+
+        self.assertEqual(state["duration"], "1 hour 30 minutes")
+        self.assertTrue(state["_duration_ambiguous"])
+        self.assertEqual(
+            self.chatbot.compute_next_required_detail(state, True),
+            "duration",
+        )
+        self.assertEqual(
+            self.chatbot.verified_calendar_result_for_state(
+                state,
+                True,
+                "maybe 60 or 90",
+            )["status"],
+            "not_checked",
+        )
+        reply = self.compose(
+            "A 90-minute massage sounds good.",
+            state,
+            "maybe 60 or 90",
+            extractor=extractor,
+            detail="duration",
+        )
+        self.assertIn("How long would you like", reply)
+        self.assertNotIn("90-minute massage sounds good", reply)
+
+    def test_response_duration_is_forced_to_canonical_state(self):
+        with patch.object(
+            self.chatbot,
+            "authoritative_service_metadata",
+            return_value={
+                "price_pence": None,
+                "price_by_duration": {"60": 5500, "90": 7500},
+            },
+        ):
+            reply = self.compose(
+                "A 90-minute Swedish massage sounds perfect. It costs £75.",
+                {
+                    "conversation_mode": "booking_request",
+                    "treatment": "Swedish Massage",
+                    "duration": "1 hour",
+                },
+                "60 minutes possibly",
+                detail="preferred_date",
+            )
+
+        self.assertIn("I've noted the 1 hour duration.", reply)
+        self.assertNotIn("90-minute", reply)
+        self.assertNotIn("£75", reply)
+
+    def test_massage_price_uses_resolved_duration(self):
+        metadata = {
+            "price_by_duration": {
+                "30": 3500,
+                "60": 5500,
+                "90": 7500,
+                "120": 9500,
+            },
+            "price_pence": None,
+        }
+
+        for minutes, price in [(30, 3500), (60, 5500), (90, 7500), (120, 9500)]:
+            with self.subTest(minutes=minutes):
+                self.assertEqual(
+                    self.chatbot.simple_request_price_pence(metadata, minutes),
+                    price,
                 )
 
     def test_duration_validation_uses_generic_service_metadata(self):

@@ -347,6 +347,46 @@ class ProjectionReliabilityTests(unittest.TestCase):
         self.assertEqual(item["price_pence"], 10000)
         self.assertEqual(conversation["active_booking_request_id"], request["id"])
 
+    def test_projection_uses_one_resolved_duration_for_request_item_and_price(self):
+        self.metadata = {
+            "service_id": 8,
+            "service_name": "Swedish Massage",
+            "category": "massage",
+            "price_pence": None,
+            "price_by_duration": {
+                "30": 3500,
+                "60": 5500,
+                "90": 7500,
+                "120": 9500,
+            },
+        }
+        state = {
+            "treatment": "Swedish Massage",
+            "duration": "1 hour",
+            "slot_status": "not_checked",
+            "next_required_detail": "preferred_date",
+        }
+
+        self.assertTrue(self.sync(state))
+
+        request = self.database.rows["booking_requests"][0]
+        item = self.database.rows["booking_items"][0]
+        self.assertEqual(request["total_duration_minutes"], 60)
+        self.assertEqual(request["total_price_pence"], 5500)
+        self.assertEqual(item["duration_minutes"], 60)
+        self.assertEqual(item["price_pence"], 5500)
+
+    def test_projection_does_not_price_ambiguous_duration_reply(self):
+        state = {
+            "treatment": "Lip Filler 0.5 ml",
+            "duration": "45 minutes",
+            "_duration_ambiguous": True,
+        }
+
+        self.assertFalse(self.sync(state))
+        self.assertEqual(self.database.rows["booking_requests"], [])
+        self.assertEqual(self.database.rows["booking_items"], [])
+
     def test_projection_logs_safe_skip_and_insert_failure_codes(self):
         with patch.object(
             self.chatbot,
