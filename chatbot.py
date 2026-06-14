@@ -4477,6 +4477,9 @@ def normalise_service_match_text(value: str | None) -> str:
     for source, target in replacements.items():
         cleaned = cleaned.replace(source, target)
 
+    # Preserve decimal service variants such as 0.5 ml, but discard sentence
+    # punctuation so "relaxing massage." still grounds the specific service.
+    cleaned = re.sub(r"\.(?!\d)", " ", cleaned)
     cleaned = re.sub(r"[^a-z0-9.]+", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
 
@@ -9759,6 +9762,9 @@ Your job:
 - identify corrections and treatment switches;
 - identify customer questions separately from booking-state changes;
 - never invent a date, time, treatment, name, phone number, price, duration, or availability;
+- vague booking intent such as "I'd like to book" is not a treatment;
+- include treatment only when the newest customer message names a configured
+  service or clearly answers a pending service-variant question;
 - never claim that a slot is free or unavailable;
 - preserve relative date language such as "today", "tomorrow", or "next Thursday" in preferred_date_expression;
 - use a 24-hour HH:MM value for preferred_time only when the customer clearly provided a time;
@@ -9870,6 +9876,42 @@ def canonical_treatment_from_text(
 
         if partial and partial.get("service_name"):
             return str(partial["service_name"])
+
+    return None
+
+
+def grounded_treatment_from_latest_message(
+    latest_message: str,
+    existing_treatment: str | None,
+) -> str | None:
+    """
+    Resolve treatment only from customer-visible evidence in the newest turn.
+
+    Existing treatment is supplied solely to support clear short variant
+    answers while a category is active. Extractor-proposed treatment text is
+    deliberately excluded from this admission check.
+    """
+    metadata = resolve_service_metadata_from_message(
+        latest_message
+    )
+
+    if metadata and metadata.get("service_name"):
+        return str(metadata["service_name"])
+
+    identity = resolve_latest_structured_service(
+        latest_message,
+        existing_treatment=existing_treatment,
+    )
+
+    if identity and identity.get("service_name"):
+        return str(identity["service_name"])
+
+    partial = resolve_latest_generic_or_partial_service(
+        latest_message
+    )
+
+    if partial and partial.get("service_name"):
+        return str(partial["service_name"])
 
     return None
 
@@ -9998,16 +10040,14 @@ def apply_validated_state_patch(
     ):
         result["name"] = name_candidate
 
-    candidate_treatment = canonical_treatment_from_text(
-        patch.get("treatment"),
+    previous_treatment = result.get("treatment")
+    grounded_treatment = grounded_treatment_from_latest_message(
         latest_message,
-        result.get("treatment"),
+        previous_treatment,
     )
 
-    previous_treatment = result.get("treatment")
-
-    if candidate_treatment:
-        result["treatment"] = candidate_treatment
+    if grounded_treatment:
+        result["treatment"] = grounded_treatment
 
     # Service helpers resolve short replies such as "B12", "Relaxing", and
     # natural filler amount replies using the active category.
@@ -10015,6 +10055,12 @@ def apply_validated_state_patch(
         result,
         latest_message,
     )
+
+    # With no active treatment, service helpers may only create one when the
+    # newest customer message itself grounded that service choice.
+    if not previous_treatment and not grounded_treatment:
+        result["treatment"] = None
+        result["active_category"] = None
     duration_resolution = duration_reply_resolution(
         latest_message,
         previous_assistant_message=latest_assistant_reply(history),

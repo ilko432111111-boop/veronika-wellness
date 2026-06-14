@@ -146,6 +146,74 @@ class Phase3ERemainingWorkflowTests(unittest.TestCase):
             "duration",
         )
 
+    def test_vague_booking_intent_cannot_create_extractor_treatment(self):
+        extractor = self.chatbot.empty_extractor_result()
+        extractor["intent"] = "booking_request"
+        extractor["state_patch"] = {
+            "treatment": "Swedish Massage",
+        }
+
+        with patch.object(
+            self.chatbot,
+            "grounded_treatment_from_latest_message",
+            return_value=None,
+        ), patch.object(
+            self.chatbot,
+            "apply_structured_service_resolution",
+            side_effect=lambda state, message: {
+                **state,
+                "treatment": "Swedish Massage",
+            },
+        ), patch.object(
+            self.chatbot,
+            "hydrate_configured_service_defaults",
+            side_effect=lambda state: state,
+        ):
+            state = self.chatbot.apply_validated_state_patch(
+                existing_state={},
+                extractor_result=extractor,
+                latest_message="I'd like to book an appointment.",
+                history=[],
+            )
+
+        self.assertIsNone(state["treatment"])
+        self.assertEqual(
+            self.chatbot.compute_next_required_detail(state, True),
+            "treatment",
+        )
+        self.assertEqual(
+            self.chatbot.render_next_question(state, "treatment"),
+            "Which treatment are you interested in?",
+        )
+
+    def test_existing_active_treatment_survives_vague_booking_follow_up(self):
+        extractor = self.chatbot.empty_extractor_result()
+        extractor["state_patch"] = {
+            "treatment": "Deep Tissue Massage",
+        }
+
+        with patch.object(
+            self.chatbot,
+            "grounded_treatment_from_latest_message",
+            return_value=None,
+        ), patch.object(
+            self.chatbot,
+            "apply_structured_service_resolution",
+            side_effect=lambda state, message: state,
+        ), patch.object(
+            self.chatbot,
+            "hydrate_configured_service_defaults",
+            side_effect=lambda state: state,
+        ):
+            state = self.chatbot.apply_validated_state_patch(
+                existing_state={"treatment": "Swedish Massage"},
+                extractor_result=extractor,
+                latest_message="Yes, I'd like to book it.",
+                history=[],
+            )
+
+        self.assertEqual(state["treatment"], "Swedish Massage")
+
     def test_hot_stone_short_duration_replies_move_to_date(self):
         history = [
             self.chatbot.ChatMessage(
