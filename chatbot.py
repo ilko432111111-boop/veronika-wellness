@@ -206,6 +206,10 @@ class AdminServicePayload(BaseModel):
     duration_prices: dict[str, StrictInt] | None = None
 
 
+class AdminAutoReplyPayload(BaseModel):
+    auto_reply_enabled: StrictBool
+
+
 def normalise_source(source: str | None) -> str:
     allowed_sources = {"website", "instagram", "whatsapp"}
 
@@ -4726,12 +4730,13 @@ def is_valid_phone_number(value: str | None) -> bool:
 def working_hours_for_date(
     requested_date,
 ) -> tuple[datetime, datetime] | None:
-    hours = load_business_hours().get(requested_date.weekday())
+    hours = get_business_hours_for_date(requested_date)
 
-    if not hours:
+    if not hours["is_open"]:
         return None
 
-    open_value, close_value = hours
+    open_value = hours["open_time"]
+    close_value = hours["close_time"]
 
     if isinstance(open_value, tuple):
         open_hour, open_minute = open_value
@@ -4769,6 +4774,17 @@ def validate_slot_against_working_hours(
     end_time: datetime,
     duration_minutes: int | None,
 ) -> dict | None:
+    business_hours = get_business_hours_for_date(start_time.date())
+
+    if not business_hours["loaded"]:
+        return {
+            "status": "hours_unknown",
+            "message": (
+                "Working hours could not be checked. Do not guess availability. "
+                "Say the therapist will check and confirm."
+            ),
+        }
+
     opening_window = working_hours_for_date(start_time.date())
 
     if not opening_window:
@@ -5691,6 +5707,7 @@ def load_chatbot_settings() -> dict:
         "emoji_style": "light",
         "personality_notes": "",
         "enable_multi_booking": False,
+        "auto_reply_enabled": True,
     }
 
     try:
@@ -5698,7 +5715,7 @@ def load_chatbot_settings() -> dict:
             supabase.table("chatbot_settings")
             .select(
                 "tone, reply_length, emoji_style, personality_notes, "
-                "enable_multi_booking"
+                "enable_multi_booking, auto_reply_enabled"
             )
             .eq("business_slug", "veronika")
             .limit(1)
@@ -5717,6 +5734,7 @@ def load_chatbot_settings() -> dict:
         enable_multi_booking = bool(
             saved.get("enable_multi_booking")
         )
+        auto_reply_enabled = saved.get("auto_reply_enabled")
 
         if tone in ["friendly", "professional", "relaxed", "luxury"]:
             defaults["tone"] = tone
@@ -5729,11 +5747,18 @@ def load_chatbot_settings() -> dict:
 
         defaults["personality_notes"] = personality_notes[:600]
         defaults["enable_multi_booking"] = enable_multi_booking
+        if isinstance(auto_reply_enabled, bool):
+            defaults["auto_reply_enabled"] = auto_reply_enabled
 
     except Exception as error:
         print(f"Could not load chatbot settings: {error}")
 
     return defaults
+
+
+def auto_reply_enabled() -> bool:
+    """Fail open until the migration exists, preserving current behaviour."""
+    return bool(load_chatbot_settings().get("auto_reply_enabled", True))
 
 
 def google_oauth_is_configured() -> bool:
@@ -5949,7 +5974,9 @@ def refresh_google_access_token() -> str | None:
     return None
 
 
-def load_business_hours() -> dict:
+def load_business_hours_with_status(
+    business_slug: str = BUSINESS_SLUG,
+) -> tuple[dict, bool]:
     """
     Read editable working hours from Supabase.
 
@@ -5963,7 +5990,7 @@ def load_business_hours() -> dict:
         response = (
             supabase.table("business_hours")
             .select("day_of_week, open_time, close_time, is_closed")
-            .eq("business_slug", BUSINESS_SLUG)
+            .eq("business_slug", business_slug)
             .order("day_of_week")
             .execute()
         )
@@ -6003,10 +6030,52 @@ def load_business_hours() -> dict:
             except Exception:
                 continue
 
+        return hours, True
+
     except Exception as error:
         print(f"Could not load live business hours: {error}")
 
-    return hours
+    return hours, False
+
+
+def load_business_hours() -> dict:
+    return load_business_hours_with_status()[0]
+
+
+def get_business_hours_for_date(
+    requested_date,
+    business_slug: str = BUSINESS_SLUG,
+) -> dict:
+    """Return the owner-edited opening window and whether it was loadable."""
+    hours, loaded = load_business_hours_with_status(business_slug)
+    configured = hours.get(requested_date.weekday())
+
+    if not loaded:
+        return {
+            "loaded": False,
+            "is_open": False,
+            "open_time": None,
+            "close_time": None,
+            "timezone": str(BUSINESS_TIMEZONE),
+        }
+
+    if not configured:
+        return {
+            "loaded": True,
+            "is_open": False,
+            "open_time": None,
+            "close_time": None,
+            "timezone": str(BUSINESS_TIMEZONE),
+        }
+
+    open_value, close_value = configured
+    return {
+        "loaded": True,
+        "is_open": True,
+        "open_time": open_value,
+        "close_time": close_value,
+        "timezone": str(BUSINESS_TIMEZONE),
+    }
 
 
 def parse_duration_minutes(value: str | None) -> int | None:
@@ -7411,6 +7480,25 @@ def process_instagram_webhook_payload(payload: dict):
                         instagram_profile,
                     )
 
+            if not auto_reply_enabled():
+                history = load_recent_messages(session_id)
+                asyncio.run(chat(
+                    ChatRequest(
+                        session_id=session_id,
+                        message=message_text,
+                        history=history,
+                        source="instagram",
+                    ),
+                    BackgroundTasks(),
+                ))
+                save_instagram_channel_contact(
+                    sender_id,
+                    session_id,
+                    customer_message_at,
+                    instagram_profile,
+                )
+                continue
+
             rate_limit_reply = instagram_rate_limit_message(sender_id)
 
             if rate_limit_reply is not None:
@@ -7702,6 +7790,37 @@ def require_authenticated_admin(request: Request):
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="Admin sign-in required.")
+
+
+@app.get("/admin/auto-reply")
+async def get_admin_auto_reply(request: Request):
+    require_authenticated_admin(request)
+    return {"auto_reply_enabled": auto_reply_enabled()}
+
+
+@app.patch("/admin/auto-reply")
+async def set_admin_auto_reply(
+    payload: AdminAutoReplyPayload,
+    request: Request,
+):
+    require_authenticated_admin(request)
+    response = (
+        supabase.table("chatbot_settings")
+        .update({
+            "auto_reply_enabled": payload.auto_reply_enabled,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("business_slug", BUSINESS_SLUG)
+        .execute()
+    )
+
+    if not response.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Auto-reply setting could not be updated.",
+        )
+
+    return {"auto_reply_enabled": payload.auto_reply_enabled}
 
 
 ADMIN_SERVICE_EDITABLE_FIELDS = {
@@ -11425,6 +11544,63 @@ def customer_asks_business_faq(message: str) -> bool:
     return any(phrase in cleaned for phrase in faq_phrases)
 
 
+def customer_asks_opening_hours(message: str) -> bool:
+    cleaned = normalise_service_match_text(message)
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "opening hours",
+            "working hours",
+            "business hours",
+            "when are you open",
+            "what days are you open",
+            "what time do you open",
+            "what time do you close",
+        ]
+    )
+
+
+def format_business_clock_time(value) -> str:
+    if not isinstance(value, tuple) or len(value) < 2:
+        return ""
+
+    hour, minute = value[:2]
+    return f"{int(hour):02d}:{int(minute):02d}"
+
+
+def build_business_hours_reply() -> str:
+    """Render the dashboard timetable without asking the model to rewrite it."""
+    hours, loaded = load_business_hours_with_status()
+
+    if not loaded:
+        return "I'll need to check the current opening hours for you."
+
+    day_names = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+    lines = ["Our current opening hours are:"]
+
+    for day, label in enumerate(day_names):
+        configured = hours.get(day)
+        detail = "Closed"
+
+        if configured:
+            detail = (
+                f"{format_business_clock_time(configured[0])}"
+                f"-{format_business_clock_time(configured[1])}"
+            )
+
+        lines.append(f"• {label}: {detail}")
+
+    return "\n".join(lines)
+
+
 def authoritative_information_fallback(latest_message: str) -> str:
     """Answer only stable built-in business facts; otherwise admit the gap."""
     cleaned = normalise_service_match_text(latest_message)
@@ -11640,6 +11816,11 @@ def compose_verified_customer_reply(
     structured_menu_body = build_customer_service_menu_reply(
         latest_message
     )
+    structured_hours_body = (
+        build_business_hours_reply()
+        if customer_asks_opening_hours(latest_message)
+        else ""
+    )
 
     # Suggested slots are fully deterministic because the model must never
     # invent alternatives or rewrite date labels. The newest useful message
@@ -11657,29 +11838,32 @@ def compose_verified_customer_reply(
             parts.append(contact_acknowledgement)
 
         if customer_requests_information(latest_message):
-            information_body = generate_natural_reply_body(
-                state,
-                extractor_result,
-                business_context,
-                services_context,
-                latest_message,
-                history,
-            )
-            information_body = sanitise_natural_responder_body(
-                information_body
-            )
-            information_body = strip_unverified_calendar_claims(
-                information_body,
-                calendar_result,
-            )
-            information_body = strip_questions_from_response(
-                information_body
-            )
+            information_body = structured_menu_body or structured_hours_body
 
-            if extractor_result.get("schedule_input_detected"):
-                information_body = strip_model_schedule_wording(
+            if not information_body:
+                information_body = generate_natural_reply_body(
+                    state,
+                    extractor_result,
+                    business_context,
+                    services_context,
+                    latest_message,
+                    history,
+                )
+                information_body = sanitise_natural_responder_body(
                     information_body
                 )
+                information_body = strip_unverified_calendar_claims(
+                    information_body,
+                    calendar_result,
+                )
+                information_body = strip_questions_from_response(
+                    information_body
+                )
+
+                if extractor_result.get("schedule_input_detected"):
+                    information_body = strip_model_schedule_wording(
+                        information_body
+                    )
 
             if reply_is_meaningful(information_body):
                 parts.append(information_body)
@@ -11707,6 +11891,8 @@ def compose_verified_customer_reply(
         body = ""
     elif structured_menu_body:
         body = structured_menu_body
+    elif structured_hours_body:
+        body = structured_hours_body
     else:
         body = generate_natural_reply_body(
             state,
@@ -11738,8 +11924,12 @@ def compose_verified_customer_reply(
         structured_menu_body
         and body == structured_menu_body
     )
+    body_is_structured_hours = bool(
+        structured_hours_body
+        and body == structured_hours_body
+    )
 
-    if not body_is_structured_menu:
+    if not body_is_structured_menu and not body_is_structured_hours:
         body = sanitise_natural_responder_body(body)
         body = strip_unverified_calendar_claims(
             body,
@@ -12201,6 +12391,25 @@ async def chat(
     existing_conversation = get_existing_conversation(
         request.session_id
     )
+
+    if not auto_reply_enabled():
+        paused_state = {
+            **prepare_conversation_for_resume(existing_conversation),
+            "source": request_source,
+        }
+        save_conversation_overview(
+            session_id=request.session_id,
+            lead_data=paused_state,
+            source=request_source,
+        )
+        return {
+            "reply": (
+                "Thanks - your message has been saved for Veronika."
+                if request_source == "website"
+                else ""
+            ),
+            "auto_reply_enabled": False,
+        }
 
     if (
         customer_explicitly_cancels_request(request.message)

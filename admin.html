@@ -214,6 +214,21 @@
             font-size: 0.86rem;
         }
 
+        .auto-reply-warning {
+            display: none;
+            margin-top: 14px;
+            padding: 12px 14px;
+            border: 1px solid #d99b3d;
+            border-radius: 10px;
+            background: #fff4df;
+            color: #744b0a;
+            font-weight: 600;
+        }
+
+        .auto-reply-warning.visible {
+            display: block;
+        }
+
         .hours-list {
             display: grid;
             gap: 10px;
@@ -851,6 +866,20 @@
             </div>
 
             <div class="settings-card">
+                <h2>Automatic replies</h2>
+                <p>Pause or resume automatic replies for every customer conversation.</p>
+                <div class="settings-actions">
+                    <button id="auto-reply-toggle" class="primary-button settings-save-button" type="button">
+                        Auto-reply: ON
+                    </button>
+                    <span id="auto-reply-message" class="settings-message"></span>
+                </div>
+                <div id="auto-reply-warning" class="auto-reply-warning">
+                    Auto-reply is paused. New customer messages will be saved but the bot will not respond automatically.
+                </div>
+            </div>
+
+            <div class="settings-card">
                 <h2>Chatbot personality</h2>
                 <p>Change how the chatbot sounds. Important booking and safety rules stay locked.</p>
 
@@ -1079,6 +1108,9 @@
         const logoutButton = document.getElementById("logout-button");
         const tableBody = document.getElementById("lead-table-body");
         const tableMessage = document.getElementById("table-message");
+        const autoReplyToggle = document.getElementById("auto-reply-toggle");
+        const autoReplyMessage = document.getElementById("auto-reply-message");
+        const autoReplyWarning = document.getElementById("auto-reply-warning");
         const toneSetting = document.getElementById("tone-setting");
         const replyLengthSetting = document.getElementById("reply-length-setting");
         const emojiStyleSetting = document.getElementById("emoji-style-setting");
@@ -1550,6 +1582,46 @@
             emojiStyleSetting.value = data.emoji_style || "light";
             personalityNotesSetting.value = data.personality_notes || "";
             settingsMessage.textContent = "";
+        }
+
+        function renderAutoReplySetting(enabled) {
+            autoReplyToggle.dataset.enabled = enabled ? "true" : "false";
+            autoReplyToggle.textContent = `Auto-reply: ${enabled ? "ON" : "OFF"}`;
+            autoReplyToggle.className =
+                `${enabled ? "primary-button" : "danger-button"} settings-save-button`;
+            autoReplyWarning.classList.toggle("visible", !enabled);
+        }
+
+        async function loadAutoReplySetting() {
+            autoReplyMessage.textContent = "Loading...";
+
+            try {
+                const result = await adminApi("/admin/auto-reply");
+                renderAutoReplySetting(result.auto_reply_enabled !== false);
+                autoReplyMessage.textContent = "";
+            } catch (error) {
+                autoReplyMessage.textContent = `Could not load: ${error.message}`;
+            }
+        }
+
+        async function toggleAutoReply() {
+            const enabled = autoReplyToggle.dataset.enabled !== "true";
+            autoReplyToggle.disabled = true;
+            autoReplyMessage.textContent = "Saving...";
+
+            try {
+                const result = await adminApi("/admin/auto-reply", {
+                    method: "PATCH",
+                    body: JSON.stringify({ auto_reply_enabled: enabled })
+                });
+                renderAutoReplySetting(result.auto_reply_enabled);
+                autoReplyMessage.textContent =
+                    result.auto_reply_enabled ? "Auto-reply enabled" : "Auto-reply paused";
+            } catch (error) {
+                autoReplyMessage.textContent = `Could not save: ${error.message}`;
+            } finally {
+                autoReplyToggle.disabled = false;
+            }
         }
 
         async function saveChatbotSettings() {
@@ -2929,6 +3001,7 @@
             showDashboard();
             await Promise.all([
                 loadLeads(),
+                loadAutoReplySetting(),
                 loadChatbotSettings(),
                 loadBusinessHours(),
                 loadAdminServices()
@@ -2938,6 +3011,7 @@
         refreshButton.addEventListener("click", async () => {
             await Promise.all([
                 loadLeads(),
+                loadAutoReplySetting(),
                 loadChatbotSettings(),
                 loadBusinessHours(),
                 loadAdminServices()
@@ -2945,6 +3019,7 @@
         });
 
         saveSettingsButton.addEventListener("click", saveChatbotSettings);
+        autoReplyToggle.addEventListener("click", toggleAutoReply);
         saveHoursButton.addEventListener("click", saveBusinessHours);
         saveInternalNoteButton.addEventListener("click", saveInternalNote);
         serviceSearch.addEventListener("input", renderAdminServices);
@@ -3034,6 +3109,7 @@
             showDashboard();
             await Promise.all([
                 loadLeads(),
+                loadAutoReplySetting(),
                 loadChatbotSettings(),
                 loadBusinessHours(),
                 loadAdminServices()
