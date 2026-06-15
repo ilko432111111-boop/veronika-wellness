@@ -112,8 +112,8 @@ SUMUP_CHECKOUT_ENDPOINT = "https://api.sumup.com/v0.1/checkouts"
 # Instagram session and moderation safeguards.
 # A completed or stale Instagram conversation starts a fresh lead session.
 INSTAGRAM_SESSION_IDLE_HOURS = 12
-INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES = 12
-INSTAGRAM_MAX_MESSAGES_PER_DAY = 80
+INSTAGRAM_MAX_MESSAGES_PER_10_MINUTES = 18
+INSTAGRAM_MAX_MESSAGES_PER_DAY = 120
 INSTAGRAM_RATE_LIMIT_NOTICE_COOLDOWN_MINUTES = 60
 INACTIVE_BOOKING_REQUEST_STATUSES = {
     "confirmed",
@@ -9764,6 +9764,236 @@ def build_authoritative_services_context() -> str:
     )
 
 
+CUSTOMER_SERVICE_CATEGORY_LABELS = {
+    "massage": "Massage",
+    "vitamin_shots": "Vitamin Shots",
+    "ultrasound": "Ultrasound",
+    "body_treatments": "Body Treatments",
+    "microneedling": "Microneedling",
+    "facials": "Facials",
+    "dermal_fillers": "Dermal Fillers",
+}
+
+
+def customer_service_catalogue(
+    requested_category: str | None = None,
+) -> list[dict]:
+    """Return customer-visible rows from the existing service loaders."""
+    catalogue = []
+    loaders = [
+        ("massage", load_massage_services),
+        ("vitamin_shots", load_vitamin_shot_services),
+        ("ultrasound", load_ultrasound_services),
+        ("body_treatments", load_body_treatment_services),
+        ("microneedling", load_microneedling_services),
+        ("facials", load_facial_services),
+        ("dermal_fillers", load_dermal_filler_services),
+    ]
+
+    for category, loader in loaders:
+        if requested_category and category != requested_category:
+            continue
+
+        services, _ = loader()
+
+        for service in services:
+            catalogue.append({
+                **service,
+                "category": category,
+            })
+
+    return catalogue
+
+
+def format_customer_menu_duration(minutes) -> str:
+    """Use short durations that scan cleanly in a mobile menu."""
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        return ""
+
+    hours, remainder = divmod(minutes, 60)
+
+    if hours and remainder:
+        return f"{hours} hr {remainder} min"
+
+    if hours:
+        return f"{hours} hr"
+
+    return f"{minutes} min"
+
+
+def customer_menu_service_details(service: dict) -> str:
+    durations = service.get("allowed_durations_minutes") or []
+    prices = service.get("price_by_duration") or {}
+    duration_parts = []
+
+    for duration in durations:
+        duration_text = format_customer_menu_duration(duration)
+        price = format_price_pence(prices.get(str(duration)))
+        detail = " ".join(part for part in [duration_text, price] if part)
+
+        if detail:
+            duration_parts.append(detail)
+
+    if duration_parts:
+        return ", ".join(duration_parts)
+
+    duration = format_customer_menu_duration(
+        service.get("fixed_duration_minutes")
+    )
+    price = format_price_pence(service.get("price_pence"))
+    return " ".join(part for part in [duration, price] if part)
+
+
+def format_services_for_customer(
+    services: list[dict],
+    requested_category: str | None = None,
+) -> str:
+    """Format canonical services as grouped, deduplicated mobile-friendly text."""
+    sections = []
+
+    for category, label in CUSTOMER_SERVICE_CATEGORY_LABELS.items():
+        if requested_category and category != requested_category:
+            continue
+
+        grouped_names: dict[str, list[str]] = {}
+
+        for service in services:
+            if service.get("category") != category:
+                continue
+
+            name = str(service.get("service_name") or "").strip()
+            details = customer_menu_service_details(service)
+
+            if not name or not details:
+                continue
+
+            names = grouped_names.setdefault(details, [])
+
+            if name not in names:
+                names.append(name)
+
+        if not grouped_names:
+            continue
+
+        bullets = [
+            f"\u2022 {' / '.join(names)}: {details}"
+            for details, names in grouped_names.items()
+        ]
+        sections.append("\n".join([label, *bullets]))
+
+    if not sections:
+        return ""
+
+    intro = (
+        "Sure - here are the prices:"
+        if requested_category
+        else "Sure - here's a quick overview:"
+    )
+    closing = (
+        "Tell me what you're interested in and I can help check availability."
+    )
+    return "\n\n".join([intro, *sections, closing])
+
+
+def requested_customer_service_menu_category(
+    latest_message: str,
+) -> str | None:
+    """Return a broad requested category, or an empty marker for a full menu."""
+    cleaned = normalise_service_match_text(latest_message)
+
+    if not cleaned:
+        return None
+
+    general_phrases = [
+        "what services",
+        "which services",
+        "services do you offer",
+        "services do you do",
+        "full service list",
+        "full price list",
+        "price list",
+        "service menu",
+    ]
+
+    if (
+        any(phrase in cleaned for phrase in general_phrases)
+        or cleaned in {"prices", "prices please", "services", "menu"}
+    ):
+        return ""
+
+    category_phrases = {
+        "massage": ["massage", "massages"],
+        "vitamin_shots": ["vitamin shot", "vitamin shots"],
+        "ultrasound": ["ultrasound"],
+        "body_treatments": ["body treatment", "body treatments"],
+        "microneedling": ["microneedling"],
+        "facials": ["facial", "facials"],
+        "dermal_fillers": ["dermal filler", "dermal fillers", "fillers"],
+    }
+    category_finders = {
+        "massage": find_massage_service,
+        "vitamin_shots": find_vitamin_shot_service,
+        "ultrasound": find_ultrasound_service,
+        "body_treatments": find_body_treatment_service,
+        "microneedling": find_microneedling_service,
+        "facials": find_facial_service,
+        "dermal_fillers": find_dermal_filler_service,
+    }
+    menu_language = [
+        "price",
+        "prices",
+        "cost",
+        "how much",
+        "do you do",
+        "do you offer",
+        "do you have",
+        "what",
+        "which",
+        "list",
+        "menu",
+    ]
+
+    for category, phrases in category_phrases.items():
+        broad_category = next(
+            (phrase for phrase in phrases if phrase in cleaned),
+            None,
+        )
+
+        if not broad_category:
+            continue
+
+        matched_service = category_finders[category](latest_message)
+
+        if (
+            matched_service
+            and matched_service.get("booking_mode") != "choose_variant"
+        ):
+            return None
+
+        if cleaned in phrases or any(
+            phrase in cleaned for phrase in menu_language
+        ):
+            return category
+
+    return None
+
+
+def build_customer_service_menu_reply(latest_message: str) -> str:
+    requested_category = requested_customer_service_menu_category(
+        latest_message
+    )
+
+    if requested_category is None:
+        return ""
+
+    return format_services_for_customer(
+        customer_service_catalogue(requested_category or None),
+        requested_category=requested_category or None,
+    )
+
+
 def format_generic_active_services_context() -> str:
     """Include valid active owner-edited services, including new categories."""
     try:
@@ -11030,8 +11260,13 @@ IMPORTANT LOCKED RULES:
 - Do not ask any question or request any missing booking detail.
 - Answer a customer's side question briefly when possible.
 - Do not repeat information unnecessarily.
-- Return clean plain text only. Do not use Markdown emphasis, headings, tables, backticks, or Markdown bullets.
+- Return clean plain text only. Do not use Markdown emphasis, tables, or backticks.
 - If the customer asks what services are offered, answer using the supplied business information and service catalogue.
+- For menu or service-list replies, use concise mobile-friendly formatting:
+  a short intro, plain category headings, bullet points, blank lines between
+  categories, and an optional short closing question. Keep each bullet short
+  and never put a long list of services or prices into one paragraph.
+- If the customer asks about one category only, list only that category.
 
 NEWEST CUSTOMER MESSAGE:
 {latest_message}
@@ -11402,6 +11637,9 @@ def compose_verified_customer_reply(
         state,
         calendar_result,
     )
+    structured_menu_body = build_customer_service_menu_reply(
+        latest_message
+    )
 
     # Suggested slots are fully deterministic because the model must never
     # invent alternatives or rewrite date labels. The newest useful message
@@ -11467,6 +11705,8 @@ def compose_verified_customer_reply(
         )
     elif extractor_result.get("verified_alternative_selected"):
         body = ""
+    elif structured_menu_body:
+        body = structured_menu_body
     else:
         body = generate_natural_reply_body(
             state,
@@ -11494,16 +11734,22 @@ def compose_verified_customer_reply(
     parts = []
 
     had_body_before_sanitise = bool(str(body or "").strip())
-    body = sanitise_natural_responder_body(body)
-    body = strip_unverified_calendar_claims(
-        body,
-        calendar_result,
+    body_is_structured_menu = bool(
+        structured_menu_body
+        and body == structured_menu_body
     )
+
+    if not body_is_structured_menu:
+        body = sanitise_natural_responder_body(body)
+        body = strip_unverified_calendar_claims(
+            body,
+            calendar_result,
+        )
 
     if extractor_result.get("schedule_input_detected"):
         body = strip_model_schedule_wording(body)
 
-    if next_question:
+    if next_question and not body_is_structured_menu:
         body = strip_questions_from_response(body)
 
         if response_already_contains_options(

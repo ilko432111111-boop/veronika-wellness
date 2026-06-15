@@ -604,7 +604,7 @@ class Phase3ERemainingWorkflowTests(unittest.TestCase):
                 "- `Hot Stone Massage` - 60 min (£55)"
             ),
             {},
-            "Do you offer massages?",
+            "Tell me about Relaxing Massage.",
             detail=None,
         )
 
