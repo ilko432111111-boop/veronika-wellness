@@ -925,6 +925,86 @@ BOOKING_INTENT_PATTERNS = [
 ]
 
 
+def customer_has_explicit_booking_intent(message: str) -> bool:
+    cleaned = str(message or "").lower()
+    return any(
+        re.search(pattern, cleaned)
+        for pattern in BOOKING_INTENT_PATTERNS
+    )
+
+
+def customer_asks_price_question(message: str) -> bool:
+    cleaned = normalise_service_match_text(message)
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "how much",
+            "price",
+            "prices",
+            "cost",
+            "costs",
+            "what is the price",
+            "what are the prices",
+        ]
+    )
+
+
+def customer_asks_children_pets_policy(message: str) -> bool:
+    cleaned = normalise_service_match_text(message)
+    child_terms = {"child", "children", "kid", "kids", "baby", "babies"}
+    pet_terms = {"dog", "dogs", "pet", "pets", "cat", "cats"}
+    tokens = set(cleaned.split())
+
+    return bool(tokens.intersection(child_terms | pet_terms)) and any(
+        phrase in cleaned
+        for phrase in [
+            "bring",
+            "come with",
+            "take my",
+            "allowed",
+            "can i",
+            "could i",
+            "is it ok",
+            "is it okay",
+        ]
+    )
+
+
+def build_children_pets_policy_reply(message: str) -> str:
+    cleaned = normalise_service_match_text(message)
+    tokens = set(cleaned.split())
+    asks_child = bool(
+        tokens.intersection({"child", "children", "kid", "kids", "baby", "babies"})
+    )
+    asks_pet = bool(
+        tokens.intersection({"dog", "dogs", "pet", "pets", "cat", "cats"})
+    )
+    closing = (
+        "If you'd like, I can still help with treatment information or "
+        "availability."
+    )
+
+    if asks_child and asks_pet:
+        return (
+            "Children are okay to bring if needed, but dogs and other pets "
+            f"are not allowed. {closing}"
+        )
+
+    if asks_pet:
+        return (
+            "Sorry, dogs and other pets are not allowed. "
+            f"{closing}"
+        )
+
+    if asks_child:
+        return (
+            "Yes, children are okay to bring if needed. "
+            f"{closing}"
+        )
+
+    return ""
+
+
 def recover_schedule_from_customer_history(
     lead_data: dict,
     conversation_history: str,
@@ -3780,6 +3860,9 @@ def structured_service_identity(
                 "allowed_durations_minutes": service.get(
                     "allowed_durations_minutes"
                 ),
+                "price_pence": service.get("price_pence"),
+                "price_by_duration": service.get("price_by_duration"),
+                "source": "structured_catalogue",
             }
 
     cleaned = normalise_treatment_name(treatment)
@@ -3791,6 +3874,9 @@ def structured_service_identity(
             "booking_mode": "choose_variant",
             "fixed_duration_minutes": None,
             "allowed_durations_minutes": None,
+            "price_pence": None,
+            "price_by_duration": None,
+            "source": "structured_catalogue",
         }
 
     if is_partial_dermal_filler_treatment(treatment):
@@ -3800,6 +3886,9 @@ def structured_service_identity(
             "booking_mode": "choose_variant",
             "fixed_duration_minutes": None,
             "allowed_durations_minutes": None,
+            "price_pence": None,
+            "price_by_duration": None,
+            "source": "structured_catalogue",
         }
 
     return None
@@ -3832,6 +3921,9 @@ def resolve_latest_generic_or_partial_service(
             "booking_mode": "choose_variant",
             "fixed_duration_minutes": None,
             "allowed_durations_minutes": None,
+            "price_pence": None,
+            "price_by_duration": None,
+            "source": "structured_catalogue",
         }
 
     generic_checks = [
@@ -3843,7 +3935,7 @@ def resolve_latest_generic_or_partial_service(
         (
             "dermal_fillers",
             "Dermal Filler",
-            ["dermal filler", "dermal fillers", "fillers"],
+            ["dermal filler", "dermal fillers", "filler", "fillers"],
         ),
     ]
 
@@ -3895,6 +3987,9 @@ def resolve_latest_structured_service(
                 "allowed_durations_minutes": service.get(
                     "allowed_durations_minutes"
                 ),
+                "price_pence": service.get("price_pence"),
+                "price_by_duration": service.get("price_by_duration"),
+                "source": "structured_catalogue",
             }
 
     generic_or_partial = resolve_latest_generic_or_partial_service(
@@ -3943,6 +4038,9 @@ def resolve_latest_structured_service(
                 "allowed_durations_minutes": service.get(
                     "allowed_durations_minutes"
                 ),
+                "price_pence": service.get("price_pence"),
+                "price_by_duration": service.get("price_by_duration"),
+                "source": "structured_catalogue",
             }
 
     return None
@@ -5304,9 +5402,6 @@ def structured_verified_alternatives(
                     f"{dated_match.group(3)}",
                     "%d %B %Y %H:%M",
                 )
-
-                if parsed.date() < datetime.now(BUSINESS_TIMEZONE).date():
-                    parsed = parsed.replace(year=parsed.year + 1)
 
             alternatives.append({
                 "date": parsed.date().isoformat(),
@@ -10113,6 +10208,96 @@ def build_customer_service_menu_reply(latest_message: str) -> str:
     )
 
 
+def metadata_for_specific_price_question(message: str) -> dict | None:
+    metadata = resolve_service_metadata_from_message(message)
+
+    if metadata and metadata.get("service_name"):
+        return metadata
+
+    identity = resolve_latest_structured_service(message)
+
+    if not identity or not identity.get("service_name"):
+        return None
+
+    return authoritative_service_metadata(identity.get("service_name")) or identity
+
+
+def build_specific_price_reply(latest_message: str) -> str:
+    if not customer_asks_price_question(latest_message):
+        return ""
+
+    metadata = metadata_for_specific_price_question(latest_message)
+
+    if not metadata or not metadata.get("service_name"):
+        return ""
+
+    if metadata.get("booking_mode") == "choose_variant":
+        return ""
+
+    service_name = str(metadata.get("service_name") or "").strip()
+    allowed = {
+        int(value)
+        for value in metadata.get("allowed_durations_minutes") or []
+        if str(value).isdigit()
+    }
+    fixed_minutes = metadata.get("fixed_duration_minutes")
+    duration_candidates = duration_candidates_from_text(
+        latest_message,
+        allowed_bare_minutes=allowed or None,
+    )
+    duration_minutes = None
+
+    if fixed_minutes not in [None, ""]:
+        if not duration_candidates:
+            return ""
+        duration_minutes = int(fixed_minutes)
+    elif len(duration_candidates) > 1:
+        options = format_duration_options(allowed) if allowed else "the duration"
+        return f"Which duration would you like the price for: {options}?"
+    elif len(duration_candidates) == 1:
+        duration_minutes = next(iter(duration_candidates))
+    elif len(allowed) == 1:
+        duration_minutes = next(iter(allowed))
+
+    if duration_minutes is None:
+        if allowed:
+            price_parts = []
+            prices = metadata.get("price_by_duration") or {}
+
+            for minutes in sorted(allowed):
+                price = format_price_pence(prices.get(str(minutes)))
+
+                if price:
+                    price_parts.append(
+                        f"{format_customer_menu_duration(minutes)} {price}"
+                    )
+
+            if price_parts:
+                return (
+                    f"{service_name} prices are: "
+                    + ", ".join(price_parts)
+                    + ". Would you like me to check availability?"
+                )
+
+        return ""
+
+    if allowed and duration_minutes not in allowed:
+        return (
+            f"For {service_name}, the available durations are "
+            f"{format_duration_options(allowed)}."
+        )
+
+    price = simple_request_price_pence(metadata, duration_minutes)
+
+    if price is None:
+        return ""
+
+    return (
+        f"{service_name} for {duration_minutes} minutes is "
+        f"{format_price_pence(price)}. Would you like me to check availability?"
+    )
+
+
 def format_generic_active_services_context() -> str:
     """Include valid active owner-edited services, including new categories."""
     try:
@@ -10859,13 +11044,17 @@ def has_booking_intent_state(
     if existing_state.get("conversation_mode") == "booking_request":
         return True
 
+    if (
+        (customer_asks_price_question(latest_message)
+        or customer_asks_children_pets_policy(latest_message))
+        and not customer_has_explicit_booking_intent(latest_message)
+    ):
+        return False
+
     if intent in BOOKING_INTENTS:
         return True
 
-    if any(
-        re.search(pattern, latest_message.lower())
-        for pattern in BOOKING_INTENT_PATTERNS
-    ):
+    if customer_has_explicit_booking_intent(latest_message):
         return True
 
     return False
@@ -10969,6 +11158,55 @@ def handoff_is_allowed(
         and state.get("preferred_date") not in [None, ""]
         and state.get("preferred_time") not in [None, ""]
         and calendar_status in {"free", "provisional_free"}
+        and slot_status in {"free", "provisional_free"}
+        and not active_verified_alternatives(state)
+        and state.get("name") not in [None, ""]
+        and (
+            normalise_source(state.get("source")) == "instagram"
+            or state.get("phone") not in [None, ""]
+        )
+        and compute_next_required_detail(state, True) == "handoff"
+    )
+
+
+def is_ready_for_owner_review(state: dict) -> bool:
+    """Strict readiness gate for dashboard status and owner review."""
+    treatment = state.get("treatment")
+    canonical_treatment = canonical_treatment_from_text(
+        treatment,
+        str(treatment or ""),
+        treatment,
+    )
+    duration_minutes = parse_duration_minutes(
+        state.get("duration")
+    )
+    unresolved_variant = (
+        needs_massage_variant(state)
+        or needs_vitamin_shot_variant(state)
+        or needs_ultrasound_variant(state)
+        or needs_microneedling_variant(state)
+        or needs_facial_variant(state)
+        or needs_dermal_filler_variant(state)
+    )
+    slot_status = str(
+        state.get("slot_status") or ""
+    ).strip()
+
+    return bool(
+        state.get("_canonical_save_succeeded", True) is True
+        and treatment not in [None, ""]
+        and canonical_treatment not in [None, ""]
+        and normalise_treatment_name(canonical_treatment)
+        == normalise_treatment_name(treatment)
+        and not unresolved_variant
+        and duration_minutes
+        and duration_minutes > 0
+        and duration_is_valid_for_treatment(
+            treatment,
+            state.get("duration"),
+        )
+        and state.get("preferred_date") not in [None, ""]
+        and state.get("preferred_time") not in [None, ""]
         and slot_status in {"free", "provisional_free"}
         and not active_verified_alternatives(state)
         and state.get("name") not in [None, ""]
@@ -11232,8 +11470,11 @@ def response_already_contains_options(
     if next_required_detail == "duration":
         allowed = {
             str(value)
-            for value in allowed_durations_for_treatment(
-                state.get("treatment")
+            for value in (
+                allowed_durations_for_treatment(
+                    state.get("treatment")
+                )
+                or set()
             )
         }
         return len(duration_option_numbers(response) & allowed) >= 2
@@ -11502,6 +11743,25 @@ def reply_is_meaningful(reply: str) -> bool:
     return bool(
         cleaned
         and re.search(r"[A-Za-z0-9£]", cleaned)
+    )
+
+
+def reply_is_hard_handoff_claim(reply: str) -> bool:
+    cleaned = str(reply or "").lower()
+    return any(
+        phrase in cleaned
+        for phrase in [
+            "veronika",
+            "therapist will",
+            "let veronika know",
+            "pass your request",
+            "booking request has been sent",
+            "noted your booking",
+            "looking forward to welcoming",
+            "will confirm",
+            "contact you",
+            "follow up",
+        ]
     )
 
 
@@ -11813,6 +12073,14 @@ def compose_verified_customer_reply(
         state,
         calendar_result,
     )
+    policy_body = (
+        build_children_pets_policy_reply(latest_message)
+        if customer_asks_children_pets_policy(latest_message)
+        else ""
+    )
+    specific_price_body = build_specific_price_reply(
+        latest_message
+    )
     structured_menu_body = build_customer_service_menu_reply(
         latest_message
     )
@@ -11821,12 +12089,22 @@ def compose_verified_customer_reply(
         if customer_asks_opening_hours(latest_message)
         else ""
     )
+    info_only_without_booking_intent = bool(
+        (policy_body or specific_price_body)
+        and not customer_has_explicit_booking_intent(latest_message)
+    )
 
     # Suggested slots are fully deterministic because the model must never
     # invent alternatives or rewrite date labels. The newest useful message
     # still gets handled first so pending alternatives cannot swallow a side
     # question or newly supplied contact detail.
     if calendar_result.get("suggestions"):
+        if info_only_without_booking_intent:
+            return enforce_response_duration_consistency(
+                policy_body or specific_price_body,
+                state,
+            )
+
         parts = []
         contact_acknowledgement = newest_contact_acknowledgement(
             state,
@@ -11882,6 +12160,9 @@ def compose_verified_customer_reply(
             state,
         )
 
+    if info_only_without_booking_intent:
+        next_question = ""
+
     if customer_asks_if_booked(latest_message):
         body = (
             "Your request has been noted, but the appointment is not "
@@ -11889,6 +12170,10 @@ def compose_verified_customer_reply(
         )
     elif extractor_result.get("verified_alternative_selected"):
         body = ""
+    elif policy_body:
+        body = policy_body
+    elif specific_price_body:
+        body = specific_price_body
     elif structured_menu_body:
         body = structured_menu_body
     elif structured_hours_body:
@@ -11908,6 +12193,8 @@ def compose_verified_customer_reply(
     )
     if handoff_ready:
         calendar_text = ""
+    if info_only_without_booking_intent:
+        calendar_text = ""
     previous_reply = latest_assistant_reply(history)
 
     if (
@@ -11919,17 +12206,31 @@ def compose_verified_customer_reply(
 
     parts = []
 
-    had_body_before_sanitise = bool(str(body or "").strip())
+    body_before_sanitise = str(body or "")
+    had_body_before_sanitise = bool(body_before_sanitise.strip())
     body_is_structured_menu = bool(
         structured_menu_body
         and body == structured_menu_body
+    )
+    body_is_structured_policy = bool(
+        policy_body
+        and body == policy_body
+    )
+    body_is_structured_price = bool(
+        specific_price_body
+        and body == specific_price_body
     )
     body_is_structured_hours = bool(
         structured_hours_body
         and body == structured_hours_body
     )
 
-    if not body_is_structured_menu and not body_is_structured_hours:
+    if (
+        not body_is_structured_menu
+        and not body_is_structured_policy
+        and not body_is_structured_price
+        and not body_is_structured_hours
+    ):
         body = sanitise_natural_responder_body(body)
         body = strip_unverified_calendar_claims(
             body,
@@ -11956,7 +12257,12 @@ def compose_verified_customer_reply(
     if not reply_is_meaningful(body):
         body = ""
 
-    if not body and had_body_before_sanitise and next_question:
+    if (
+        not body
+        and had_body_before_sanitise
+        and next_question
+        and not reply_is_hard_handoff_claim(body_before_sanitise)
+    ):
         body = "I've noted that."
 
     if (
@@ -12143,15 +12449,19 @@ def load_active_simple_request(
     session_id: str,
 ) -> dict | None:
     try:
-        response = (
+        query = (
             supabase.table("booking_requests")
             .select("*")
             .eq("session_id", session_id)
-            .in_("request_status", ["draft", "ready_for_review"])
-            .order("request_number")
-            .limit(1)
-            .execute()
         )
+
+        if hasattr(query, "in_"):
+            query = query.in_(
+                "request_status",
+                ["draft", "ready_for_review"],
+            )
+
+        response = query.order("request_number").limit(1).execute()
 
         if response.data:
             return response.data[0]
@@ -12160,6 +12470,13 @@ def load_active_simple_request(
         print("projection_draft_load_failed")
 
     return None
+
+
+def load_simple_draft_request(
+    session_id: str,
+) -> dict | None:
+    """Backward-compatible alias for older projection tests."""
+    return load_active_simple_request(session_id)
 
 
 def next_simple_request_number(
@@ -12228,12 +12545,12 @@ def sync_simple_single_request_projection(
         duration_minutes,
     )
     now_iso = datetime.now(timezone.utc).isoformat()
-    request_row = load_active_simple_request(
+    request_row = load_simple_draft_request(
         session_id
     )
     request_status = (
         "ready_for_review"
-        if booking_request_is_complete(state)
+        if is_ready_for_owner_review(state)
         else "draft"
     )
 
