@@ -2,6 +2,8 @@ from datetime import datetime, timedelta
 import unittest
 from unittest.mock import patch
 
+from fastapi import BackgroundTasks
+
 from test_smoke import load_chatbot_module
 
 
@@ -577,6 +579,96 @@ class ServiceLockProjectionRegressionTests(unittest.TestCase):
 
         self.assertIn("Swedish Massage", dashboard_line)
         self.assertIn("1 hr", dashboard_line)
+
+
+class SafetyReplyRegressionTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.chatbot = load_chatbot_module()
+
+    def test_conversation_save_retries_without_optional_active_service_fields(self):
+        writes = []
+
+        class Query:
+            def __init__(self):
+                self.payload = None
+
+            def upsert(self, payload, **kwargs):
+                self.payload = dict(payload)
+                return self
+
+            def execute(self):
+                writes.append(self.payload)
+                if "active_service_name" in self.payload:
+                    raise RuntimeError("unknown column active_service_name")
+                return type("Response", (), {"data": [self.payload]})()
+
+        class Supabase:
+            def table(self, name):
+                return Query()
+
+        with patch.object(self.chatbot, "supabase", Supabase()):
+            self.assertTrue(
+                self.chatbot.save_conversation_overview(
+                    "save-fallback-session",
+                    {
+                        "treatment": "Swedish Massage",
+                        "active_service_id": 101,
+                        "active_service_name": "Swedish Massage",
+                        "active_service_source": "latest_explicit_customer_intent",
+                    },
+                )
+            )
+
+        self.assertEqual(len(writes), 2)
+        self.assertIn("active_service_name", writes[0])
+        self.assertNotIn("active_service_name", writes[1])
+
+    async def test_projection_failure_does_not_show_safety_error_for_swedish_flow(self):
+        messages = [
+            "Can I book Swedish massage today",
+            "60 minutes",
+            "16:30",
+        ]
+
+        with patch.object(self.chatbot, "save_message"), patch.object(
+            self.chatbot, "get_existing_conversation", return_value={}
+        ), patch.object(
+            self.chatbot, "active_booking_request_status", return_value=None
+        ), patch.object(
+            self.chatbot, "load_recent_messages", return_value=[]
+        ), patch.object(
+            self.chatbot, "build_authoritative_services_context", return_value=""
+        ), patch.object(
+            self.chatbot, "load_business_documents_context", return_value=""
+        ), patch.object(
+            self.chatbot,
+            "extract_hidden_state_patch",
+            return_value=self.chatbot.empty_extractor_result(),
+        ), patch.object(
+            self.chatbot, "save_conversation_overview", return_value=True
+        ), patch.object(
+            self.chatbot,
+            "sync_simple_single_request_projection",
+            side_effect=RuntimeError("booking_items unavailable"),
+        ), patch.object(
+            self.chatbot,
+            "compose_verified_customer_reply",
+            return_value="Normal assistant reply.",
+        ):
+            for message in messages:
+                response = await self.chatbot.chat(
+                    self.chatbot.ChatRequest(
+                        session_id="swedish-no-safety",
+                        message=message,
+                        history=[],
+                    ),
+                    BackgroundTasks(),
+                )
+                self.assertNotIn(
+                    "could not safely save",
+                    response["reply"].lower(),
+                )
 
 
 if __name__ == "__main__":

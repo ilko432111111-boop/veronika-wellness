@@ -5378,6 +5378,12 @@ def save_conversation_overview(
     lead_data: dict,
     source: str = "website",
 ) -> bool:
+    optional_projection_fields = {
+        "active_service_id",
+        "active_service_name",
+        "active_service_source",
+    }
+
     try:
         persisted_lead_data = {
             key: value
@@ -5398,6 +5404,27 @@ def save_conversation_overview(
         return True
 
     except Exception as error:
+        try:
+            fallback_payload = {
+                key: value
+                for key, value in payload.items()
+                if key not in optional_projection_fields
+            }
+            supabase.table("conversations").upsert(
+                fallback_payload,
+                on_conflict="session_id"
+            ).execute()
+            print(
+                "Canonical conversation state save retried without "
+                f"optional active-service fields: {type(error).__name__}"
+            )
+            return True
+        except Exception as retry_error:
+            print(
+                "Canonical conversation state fallback save failed: "
+                f"{type(retry_error).__name__}"
+            )
+
         print(
             "Canonical conversation state save failed: "
             f"{type(error).__name__}"
@@ -13115,11 +13142,23 @@ async def chat(
 
     merged_state["_canonical_save_succeeded"] = True
 
-    sync_simple_single_request_projection(
-        session_id=request.session_id,
-        state=merged_state,
-        booking_flow_active=booking_flow_active,
-    )
+    try:
+        projection_saved = sync_simple_single_request_projection(
+            session_id=request.session_id,
+            state=merged_state,
+            booking_flow_active=booking_flow_active,
+        )
+        if not projection_saved and booking_flow_active:
+            print(
+                "booking_projection_non_blocking_failure "
+                f"session_id={request.session_id} reason=projection_returned_false"
+            )
+    except Exception as projection_error:
+        print(
+            "booking_projection_non_blocking_failure "
+            f"session_id={request.session_id} "
+            f"reason={type(projection_error).__name__}"
+        )
 
     reply = compose_verified_customer_reply(
         state=merged_state,
