@@ -646,17 +646,18 @@ def parse_time_from_text(message: str) -> str | None:
         return f"{hour:02d}:00"
 
     twenty_four_hour_match = re.search(
-        r"\b(?:at\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b",
+        r"\b(?:at\s*)?([01]?\d|2[0-3])([:.])([0-5]\d)\b",
         lower_message,
     )
 
     if twenty_four_hour_match:
         hour = int(twenty_four_hour_match.group(1))
-        minute = twenty_four_hour_match.group(2)
+        separator = twenty_four_hour_match.group(2)
+        minute = twenty_four_hour_match.group(3)
 
-        # For daytime appointment businesses, an ambiguous "1.30" normally
-        # means 13:30 rather than 01:30. Explicit am/pm always overrides this.
-        if 1 <= hour <= 7:
+        # Colon-form inputs are treated as explicit 24-hour times. Keep
+        # "07:00" as 07:00; dotted casual inputs like "1.30" stay afternoon.
+        if separator == "." and 1 <= hour <= 7:
             hour += 12
 
         return f"{hour:02d}:{minute}"
@@ -790,6 +791,11 @@ def resolve_schedule_input(
         str(latest_message or "").lower(),
     ))
     parsed_time = parse_time_from_text(time_source)
+    if parsed_time:
+        print(
+            "requested_time_parsed "
+            f"source_message={latest_message} parsed_time={parsed_time}"
+        )
     parsed_date = parse_validated_date_from_text(
         date_source,
         reference_date=existing_state.get("preferred_date"),
@@ -905,10 +911,33 @@ def parse_phone_from_text(message: str) -> str | None:
     for candidate in digit_groups:
         digits = re.sub(r"\D", "", candidate)
 
-        if 10 <= len(digits) <= 15:
+        if 9 <= len(digits) <= 15:
             return candidate.strip()
 
     return None
+
+
+def parse_name_from_contact_message(
+    message: str,
+    phone: str | None,
+) -> str | None:
+    """Extract a name from simple contact replies like "John Doe, 123456789"."""
+    if not phone:
+        return None
+
+    cleaned = str(message or "")
+    cleaned = cleaned.replace(str(phone), " ")
+    cleaned = re.sub(r"\+?\d[\d\s()-]{6,}\d", " ", cleaned)
+    cleaned = re.sub(
+        r"\b(?:my name is|name is|i am|i'm|im|phone|number|mobile|tel)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[,;:|/]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    return cleaned if is_valid_customer_name(cleaned) else None
 
 
 BOOKING_INTENT_PATTERNS = [
@@ -1431,6 +1460,9 @@ def allowed_durations_for_treatment(
         }
 
     metadata = authoritative_service_metadata(treatment)
+
+    if not metadata:
+        metadata = structured_service_identity(treatment)
 
     if not metadata:
         return None
@@ -4748,7 +4780,7 @@ def hydrate_configured_service_defaults(
         "fixed_duration_minutes"
     )
 
-    if fixed_minutes not in [None, ""]:
+    if fixed_minutes not in [None, ""] and not result.get("_fixed_duration_correction"):
         result["duration"] = format_minutes_as_duration(
             int(fixed_minutes)
         )
@@ -4951,7 +4983,7 @@ def is_valid_phone_number(value: str | None) -> bool:
 
     digits = re.sub(r"\D", "", str(value))
 
-    return 10 <= len(digits) <= 15
+    return 9 <= len(digits) <= 15
 
 
 def working_hours_for_date(
@@ -5724,6 +5756,10 @@ def apply_verified_alternative_resolution(
         result["preferred_time"] = selected["time"]
         result["verified_alternatives"] = []
         result["slot_status"] = "not_checked"
+        print(
+            "verified_slot_selected "
+            f"date={selected['date']} time={selected['time']}"
+        )
         return result
 
     if status in {"ambiguous", "no_match"}:
@@ -11093,8 +11129,18 @@ def apply_validated_state_patch(
 
     if parsed_phone and is_valid_phone_number(parsed_phone):
         result["phone"] = parsed_phone
+        print(
+            "contact_phone_extracted "
+            f"phone={parsed_phone} source_message={latest_message}"
+        )
 
     name_candidate = str(patch.get("name") or "").strip()
+
+    if not name_candidate and parsed_phone:
+        name_candidate = parse_name_from_contact_message(
+            latest_message,
+            parsed_phone,
+        ) or ""
 
     if (
         name_candidate
@@ -11102,6 +11148,10 @@ def apply_validated_state_patch(
         and not message_looks_like_schedule_input(name_candidate)
     ):
         result["name"] = name_candidate
+        print(
+            "contact_name_extracted "
+            f"name={name_candidate} source_message={latest_message}"
+        )
 
     previous_treatment = result.get("treatment")
     explicit_service_metadata = latest_explicit_service_metadata(
@@ -11223,6 +11273,8 @@ def apply_validated_state_patch(
     if duration_resolution.get("ambiguous"):
         result["_duration_ambiguous"] = True
 
+    fixed_duration_correction = None
+
     if parsed_duration is not None:
         candidate_duration = format_minutes_as_duration(
             parsed_duration
@@ -11236,6 +11288,14 @@ def apply_validated_state_patch(
         else:
             result["duration"] = None
     elif duration_resolution.get("explicit_invalid"):
+        metadata = active_service_metadata_from_state(result)
+        fixed_minutes = (metadata or {}).get("fixed_duration_minutes")
+        if fixed_minutes not in [None, ""]:
+            fixed_duration_correction = {
+                "service_name": (metadata or {}).get("service_name") or result.get("treatment"),
+                "fixed_minutes": int(fixed_minutes),
+                "price_pence": (metadata or {}).get("price_pence"),
+            }
         result["duration"] = None
 
     if (
@@ -11255,6 +11315,11 @@ def apply_validated_state_patch(
     result = hydrate_configured_service_defaults(
         result
     )
+
+    if fixed_duration_correction:
+        result["duration"] = None
+        result["_fixed_duration_correction"] = fixed_duration_correction
+        extractor_result["fixed_duration_correction"] = fixed_duration_correction
 
     result["notes"] = merge_notes(
         result.get("notes"),
@@ -11501,6 +11566,9 @@ def render_next_question(
         return "Which day would you prefer?"
 
     if next_required_detail == "preferred_time":
+        if state.get("preferred_date") == datetime.now(BUSINESS_TIMEZONE).date().isoformat():
+            return "What time works best for you today?"
+
         return (
             "What time would suit you on "
             + format_customer_date(
@@ -11555,6 +11623,12 @@ def apply_canonical_controller_state(
     result["status"] = calculate_lead_status(
         result,
         result.get("status"),
+    )
+    print(
+        "booking_state_next_detail "
+        f"active_service={result.get('active_service_name') or result.get('treatment')} "
+        f"active_duration={result.get('duration')} "
+        f"next_required_detail={next_detail}"
     )
 
     suggestions = (calendar_result or {}).get("suggestions") or []
@@ -12310,9 +12384,31 @@ def compose_verified_customer_reply(
     schedule_clarification = str(
         extractor_result.get("schedule_clarification") or ""
     ).strip()
+    fixed_duration_correction = (
+        extractor_result.get("fixed_duration_correction")
+        or state.get("_fixed_duration_correction")
+        or {}
+    )
 
     if schedule_clarification:
         return schedule_clarification
+
+    if fixed_duration_correction:
+        service_name = fixed_duration_correction.get("service_name") or "That service"
+        fixed_minutes = fixed_duration_correction.get("fixed_minutes")
+        price = format_price_pence(
+            fixed_duration_correction.get("price_pence")
+        )
+        details = (
+            f"{fixed_minutes}-minute treatment"
+            if fixed_minutes
+            else "fixed-duration treatment"
+        )
+        price_text = f" for {price}" if price else ""
+        return (
+            f"{service_name} is only offered as a {details}{price_text}. "
+            f"Would you like to go ahead with that?"
+        )
 
     if state.get("_duration_ambiguous"):
         return render_next_question(state, "duration")

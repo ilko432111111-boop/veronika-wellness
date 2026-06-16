@@ -671,5 +671,176 @@ class SafetyReplyRegressionTests(unittest.IsolatedAsyncioTestCase):
                 )
 
 
+class NarrowBookingFlowRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.chatbot = load_chatbot_module()
+
+    def apply_state(self, existing, message, history=None):
+        with patch.object(
+            self.chatbot,
+            "hydrate_configured_service_defaults",
+            side_effect=lambda state: state,
+        ):
+            return self.chatbot.apply_validated_state_patch(
+                existing_state=existing,
+                extractor_result=self.chatbot.empty_extractor_result(),
+                latest_message=message,
+                history=history or [],
+            )
+
+    def compose(self, state, detail, message="thanks", extractor=None, calendar=None):
+        with patch.object(
+            self.chatbot,
+            "generate_natural_reply_body",
+            return_value="I've noted that.",
+        ):
+            return self.chatbot.compose_verified_customer_reply(
+                state=state,
+                extractor_result=extractor or self.chatbot.empty_extractor_result(),
+                calendar_result=calendar or {"status": "not_checked"},
+                next_required_detail=detail,
+                business_context="",
+                services_context="",
+                latest_message=message,
+                history=[],
+            )
+
+    def test_name_and_nine_digit_phone_do_not_loop_phone_question(self):
+        state = self.apply_state(
+            {
+                "conversation_mode": "booking_request",
+                "treatment": "Swedish Massage",
+                "duration": "1 hour",
+                "preferred_date": "2026-06-20",
+                "preferred_time": "11:30",
+            },
+            "John Doe, 123456789",
+        )
+        controlled = self.chatbot.apply_canonical_controller_state(
+            state,
+            True,
+            {"status": "free"},
+        )
+        reply = self.compose(
+            controlled,
+            controlled["next_required_detail"],
+            "John Doe, 123456789",
+            calendar={"status": "free"},
+        )
+
+        self.assertEqual(controlled["name"], "John Doe")
+        self.assertEqual(controlled["phone"], "123456789")
+        self.assertNotEqual(controlled["next_required_detail"], "phone")
+        self.assertNotIn("phone number", reply.lower())
+
+    def test_0700_colon_time_is_preserved_not_converted_to_1900(self):
+        self.assertEqual(
+            self.chatbot.parse_time_from_text("07:00"),
+            "07:00",
+        )
+        state = self.apply_state(
+            {
+                "conversation_mode": "booking_request",
+                "treatment": "Swedish Massage",
+                "duration": "1 hour",
+                "preferred_date": "2026-06-20",
+            },
+            "07:00",
+        )
+
+        self.assertEqual(state["preferred_time"], "07:00")
+        self.assertNotEqual(state["preferred_time"], "19:00")
+
+    def test_selected_verified_slot_and_contact_details_progress(self):
+        alternative = {
+            "date": "2026-06-20",
+            "time": "11:30",
+            "label": "Saturday 20 June at 11:30",
+            "duration_minutes": 60,
+        }
+        existing = {
+            "conversation_mode": "booking_request",
+            "treatment": "Swedish Massage",
+            "duration": "1 hour",
+            "preferred_date": "2026-06-20",
+            "preferred_time": "14:00",
+            "verified_alternatives": [alternative],
+        }
+        resolution = self.chatbot.resolve_verified_alternative_reply(
+            existing,
+            "11:30",
+        )
+        selected = self.chatbot.apply_verified_alternative_resolution(
+            existing,
+            existing,
+            resolution,
+        )
+        with_contact = self.apply_state(
+            selected,
+            "John Doe, 123456789",
+        )
+        controlled = self.chatbot.apply_canonical_controller_state(
+            with_contact,
+            True,
+            {"status": "free"},
+        )
+
+        self.assertEqual(selected["preferred_time"], "11:30")
+        self.assertEqual(with_contact["name"], "John Doe")
+        self.assertEqual(with_contact["phone"], "123456789")
+        self.assertNotIn(
+            controlled["next_required_detail"],
+            {"preferred_time", "phone", "name_and_phone"},
+        )
+
+    def test_hydrafacial_invalid_60_minute_request_explains_fixed_duration(self):
+        extractor = self.chatbot.empty_extractor_result()
+        state = self.chatbot.apply_validated_state_patch(
+            existing_state={},
+            extractor_result=extractor,
+            latest_message="Can I book a hydrafacial for 60 minutes?",
+            history=[],
+        )
+        controlled = self.chatbot.apply_canonical_controller_state(
+            state,
+            True,
+            {"status": "not_checked"},
+        )
+        reply = self.compose(
+            controlled,
+            controlled["next_required_detail"],
+            "Can I book a hydrafacial for 60 minutes?",
+            extractor=extractor,
+        )
+
+        self.assertEqual(controlled["treatment"], "Hydrafacial")
+        self.assertIsNone(controlled["duration"])
+        self.assertIn("90-minute", reply)
+        self.assertIn("£80", reply)
+        self.assertIn("Would you like to go ahead", reply)
+        self.assertNotIn("Which day", reply)
+
+    def test_switch_from_hydrafacial_to_swedish_clears_fixed_duration(self):
+        state = self.apply_state(
+            {
+                "conversation_mode": "booking_request",
+                "treatment": "Hydrafacial",
+                "duration": "1 hour 30 minutes",
+                "active_service_name": "Hydrafacial",
+            },
+            "Actually Swedish massage",
+        )
+        controlled = self.chatbot.apply_canonical_controller_state(
+            state,
+            True,
+            {"status": "not_checked"},
+        )
+
+        self.assertEqual(controlled["treatment"], "Swedish Massage")
+        self.assertIsNone(controlled["duration"])
+        self.assertEqual(controlled["next_required_detail"], "duration")
+
+
 if __name__ == "__main__":
     unittest.main()
