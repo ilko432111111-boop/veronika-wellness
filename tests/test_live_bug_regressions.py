@@ -296,5 +296,288 @@ class LiveBugRegressionTests(unittest.TestCase):
         )
 
 
+class ServiceLockProjectionRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.chatbot = load_chatbot_module()
+
+    def metadata(self, treatment):
+        name = self.chatbot.normalise_treatment_name(treatment)
+        if name == "swedish massage":
+            return {
+                "service_id": 101,
+                "service_name": "Swedish Massage",
+                "category": "massage",
+                "booking_mode": "choose_duration",
+                "fixed_duration_minutes": None,
+                "allowed_durations_minutes": [30, 60, 90, 120],
+                "price_pence": None,
+                "price_by_duration": {
+                    "30": 3500,
+                    "60": 5000,
+                    "90": 7500,
+                    "120": 9500,
+                },
+                "source": "test_services",
+            }
+        if name == "hydrafacial":
+            return {
+                "service_id": 202,
+                "service_name": "Hydrafacial",
+                "category": "facials",
+                "booking_mode": "fixed_duration",
+                "fixed_duration_minutes": 90,
+                "allowed_durations_minutes": [90],
+                "price_pence": 8000,
+                "price_by_duration": None,
+                "source": "test_services",
+            }
+        return None
+
+    def apply_state(self, existing, message, history=None, extractor=None):
+        with patch.object(
+            self.chatbot,
+            "authoritative_service_metadata",
+            side_effect=self.metadata,
+        ):
+            return self.chatbot.apply_validated_state_patch(
+                existing_state=existing,
+                extractor_result=extractor or self.chatbot.empty_extractor_result(),
+                latest_message=message,
+                history=history or [],
+            )
+
+    def project(self, state, existing_item=None):
+        writes = {
+            "booking_requests": [],
+            "booking_items": [],
+            "conversations": [],
+        }
+
+        class Response:
+            def __init__(self, data):
+                self.data = data
+
+        class Query:
+            def __init__(self, table):
+                self.table = table
+                self.operation = "select"
+                self.payload = None
+                self.filters = []
+
+            def select(self, *args, **kwargs):
+                return self
+
+            def eq(self, field, value):
+                self.filters.append((field, value))
+                return self
+
+            def in_(self, *args, **kwargs):
+                return self
+
+            def order(self, *args, **kwargs):
+                return self
+
+            def limit(self, *args, **kwargs):
+                return self
+
+            def insert(self, payload):
+                self.operation = "insert"
+                self.payload = dict(payload)
+                return self
+
+            def update(self, payload):
+                self.operation = "update"
+                self.payload = dict(payload)
+                return self
+
+            def execute(self):
+                if self.table == "booking_requests" and self.operation == "select":
+                    return Response([{"id": 55, "request_number": 1}])
+                if self.table == "booking_items" and self.operation == "select":
+                    return Response([existing_item] if existing_item else [])
+                if self.operation in {"insert", "update"}:
+                    row = {**self.payload, "id": 77}
+                    writes[self.table].append(row)
+                    return Response([row])
+                return Response([])
+
+        class Supabase:
+            def table(self, name):
+                return Query(name)
+
+        with patch.object(self.chatbot, "supabase", Supabase()), patch.object(
+            self.chatbot,
+            "authoritative_service_metadata",
+            side_effect=self.metadata,
+        ):
+            ok = self.chatbot.sync_simple_single_request_projection(
+                "service-lock-session",
+                state,
+                True,
+            )
+
+        self.assertTrue(ok)
+        return writes
+
+    def complete_swedish_state(self, **overrides):
+        state = {
+            "conversation_mode": "booking_request",
+            "treatment": "Swedish Massage",
+            "active_service_id": 101,
+            "active_service_name": "Swedish Massage",
+            "active_service_source": "latest_explicit_customer_intent",
+            "active_category": "massage",
+            "duration": "1 hour",
+            "preferred_date": "2026-06-19",
+            "preferred_time": "15:00",
+            "slot_status": "not_checked",
+            "next_required_detail": "name_and_phone",
+        }
+        state.update(overrides)
+        return state
+
+    def assert_projected_swedish_60(self, state, existing_item=None):
+        writes = self.project(state, existing_item=existing_item)
+        item = writes["booking_items"][0]
+        request = writes["booking_requests"][0]
+
+        self.assertEqual(item["service_id"], 101)
+        self.assertEqual(item["service_name"], "Swedish Massage")
+        self.assertEqual(item["duration_minutes"], 60)
+        self.assertEqual(item["price_pence"], 5000)
+        self.assertEqual(request["total_duration_minutes"], 60)
+        self.assertEqual(request["total_price_pence"], 5000)
+
+    def test_bot_hydrafacial_suggestion_cannot_pollute_swedish_booking(self):
+        history = [
+            self.chatbot.ChatMessage(
+                role="assistant",
+                content="For skin concerns, Hydrafacial is 1 hr 30 min and costs \u00a380.",
+            )
+        ]
+        state = self.apply_state(
+            {},
+            "Can I book Swedish massage today",
+            history,
+        )
+        state = self.apply_state(
+            state,
+            "60 minutes possibly",
+            [
+                *history,
+                self.chatbot.ChatMessage(
+                    role="assistant",
+                    content="How long would you like the session for?",
+                ),
+            ],
+        )
+
+        self.assertEqual(state["active_service_name"], "Swedish Massage")
+        self.assertEqual(state["duration"], "1 hour")
+        self.assert_projected_swedish_60(self.complete_swedish_state(**state))
+
+    def test_previous_session_hydrafacial_history_cannot_select_current_service(self):
+        history = [
+            self.chatbot.ChatMessage(
+                role="user",
+                content="I had Hydrafacial before.",
+            ),
+            self.chatbot.ChatMessage(
+                role="assistant",
+                content="Hydrafacial is 90 minutes.",
+            ),
+        ]
+        state = self.apply_state(
+            {},
+            "Can I book Swedish massage today 60 minutes",
+            history,
+        )
+
+        self.assertEqual(state["active_service_name"], "Swedish Massage")
+        self.assertEqual(state["duration"], "1 hour")
+
+    def test_switch_from_hydrafacial_removes_stale_item_and_saves_swedish(self):
+        state = self.apply_state(
+            {
+                "treatment": "Hydrafacial",
+                "active_service_id": 202,
+                "active_service_name": "Hydrafacial",
+                "active_service_source": "canonical_state",
+                "duration": "1 hour 30 minutes",
+            },
+            "Actually Swedish massage 60 minutes",
+        )
+
+        self.assertEqual(state["active_service_name"], "Swedish Massage")
+        self.assertEqual(state["duration"], "1 hour")
+        self.assert_projected_swedish_60(
+            self.complete_swedish_state(**state),
+            existing_item={"id": 9, "service_name": "Hydrafacial"},
+        )
+
+    def test_generic_facial_question_then_swedish_booking_saves_swedish(self):
+        state = self.apply_state({}, "What facials do you do?")
+        state = self.apply_state(
+            state,
+            "Can I book Swedish massage 60 minutes?",
+        )
+
+        self.assertEqual(state["active_service_name"], "Swedish Massage")
+        self.assertEqual(state["duration"], "1 hour")
+
+    def test_wrong_ai_extractor_treatment_is_rejected_by_latest_service(self):
+        extractor = self.chatbot.empty_extractor_result()
+        extractor["state_patch"] = {
+            "treatment": "Hydrafacial",
+            "duration": "1 hour 30 minutes",
+        }
+        state = self.apply_state(
+            {},
+            "Can I book Swedish massage 60 minutes?",
+            extractor=extractor,
+        )
+
+        self.assertEqual(state["active_service_name"], "Swedish Massage")
+        self.assertEqual(state["duration"], "1 hour")
+        self.assertEqual(
+            state["_service_validation"]["reason"],
+            "latest_explicit_customer_service_wins",
+        )
+
+    def test_soft_60_minutes_attaches_to_active_swedish_only(self):
+        state = self.apply_state(
+            {
+                "treatment": "Swedish Massage",
+                "active_service_id": 101,
+                "active_service_name": "Swedish Massage",
+                "duration": None,
+            },
+            "60 minutes possibly",
+            [
+                self.chatbot.ChatMessage(
+                    role="assistant",
+                    content="How long would you like the session for?",
+                )
+            ],
+        )
+
+        self.assertEqual(state["active_service_name"], "Swedish Massage")
+        self.assertEqual(state["duration"], "1 hour")
+
+    def test_dashboard_projection_matches_booking_item(self):
+        state = self.complete_swedish_state()
+        writes = self.project(state)
+        item = writes["booking_items"][0]
+
+        dashboard_line = (
+            f"{item['service_name']} - "
+            f"{self.chatbot.format_customer_menu_duration(item['duration_minutes'])}"
+        )
+
+        self.assertIn("Swedish Massage", dashboard_line)
+        self.assertIn("1 hr", dashboard_line)
+
+
 if __name__ == "__main__":
     unittest.main()

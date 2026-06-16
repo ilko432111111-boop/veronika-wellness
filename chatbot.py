@@ -4347,6 +4347,128 @@ def authoritative_service_metadata(
     return fixed_treatment_metadata(treatment)
 
 
+def active_service_metadata_from_state(
+    state: dict,
+) -> dict | None:
+    """
+    Resolve metadata for the locked active service.
+
+    Booking projection must use the current active service identity, not
+    historic summaries, model guesses, or catalogue text from older turns.
+    """
+    active_name = state.get("active_service_name") or state.get("treatment")
+    metadata = authoritative_service_metadata(active_name)
+
+    if not metadata and active_name:
+        metadata = structured_service_identity(active_name)
+
+    if (
+        metadata
+        and state.get("active_service_name")
+        and normalise_treatment_name(metadata.get("service_name"))
+        != normalise_treatment_name(state.get("active_service_name"))
+    ):
+        print(
+            "booking_service_lock_conflict "
+            f"locked={state.get('active_service_name')} "
+            f"resolved={metadata.get('service_name')}"
+        )
+        return None
+
+    return metadata
+
+
+def clear_service_specific_state(state: dict) -> dict:
+    """Clear fields that must be rebuilt when the active service changes."""
+    result = dict(state)
+
+    for field in [
+        "treatment",
+        "duration",
+        "active_service_id",
+        "active_service_name",
+        "active_service_source",
+        "active_category",
+        "verified_alternatives",
+    ]:
+        result[field] = None
+
+    result["slot_status"] = "not_checked"
+    return result
+
+
+def lock_active_service_from_metadata(
+    state: dict,
+    metadata: dict | None,
+    source: str,
+    preserve_treatment: bool = False,
+) -> dict:
+    result = dict(state)
+
+    if not metadata or not metadata.get("service_name"):
+        return result
+
+    service_name = str(metadata.get("service_name") or "").strip()
+
+    if not service_name:
+        return result
+
+    if not preserve_treatment:
+        result["treatment"] = service_name
+    result["active_service_name"] = service_name
+    result["active_service_id"] = metadata.get("service_id")
+    result["active_service_source"] = source
+
+    if metadata.get("category"):
+        result["active_category"] = metadata.get("category")
+
+    return result
+
+
+def lock_active_service_from_treatment(
+    state: dict,
+    treatment: str | None,
+    source: str,
+    preserve_treatment: bool = False,
+) -> dict:
+    if treatment in [None, ""]:
+        return dict(state)
+
+    metadata = authoritative_service_metadata(treatment)
+
+    if not metadata:
+        metadata = structured_service_identity(treatment)
+
+    return lock_active_service_from_metadata(
+        state,
+        metadata,
+        source,
+        preserve_treatment=preserve_treatment,
+    )
+
+
+def latest_explicit_service_metadata(
+    latest_message: str,
+    existing_treatment: str | None = None,
+) -> dict | None:
+    identity = resolve_latest_structured_service(
+        latest_message,
+        existing_treatment=existing_treatment,
+    )
+
+    if (
+        not identity
+        or not identity.get("service_name")
+        or identity.get("booking_mode") == "choose_variant"
+    ):
+        return None
+
+    return (
+        authoritative_service_metadata(identity.get("service_name"))
+        or identity
+    )
+
+
 def inactive_service_matches(value: str | None) -> bool:
     """Prevent legacy fallbacks from resurrecting owner-deactivated services."""
     cleaned = normalise_service_match_text(value)
@@ -4614,6 +4736,13 @@ def hydrate_configured_service_defaults(
 
     if service_name:
         result["treatment"] = service_name
+        result["active_service_name"] = service_name
+        result["active_service_id"] = metadata.get("service_id")
+        result["active_service_source"] = (
+            result.get("active_service_source")
+            or metadata.get("source")
+            or "service_metadata"
+        )
 
     fixed_minutes = metadata.get(
         "fixed_duration_minutes"
@@ -9921,6 +10050,9 @@ CORE_STATE_FIELDS = [
     "phone",
     "treatment",
     "duration",
+    "active_service_id",
+    "active_service_name",
+    "active_service_source",
     "preferred_date",
     "preferred_time",
     "notes",
@@ -10945,13 +11077,64 @@ def apply_validated_state_patch(
         result["name"] = name_candidate
 
     previous_treatment = result.get("treatment")
-    grounded_treatment = grounded_treatment_from_latest_message(
+    explicit_service_metadata = latest_explicit_service_metadata(
         latest_message,
-        previous_treatment,
+        existing_treatment=previous_treatment,
     )
+    grounded_treatment = (
+        explicit_service_metadata.get("service_name")
+        if explicit_service_metadata
+        else grounded_treatment_from_latest_message(
+            latest_message,
+            previous_treatment,
+        )
+    )
+    extractor_treatment = str(
+        patch.get("treatment") or ""
+    ).strip()
+
+    if explicit_service_metadata and extractor_treatment:
+        extracted_metadata = (
+            authoritative_service_metadata(extractor_treatment)
+            or structured_service_identity(extractor_treatment)
+        )
+        extracted_name = (
+            extracted_metadata.get("service_name")
+            if extracted_metadata
+            else extractor_treatment
+        )
+        deterministic_name = explicit_service_metadata.get("service_name")
+
+        if (
+            extracted_name
+            and deterministic_name
+            and normalise_treatment_name(extracted_name)
+            != normalise_treatment_name(deterministic_name)
+        ):
+            extractor_result["service_validation"] = {
+                "accepted": False,
+                "extracted_service": extracted_name,
+                "deterministic_service": deterministic_name,
+                "reason": "latest_explicit_customer_service_wins",
+            }
+            print(
+                "booking_service_extractor_rejected "
+                f"extracted={extracted_name} "
+                f"deterministic={deterministic_name} "
+                f"source_message={latest_message}"
+            )
 
     if grounded_treatment:
+        if (
+            previous_treatment
+            and normalise_treatment_name(previous_treatment)
+            != normalise_treatment_name(grounded_treatment)
+        ):
+            result = clear_service_specific_state(result)
+
         result["treatment"] = grounded_treatment
+
+    duration_before_service_resolution = result.get("duration")
 
     # Service helpers resolve short replies such as "B12", "Relaxing", and
     # natural filler amount replies using the active category.
@@ -10960,11 +11143,48 @@ def apply_validated_state_patch(
         latest_message,
     )
 
+    if explicit_service_metadata:
+        result = lock_active_service_from_metadata(
+            result,
+            explicit_service_metadata,
+            "latest_explicit_customer_intent",
+        )
+        extractor_result.setdefault("service_validation", {
+            "accepted": True,
+            "extracted_service": extractor_treatment or None,
+            "deterministic_service": explicit_service_metadata.get(
+                "service_name"
+            ),
+            "reason": "latest_explicit_customer_service",
+        })
+    elif result.get("treatment"):
+        result = lock_active_service_from_treatment(
+            result,
+            result.get("treatment"),
+            result.get("active_service_source") or "canonical_state",
+            preserve_treatment=True,
+        )
+
     # With no active treatment, service helpers may only create one when the
     # newest customer message itself grounded that service choice.
     if not previous_treatment and not grounded_treatment:
         result["treatment"] = None
         result["active_category"] = None
+        result["active_service_id"] = None
+        result["active_service_name"] = None
+        result["active_service_source"] = None
+
+    if (
+        previous_treatment
+        and result.get("treatment")
+        and normalise_treatment_name(previous_treatment)
+        != normalise_treatment_name(result.get("treatment"))
+    ):
+        if result.get("duration") == duration_before_service_resolution:
+            result["duration"] = None
+        result["verified_alternatives"] = []
+        result["slot_status"] = "not_checked"
+
     duration_resolution = duration_reply_resolution(
         latest_message,
         previous_assistant_message=latest_assistant_reply(history),
@@ -11028,6 +11248,11 @@ def apply_validated_state_patch(
             compact_recent_history(history),
             latest_message,
         )
+
+    result["_latest_source_message"] = latest_message
+    result["_service_validation"] = extractor_result.get(
+        "service_validation"
+    )
 
     return result
 
@@ -12524,12 +12749,24 @@ def sync_simple_single_request_projection(
         print("projection_skipped_ambiguous_duration")
         return False
 
-    metadata = authoritative_service_metadata(
-        state.get("treatment")
-    )
+    metadata = active_service_metadata_from_state(state)
 
     if not metadata:
         print("projection_skipped_missing_metadata")
+        return False
+
+    locked_service = state.get("active_service_name") or state.get("treatment")
+    if (
+        locked_service
+        and metadata.get("service_name")
+        and normalise_treatment_name(locked_service)
+        != normalise_treatment_name(metadata.get("service_name"))
+    ):
+        print(
+            "projection_skipped_service_lock_conflict "
+            f"locked={locked_service} "
+            f"metadata={metadata.get('service_name')}"
+        )
         return False
 
     duration_minutes = parse_duration_minutes(
@@ -12620,7 +12857,7 @@ def sync_simple_single_request_projection(
 
         existing_item_response = (
             supabase.table("booking_items")
-            .select("id")
+            .select("id, service_name")
             .eq("booking_request_id", request_id)
             .eq("item_order", 1)
             .limit(1)
@@ -12628,6 +12865,29 @@ def sync_simple_single_request_projection(
         )
 
         try:
+            previous_service = None
+            if existing_item_response.data:
+                previous_service = existing_item_response.data[0].get(
+                    "service_name"
+                )
+
+            if (
+                previous_service
+                and item_payload.get("service_name")
+                and normalise_treatment_name(previous_service)
+                != normalise_treatment_name(item_payload.get("service_name"))
+            ):
+                print(
+                    "booking_item_service_changed "
+                    f"session_id={session_id} "
+                    f"previous_service={previous_service} "
+                    f"new_service={item_payload.get('service_name')} "
+                    f"source_message={state.get('_latest_source_message')} "
+                    f"extraction_output={state.get('_service_validation')} "
+                    f"deterministic_match={locked_service} "
+                    "reason=active_service_lock"
+                )
+
             if existing_item_response.data:
                 item_response = (
                     supabase.table("booking_items")
