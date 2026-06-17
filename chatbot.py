@@ -3810,6 +3810,10 @@ def needs_dermal_filler_variant(lead_data: dict) -> bool:
     return (
         normalise_treatment_name(treatment) == "dermal filler"
         or is_partial_dermal_filler_treatment(treatment)
+        or (
+            dermal_filler_area_from_text(treatment) is not None
+            and find_dermal_filler_service(treatment) is None
+        )
     )
 
 
@@ -4546,12 +4550,18 @@ def metadata_match_tokens(
         "a", "an", "and", "area", "for", "i", "id", "im", "in",
         "injection", "injections", "interested", "looking", "my", "of",
         "please", "session", "the", "to", "treatment", "want", "would",
+        "duration", "durations", "hour", "hours", "hr", "hrs", "min",
+        "mins", "minute", "minutes",
     }
 
     return {
         token
         for token in normalise_service_match_text(value).split()
-        if token and token not in ignored
+        if (
+            token
+            and token not in ignored
+            and not re.fullmatch(r"\d+(?:\.\d+)?", token)
+        )
     }
 
 
@@ -11295,6 +11305,32 @@ def apply_validated_state_patch(
                 f"source_message={latest_message}"
             )
 
+    if (
+        not explicit_service_metadata
+        and extractor_treatment
+        and previous_treatment
+    ):
+        extracted_metadata = (
+            authoritative_service_metadata(extractor_treatment)
+            or structured_service_identity(extractor_treatment)
+        )
+        extractor_result["service_validation"] = {
+            "accepted": False,
+            "extracted_service": (
+                extracted_metadata.get("service_name")
+                if extracted_metadata
+                else extractor_treatment
+            ),
+            "deterministic_service": previous_treatment,
+            "reason": "slot_filling_message_preserved_active_service",
+        }
+        print(
+            "booking_service_extractor_rejected "
+            f"extracted={extractor_result['service_validation']['extracted_service']} "
+            f"deterministic={previous_treatment} "
+            f"source_message={latest_message}"
+        )
+
     if grounded_treatment:
         if (
             previous_treatment
@@ -11309,10 +11345,24 @@ def apply_validated_state_patch(
 
     # Service helpers resolve short replies such as "B12", "Relaxing", and
     # natural filler amount replies using the active category.
-    result = apply_structured_service_resolution(
-        result,
-        latest_message,
+    variant_choice_pending = (
+        needs_massage_variant(result)
+        or needs_vitamin_shot_variant(result)
+        or needs_ultrasound_variant(result)
+        or needs_microneedling_variant(result)
+        or needs_facial_variant(result)
+        or needs_dermal_filler_variant(result)
     )
+    allow_service_resolution = bool(
+        not previous_treatment
+        or grounded_treatment
+        or variant_choice_pending
+    )
+    if allow_service_resolution:
+        result = apply_structured_service_resolution(
+            result,
+            latest_message,
+        )
 
     if explicit_service_metadata:
         result = lock_active_service_from_metadata(
