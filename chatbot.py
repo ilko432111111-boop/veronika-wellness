@@ -148,7 +148,10 @@ REQUIRED_BOOKING_FIELDS = [
 
 
 def required_booking_fields(lead_data: dict) -> list[str]:
-    if normalise_source(lead_data.get("source")) == "instagram":
+    if (
+        normalise_source(lead_data.get("source")) == "instagram"
+        or lead_data.get("phone_declined") is True
+    ):
         return [
             field
             for field in REQUIRED_BOOKING_FIELDS
@@ -4755,8 +4758,10 @@ def hydrate_configured_service_defaults(
     to choose a duration. The extractor and responder do not control this.
     """
     result = dict(state)
-    metadata = authoritative_service_metadata(
-        result.get("treatment")
+    metadata = (
+        active_service_metadata_from_state(result)
+        if result.get("active_service_name")
+        else authoritative_service_metadata(result.get("treatment"))
     )
 
     if not metadata:
@@ -5414,6 +5419,7 @@ def save_conversation_overview(
         "active_service_id",
         "active_service_name",
         "active_service_source",
+        "phone_declined",
     }
 
     try:
@@ -5422,6 +5428,8 @@ def save_conversation_overview(
             for key, value in lead_data.items()
             if not str(key).startswith("_")
         }
+        if persisted_lead_data.get("phone_declined") is None:
+            persisted_lead_data["phone_declined"] = False
         payload = {
             "session_id": session_id,
             "source": normalise_source(source),
@@ -5872,7 +5880,7 @@ def send_booking_notification(session_id: str):
             .select(
                 "session_id, name, phone, treatment, duration, "
                 "preferred_date, preferred_time, notes, summary, "
-                "status, source, notification_sent_at"
+                "status, source, phone_declined, notification_sent_at"
             )
             .eq("session_id", session_id)
             .limit(1)
@@ -10111,6 +10119,7 @@ def advanced_multi_booking_enabled() -> bool:
 CORE_STATE_FIELDS = [
     "name",
     "phone",
+    "phone_declined",
     "treatment",
     "duration",
     "active_service_id",
@@ -10836,6 +10845,81 @@ def normalise_extractor_result(raw: dict | None) -> dict:
     return result
 
 
+def customer_declines_phone_number(
+    latest_message: str,
+    previous_assistant_message: str = "",
+) -> bool:
+    cleaned = normalise_service_match_text(latest_message)
+
+    if not cleaned:
+        return False
+
+    explicit_phrases = [
+        "no phone",
+        "no phone number",
+        "without phone",
+        "without a phone",
+        "dont have phone",
+        "dont have a phone",
+        "dont want to give phone",
+        "dont want to give my phone",
+        "dont want to share phone",
+        "dont want to share my phone",
+        "don t want to give phone",
+        "don t want to give my phone",
+        "don t want to share phone",
+        "don t want to share my phone",
+        "do not want to give phone",
+        "do not want to share phone",
+        "dont want to give number",
+        "dont want to give my number",
+        "dont want to share number",
+        "dont want to share my number",
+        "don t want to give number",
+        "don t want to give my number",
+        "don t want to share number",
+        "don t want to share my number",
+        "do not want to give number",
+        "do not want to share number",
+        "rather not give phone",
+        "rather not share phone",
+        "rather not give number",
+        "rather not share number",
+        "prefer not to give phone",
+        "prefer not to share phone",
+        "prefer not to give number",
+        "prefer not to share number",
+        "i refuse phone",
+        "i wont give phone",
+        "i will not give phone",
+    ]
+
+    if any(phrase in cleaned for phrase in explicit_phrases):
+        return True
+
+    previous = normalise_service_match_text(previous_assistant_message)
+    previous_asked_phone = (
+        "phone" in previous
+        or "contact number" in previous
+        or "mobile number" in previous
+    )
+
+    if not previous_asked_phone:
+        return False
+
+    return cleaned in {
+        "no",
+        "no thanks",
+        "no thank you",
+        "rather not",
+        "id rather not",
+        "i would rather not",
+        "prefer not",
+        "i prefer not",
+        "skip",
+    }
+
+
 def extract_hidden_state_patch(
     current_state: dict,
     latest_message: str,
@@ -11099,6 +11183,7 @@ def apply_validated_state_patch(
         "next_required_detail": existing_state.get("next_required_detail"),
         "notification_sent_at": existing_state.get("notification_sent_at"),
     })
+    result["phone_declined"] = bool(result.get("phone_declined"))
 
     patch = extractor_result.get("state_patch") or {}
 
@@ -11119,6 +11204,10 @@ def apply_validated_state_patch(
     parsed_phone = parse_phone_from_text(
         str(patch.get("phone") or latest_message)
     )
+    phone_declined = customer_declines_phone_number(
+        latest_message,
+        latest_assistant_reply(history),
+    )
     # Duration is a calendar-critical field. Accept it only when the newest
     # customer message explicitly supplies it; never trust an extractor guess.
     if parsed_date:
@@ -11127,8 +11216,13 @@ def apply_validated_state_patch(
     if parsed_time:
         result["preferred_time"] = parsed_time
 
+    if phone_declined:
+        result["phone"] = None
+        result["phone_declined"] = True
+
     if parsed_phone and is_valid_phone_number(parsed_phone):
         result["phone"] = parsed_phone
+        result["phone_declined"] = False
         print(
             "contact_phone_extracted "
             f"phone={parsed_phone} source_message={latest_message}"
@@ -11410,21 +11504,28 @@ def compute_next_required_detail(
         return "verified_alternative"
 
     instagram_source = normalise_source(state.get("source")) == "instagram"
+    phone_required = (
+        not instagram_source
+        and state.get("phone_declined") is not True
+    )
 
     if (
         state.get("name") in [None, ""]
         and state.get("phone") in [None, ""]
     ):
+        if state.get("phone_declined") is True:
+            return "name"
+
         return (
             "name_and_optional_phone"
-            if instagram_source
+            if not phone_required
             else "name_and_phone"
         )
 
     if state.get("name") in [None, ""]:
         return "name"
 
-    if state.get("phone") in [None, ""] and not instagram_source:
+    if state.get("phone") in [None, ""] and phone_required:
         return "phone"
 
     return "handoff"
@@ -11480,6 +11581,7 @@ def handoff_is_allowed(
         and state.get("name") not in [None, ""]
         and (
             normalise_source(state.get("source")) == "instagram"
+            or state.get("phone_declined") is True
             or state.get("phone") not in [None, ""]
         )
         and compute_next_required_detail(state, True) == "handoff"
@@ -11529,6 +11631,7 @@ def is_ready_for_owner_review(state: dict) -> bool:
         and state.get("name") not in [None, ""]
         and (
             normalise_source(state.get("source")) == "instagram"
+            or state.get("phone_declined") is True
             or state.get("phone") not in [None, ""]
         )
         and compute_next_required_detail(state, True) == "handoff"
