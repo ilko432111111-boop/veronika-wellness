@@ -965,6 +965,32 @@ def customer_has_explicit_booking_intent(message: str) -> bool:
     )
 
 
+def message_has_service_with_valid_duration(message: str) -> bool:
+    metadata = resolve_service_metadata_from_message(message)
+
+    if not metadata:
+        identity = resolve_latest_structured_service(message)
+
+        if identity and identity.get("booking_mode") != "choose_variant":
+            metadata = (
+                authoritative_service_metadata(identity.get("service_name"))
+                or identity
+            )
+
+    if (
+        not metadata
+        or not metadata.get("service_name")
+        or metadata.get("booking_mode") == "choose_variant"
+    ):
+        return False
+
+    resolution = duration_reply_resolution(
+        message,
+        treatment=metadata.get("service_name"),
+    )
+    return resolution.get("minutes") is not None
+
+
 def customer_asks_price_question(message: str) -> bool:
     cleaned = normalise_service_match_text(message)
     return any(
@@ -4611,11 +4637,12 @@ def metadata_match_tokens(
     without hard-coding the exact sentence.
     """
     ignored = {
-        "a", "an", "and", "area", "for", "i", "id", "im", "in",
-        "injection", "injections", "interested", "looking", "my", "of",
-        "please", "session", "the", "to", "treatment", "want", "would",
-        "duration", "durations", "hour", "hours", "hr", "hrs", "min",
-        "mins", "minute", "minutes",
+        "a", "an", "and", "area", "book", "booking", "can", "could",
+        "for", "i", "id", "im", "in", "injection", "injections",
+        "interested", "looking", "my", "of", "please", "session",
+        "the", "to", "treatment", "want", "would", "duration",
+        "durations", "hour", "hours", "hr", "hrs", "min", "mins",
+        "minute", "minutes",
     }
 
     return {
@@ -4627,6 +4654,100 @@ def metadata_match_tokens(
             and not re.fullmatch(r"\d+(?:\.\d+)?", token)
         )
     }
+
+
+def bounded_levenshtein_distance(
+    left: str,
+    right: str,
+    max_distance: int,
+) -> int:
+    """Return edit distance, stopping once it cannot be a safe match."""
+    if left == right:
+        return 0
+
+    if abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+
+    previous = list(range(len(right) + 1))
+
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        row_minimum = current[0]
+
+        for right_index, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            value = min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                previous[right_index - 1] + cost,
+            )
+            current.append(value)
+            row_minimum = min(row_minimum, value)
+
+        if row_minimum > max_distance:
+            return max_distance + 1
+
+        previous = current
+
+    return previous[-1]
+
+
+def fuzzy_metadata_token_match_score(
+    value_tokens: set[str],
+    candidate_tokens: set[str],
+) -> int:
+    """
+    Score only highly confident typo matches on distinctive service words.
+
+    Generic category words are ignored so "facial" or "massage" cannot pick a
+    specific treatment by fuzzy matching alone.
+    """
+    ignored = {
+        "facial",
+        "facials",
+        "filler",
+        "fillers",
+        "injection",
+        "injections",
+        "massage",
+        "service",
+        "shot",
+        "shots",
+        "treatment",
+        "treatments",
+    }
+    best_score = 0
+
+    for candidate in candidate_tokens:
+        if len(candidate) < 5 or candidate in ignored:
+            continue
+
+        for token in value_tokens:
+            if len(token) < 5 or token in ignored:
+                continue
+
+            max_length = max(len(candidate), len(token))
+            max_distance = 1 if max_length <= 7 else 2
+            distance = bounded_levenshtein_distance(
+                token,
+                candidate,
+                max_distance,
+            )
+
+            if distance == 0 or distance > max_distance:
+                continue
+
+            similarity = 1 - (distance / max_length)
+
+            if similarity < 0.78:
+                continue
+
+            best_score = max(
+                best_score,
+                6000 + len(candidate) * 20 - distance * 100,
+            )
+
+    return best_score
 
 
 def service_metadata_match_score(
@@ -4692,6 +4813,14 @@ def service_metadata_match_score(
                 best_score,
                 1000 + len(overlap) * 100 - len(candidate_tokens),
             )
+
+        fuzzy_score = fuzzy_metadata_token_match_score(
+            value_tokens,
+            candidate_tokens,
+        )
+
+        if fuzzy_score:
+            best_score = max(best_score, fuzzy_score)
 
     return best_score
 
@@ -4769,7 +4898,7 @@ def resolve_service_metadata_from_message(
             f"{error}"
         )
 
-    if inactive_service_matches(message):
+    if not matches and inactive_service_matches(message):
         return None
 
     for item in FIXED_TREATMENT_DETAILS:
@@ -4881,6 +5010,7 @@ def normalise_service_match_text(value: str | None) -> str:
     replacements = {
         "hydrofacial": "hydrafacial",
         "hydroface": "hydraface",
+        "hydra face": "hydraface",
     }
 
     for source, target in replacements.items():
@@ -10334,14 +10464,40 @@ def build_authoritative_services_context() -> str:
     )
 
 
+CUSTOMER_SERVICE_CATEGORY_ORDER = [
+    "massage",
+    "facials",
+    "body_treatments",
+    "vitamin_shots",
+    "microneedling",
+    "dermal_fillers",
+    "fat_dissolving",
+    "ultrasound",
+]
+
+
 CUSTOMER_SERVICE_CATEGORY_LABELS = {
     "massage": "Massage",
-    "vitamin_shots": "Vitamin Shots",
-    "ultrasound": "Ultrasound",
-    "body_treatments": "Body Treatments",
-    "microneedling": "Microneedling",
     "facials": "Facials",
+    "body_treatments": "Body Treatments",
+    "vitamin_shots": "Vitamin Shots",
+    "microneedling": "Microneedling",
     "dermal_fillers": "Dermal Fillers",
+    "fat_dissolving": "Fat-Dissolving Injections",
+    "ultrasound": "Ultrasound",
+    "other": "Other Treatments",
+}
+
+
+CUSTOMER_SERVICE_CATEGORY_PHRASES = {
+    "massage": ["massage", "massages"],
+    "facials": ["facial", "facials"],
+    "body_treatments": ["body treatment", "body treatments", "body sculpting", "ems"],
+    "vitamin_shots": ["vitamin shot", "vitamin shots", "b12", "vitamin c"],
+    "microneedling": ["microneedling"],
+    "dermal_fillers": ["dermal filler", "dermal fillers", "filler", "fillers"],
+    "fat_dissolving": ["fat dissolving", "fat-dissolving", "fat dissolving injections"],
+    "ultrasound": ["ultrasound"],
 }
 
 
@@ -10373,6 +10529,57 @@ def customer_service_catalogue(
             })
 
     return catalogue
+
+
+def load_active_services_for_customer_menu(
+    requested_category: str | None = None,
+) -> list[dict]:
+    """Load customer-visible active services from public.services."""
+    try:
+        response = (
+            supabase.table("services")
+            .select(
+                "service_name, category, category_key, variant_name, "
+                "booking_mode, fixed_duration_minutes, "
+                "allowed_durations_minutes, price_pence, "
+                "price_by_duration, is_active, sort_order, display_order"
+            )
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("is_active", True)
+            .execute()
+        )
+    except Exception as error:
+        print(f"Could not load customer service menu from Supabase: {error}")
+        return customer_service_catalogue(requested_category)
+
+    services = []
+
+    for row in response.data or []:
+        category = str(
+            row.get("category_key")
+            or row.get("category")
+            or "other"
+        ).strip() or "other"
+
+        if requested_category and category != requested_category:
+            continue
+
+        services.append({
+            **row,
+            "category": category,
+            "sort_order": row.get("sort_order") or row.get("display_order") or 0,
+        })
+
+    return sorted(
+        services,
+        key=lambda service: (
+            CUSTOMER_SERVICE_CATEGORY_ORDER.index(service.get("category"))
+            if service.get("category") in CUSTOMER_SERVICE_CATEGORY_ORDER
+            else len(CUSTOMER_SERVICE_CATEGORY_ORDER),
+            int(service.get("sort_order") or 0),
+            str(service.get("service_name") or ""),
+        ),
+    )
 
 
 def format_customer_menu_duration(minutes) -> str:
@@ -10407,7 +10614,7 @@ def customer_menu_service_details(service: dict) -> str:
             duration_parts.append(detail)
 
     if duration_parts:
-        return ", ".join(duration_parts)
+        return " or ".join(duration_parts)
 
     duration = format_customer_menu_duration(
         service.get("fixed_duration_minutes")
@@ -10416,41 +10623,122 @@ def customer_menu_service_details(service: dict) -> str:
     return " ".join(part for part in [duration, price] if part)
 
 
-def format_services_for_customer(
+def compact_customer_service_name(
+    service: dict,
+    requested_category: str | None = None,
+) -> str:
+    name = str(service.get("service_name") or "").strip()
+    category = str(service.get("category") or "").strip()
+
+    if not name:
+        return ""
+
+    if requested_category:
+        return name
+
+    lowered = normalise_service_match_text(name)
+
+    if category == "microneedling":
+        return "Microneedling"
+
+    if category == "dermal_fillers":
+        return "Dermal Fillers"
+
+    if category == "fat_dissolving" or lowered.startswith("fat dissolving"):
+        return "Fat-Dissolving Injections"
+
+    if category == "ultrasound":
+        return "Ultrasound"
+
+    if category == "vitamin_shots":
+        if "b12" in lowered:
+            return "B12"
+        if "vitamin c" in lowered or " c shot" in f" {lowered} ":
+            return "Vitamin C"
+        if lowered in {"vitamin shot", "vitamin shots"}:
+            return ""
+
+    return name
+
+
+def customer_menu_should_show_details(
+    service: dict,
+    requested_category: str | None,
+) -> bool:
+    if requested_category:
+        return True
+
+    category = str(service.get("category") or "")
+    name = normalise_service_match_text(service.get("service_name"))
+
+    return bool(
+        category == "facials"
+        and "hydra" in name
+        and service.get("price_by_duration")
+    )
+
+
+def format_service_menu_for_customer(
     services: list[dict],
     requested_category: str | None = None,
 ) -> str:
-    """Format canonical services as grouped, deduplicated mobile-friendly text."""
+    """Format active services as grouped, mobile-friendly customer text."""
     sections = []
 
-    for category, label in CUSTOMER_SERVICE_CATEGORY_LABELS.items():
+    ordered_categories = [
+        *CUSTOMER_SERVICE_CATEGORY_ORDER,
+        "other",
+    ]
+
+    for category in ordered_categories:
         if requested_category and category != requested_category:
             continue
 
-        grouped_names: dict[str, list[str]] = {}
+        label = CUSTOMER_SERVICE_CATEGORY_LABELS.get(
+            category,
+            category.replace("_", " ").title(),
+        )
+        bullets = []
+        seen = set()
 
         for service in services:
             if service.get("category") != category:
                 continue
 
-            name = str(service.get("service_name") or "").strip()
-            details = customer_menu_service_details(service)
+            name = compact_customer_service_name(
+                service,
+                requested_category=requested_category,
+            )
 
-            if not name or not details:
+            if not name:
                 continue
 
-            names = grouped_names.setdefault(details, [])
+            details = ""
 
-            if name not in names:
-                names.append(name)
+            if customer_menu_should_show_details(
+                service,
+                requested_category,
+            ):
+                details = customer_menu_service_details(service)
 
-        if not grouped_names:
+            key = (
+                normalise_service_match_text(name),
+                normalise_service_match_text(details),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            if details:
+                bullets.append(f"\u2022 {name} - {details}")
+            else:
+                bullets.append(f"\u2022 {name}")
+
+        if not bullets:
             continue
 
-        bullets = [
-            f"\u2022 {' / '.join(names)}: {details}"
-            for details, names in grouped_names.items()
-        ]
         sections.append("\n".join([label, *bullets]))
 
     if not sections:
@@ -10467,6 +10755,16 @@ def format_services_for_customer(
     return "\n\n".join([intro, *sections, closing])
 
 
+def format_services_for_customer(
+    services: list[dict],
+    requested_category: str | None = None,
+) -> str:
+    return format_service_menu_for_customer(
+        services,
+        requested_category=requested_category,
+    )
+
+
 def requested_customer_service_menu_category(
     latest_message: str,
 ) -> str | None:
@@ -10477,31 +10775,39 @@ def requested_customer_service_menu_category(
         return None
 
     general_phrases = [
+        "what do you offer",
+        "what do you do",
         "what services",
         "which services",
+        "what treatments",
+        "which treatments",
         "services do you offer",
         "services do you do",
+        "treatments do you offer",
+        "treatments do you do",
+        "treatments are available",
+        "what treatments are available",
+        "available treatments",
         "full service list",
+        "full treatment list",
         "full price list",
         "price list",
         "service menu",
+        "treatment menu",
     ]
 
     if (
         any(phrase in cleaned for phrase in general_phrases)
-        or cleaned in {"prices", "prices please", "services", "menu"}
+        or cleaned in {
+            "prices",
+            "prices please",
+            "services",
+            "treatments",
+            "menu",
+        }
     ):
         return ""
 
-    category_phrases = {
-        "massage": ["massage", "massages"],
-        "vitamin_shots": ["vitamin shot", "vitamin shots"],
-        "ultrasound": ["ultrasound"],
-        "body_treatments": ["body treatment", "body treatments"],
-        "microneedling": ["microneedling"],
-        "facials": ["facial", "facials"],
-        "dermal_fillers": ["dermal filler", "dermal fillers", "fillers"],
-    }
     category_finders = {
         "massage": find_massage_service,
         "vitamin_shots": find_vitamin_shot_service,
@@ -10525,7 +10831,7 @@ def requested_customer_service_menu_category(
         "menu",
     ]
 
-    for category, phrases in category_phrases.items():
+    for category, phrases in CUSTOMER_SERVICE_CATEGORY_PHRASES.items():
         broad_category = next(
             (phrase for phrase in phrases if phrase in cleaned),
             None,
@@ -10534,7 +10840,11 @@ def requested_customer_service_menu_category(
         if not broad_category:
             continue
 
-        matched_service = category_finders[category](latest_message)
+        matched_service = (
+            category_finders[category](latest_message)
+            if category in category_finders
+            else None
+        )
 
         if (
             matched_service
@@ -10558,8 +10868,8 @@ def build_customer_service_menu_reply(latest_message: str) -> str:
     if requested_category is None:
         return ""
 
-    return format_services_for_customer(
-        customer_service_catalogue(requested_category or None),
+    return format_service_menu_for_customer(
+        load_active_services_for_customer_menu(requested_category or None),
         requested_category=requested_category or None,
     )
 
@@ -11660,6 +11970,9 @@ def has_booking_intent_state(
     if customer_has_explicit_booking_intent(latest_message):
         return True
 
+    if message_has_service_with_valid_duration(latest_message):
+        return True
+
     return False
 
 
@@ -12403,6 +12716,30 @@ def reply_is_hard_handoff_claim(reply: str) -> bool:
     )
 
 
+def reply_claims_service_recorded_without_state(
+    reply: str,
+    state: dict,
+) -> bool:
+    if state.get("treatment") not in [None, ""]:
+        return False
+
+    cleaned = str(reply or "").strip().lower()
+
+    if not cleaned:
+        return False
+
+    if not re.search(
+        r"\b(?:recorded|noted|saved|logged)\b|\bgreat choice\b",
+        cleaned,
+    ):
+        return False
+
+    return bool(
+        resolve_service_metadata_from_message(reply)
+        or structured_service_identity(reply)
+    )
+
+
 def customer_requests_information(message: str) -> bool:
     cleaned = re.sub(r"\s+", " ", str(message or "").strip().lower())
 
@@ -12899,6 +13236,9 @@ def compose_verified_customer_reply(
 
     if extractor_result.get("schedule_input_detected"):
         body = strip_model_schedule_wording(body)
+
+    if reply_claims_service_recorded_without_state(body, state):
+        body = ""
 
     if next_question and not body_is_structured_menu:
         body = strip_questions_from_response(body)
