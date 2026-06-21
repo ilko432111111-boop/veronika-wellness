@@ -10471,8 +10471,8 @@ CUSTOMER_SERVICE_CATEGORY_ORDER = [
     "vitamin_shots",
     "microneedling",
     "dermal_fillers",
-    "fat_dissolving",
     "ultrasound",
+    "fat_dissolving",
 ]
 
 
@@ -10540,6 +10540,7 @@ def load_active_services_for_customer_menu(
             supabase.table("services")
             .select(
                 "service_name, category, category_key, variant_name, "
+                "aliases, description, "
                 "booking_mode, fixed_duration_minutes, "
                 "allowed_durations_minutes, price_pence, "
                 "price_by_duration, is_active, sort_order, display_order"
@@ -10600,9 +10601,36 @@ def format_customer_menu_duration(minutes) -> str:
     return f"{minutes} min"
 
 
-def customer_menu_service_details(service: dict) -> str:
-    durations = service.get("allowed_durations_minutes") or []
+def compact_duration_list(durations: list[int]) -> str:
+    cleaned = [
+        int(value)
+        for value in durations
+        if str(value).isdigit() and int(value) > 0
+    ]
+
+    if not cleaned:
+        return ""
+
+    return "/".join(str(value) for value in sorted(cleaned)) + " min"
+
+
+def customer_menu_duration_price_details(
+    service: dict,
+    include_prices: bool,
+) -> str:
+    durations = sorted({
+        int(value)
+        for value in service.get("allowed_durations_minutes") or []
+        if str(value).isdigit() and int(value) > 0
+    })
     prices = service.get("price_by_duration") or {}
+
+    if not durations:
+        return ""
+
+    if not include_prices:
+        return compact_duration_list(durations)
+
     duration_parts = []
 
     for duration in durations:
@@ -10616,11 +10644,119 @@ def customer_menu_service_details(service: dict) -> str:
     if duration_parts:
         return " or ".join(duration_parts)
 
+    return compact_duration_list(durations)
+
+
+def ultrasound_package_session_count(service: dict) -> str:
+    aliases = service.get("aliases") or []
+
+    if isinstance(aliases, str):
+        aliases = [aliases]
+
+    text = " ".join(
+        str(value or "")
+        for value in [
+            service.get("service_name"),
+            service.get("description"),
+            *aliases,
+        ]
+    )
+    match = re.search(
+        r"\b(?:package of\s*)?(\d+)\s+(?:separate\s+)?"
+        r"(?:ultrasound\s+)?sessions?\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return match.group(1) if match else ""
+
+
+def customer_menu_fixed_or_package_details(service: dict) -> str:
+    category = str(service.get("category") or "")
+    booking_mode = str(service.get("booking_mode") or "")
+    price = format_price_pence(service.get("price_pence"))
+
+    if booking_mode == "package":
+        session_count = (
+            ultrasound_package_session_count(service)
+            if category == "ultrasound"
+            else ""
+        )
+        pieces = []
+
+        if session_count:
+            pieces.append(f"{session_count} sessions")
+
+        if price:
+            pieces.append(price)
+
+        return " ".join(pieces)
+
     duration = format_customer_menu_duration(
         service.get("fixed_duration_minutes")
     )
-    price = format_price_pence(service.get("price_pence"))
     return " ".join(part for part in [duration, price] if part)
+
+
+def customer_menu_service_details(
+    service: dict,
+    requested_category: str | None = None,
+) -> str:
+    category = str(service.get("category") or "")
+    booking_mode = str(service.get("booking_mode") or "")
+
+    if booking_mode == "choose_duration":
+        include_prices = bool(
+            requested_category
+            or category != "massage"
+            or "hydra" in normalise_service_match_text(
+                service.get("service_name")
+            )
+        )
+        return customer_menu_duration_price_details(
+            service,
+            include_prices=include_prices,
+        )
+
+    return customer_menu_fixed_or_package_details(service)
+
+
+def service_name_variant_after_dash(name: str) -> str:
+    parts = re.split(
+        r"\s+(?:-|–|—|â€”|Ã¢â‚¬â€)\s+",
+        name,
+        maxsplit=1,
+    )
+
+    if len(parts) > 1:
+        return parts[1].strip()
+
+    parts = re.split(r"\s*(?:—|â€”|-)\s*", name, maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else name.strip()
+
+
+def dermal_filler_menu_label_and_option(service: dict) -> tuple[str, str] | None:
+    variant = service_name_variant_after_dash(
+        str(service.get("service_name") or "")
+    )
+    match = re.search(
+        r"^(?P<label>.+?)\s+(?P<amount>\d+(?:\.\d+)?)\s*ml\b",
+        variant,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    price = format_price_pence(service.get("price_pence"))
+
+    if not price:
+        return None
+
+    return (
+        match.group("label").strip(),
+        f"{match.group('amount')} ml {price}",
+    )
 
 
 def compact_customer_service_name(
@@ -10633,22 +10769,38 @@ def compact_customer_service_name(
     if not name:
         return ""
 
-    if requested_category:
-        return name
-
     lowered = normalise_service_match_text(name)
 
+    if category == "body_treatments":
+        if "electronic muscle stimulation" in lowered or "ems" in lowered:
+            return "EMS"
+
+        if "body sculpting" in lowered:
+            return "Body Sculpting"
+
     if category == "microneedling":
-        return "Microneedling"
+        variant = service_name_variant_after_dash(name)
+        variant = re.sub(
+            r"(?i)^microneedling\s+for\s+1\s+area\s+",
+            "",
+            variant,
+        ).strip()
+        variant = re.sub(r"^[^A-Za-z0-9]+", "", variant).strip()
+        return variant or "Microneedling"
 
     if category == "dermal_fillers":
-        return "Dermal Fillers"
+        grouped = dermal_filler_menu_label_and_option(service)
+        return grouped[0] if grouped else service_name_variant_after_dash(name)
 
     if category == "fat_dissolving" or lowered.startswith("fat dissolving"):
+        if requested_category:
+            match = re.search(r"\(([^)]+)\)", name)
+            return match.group(1).strip() if match else name
+
         return "Fat-Dissolving Injections"
 
     if category == "ultrasound":
-        return "Ultrasound"
+        return service_name_variant_after_dash(name)
 
     if category == "vitamin_shots":
         if "b12" in lowered:
@@ -10661,21 +10813,51 @@ def compact_customer_service_name(
     return name
 
 
-def customer_menu_should_show_details(
+def service_is_generic_menu_parent(
     service: dict,
-    requested_category: str | None,
+    category: str,
 ) -> bool:
-    if requested_category:
-        return True
-
-    category = str(service.get("category") or "")
     name = normalise_service_match_text(service.get("service_name"))
+    booking_mode = str(service.get("booking_mode") or "")
 
-    return bool(
-        category == "facials"
-        and "hydra" in name
-        and service.get("price_by_duration")
-    )
+    if booking_mode != "choose_variant":
+        return False
+
+    generic_names = {
+        "massage": {"massage"},
+        "facials": {"facial", "facials"},
+        "vitamin_shots": {"vitamin shot", "vitamin shots"},
+        "ultrasound": {"ultrasound"},
+        "microneedling": {"microneedling"},
+        "dermal_fillers": {"dermal filler", "dermal fillers", "filler", "fillers"},
+    }
+
+    return name in generic_names.get(category, set())
+
+
+def format_dermal_filler_menu_bullets(services: list[dict]) -> list[str]:
+    grouped: dict[str, list[str]] = {}
+
+    for service in services:
+        parsed = dermal_filler_menu_label_and_option(service)
+
+        if not parsed:
+            continue
+
+        label, option = parsed
+        options = grouped.setdefault(label, [])
+
+        if option not in options:
+            options.append(option)
+
+    def option_sort_key(option: str) -> float:
+        match = re.search(r"\d+(?:\.\d+)?", option)
+        return float(match.group(0)) if match else 999.0
+
+    return [
+        f"\u2022 {label}: {' or '.join(sorted(options, key=option_sort_key))}"
+        for label, options in grouped.items()
+    ]
 
 
 def format_service_menu_for_customer(
@@ -10700,9 +10882,37 @@ def format_service_menu_for_customer(
         )
         bullets = []
         seen = set()
+        category_services = [
+            service
+            for service in services
+            if service.get("category") == category
+        ]
+        useful_children_exist = any(
+            not service_is_generic_menu_parent(service, category)
+            for service in category_services
+        )
 
-        for service in services:
-            if service.get("category") != category:
+        if category == "dermal_fillers":
+            bullets = format_dermal_filler_menu_bullets(
+                [
+                    service
+                    for service in category_services
+                    if not (
+                        useful_children_exist
+                        and service_is_generic_menu_parent(service, category)
+                    )
+                ]
+            )
+
+            if bullets:
+                sections.append("\n".join([label, *bullets]))
+                continue
+
+        for service in category_services:
+            if (
+                useful_children_exist
+                and service_is_generic_menu_parent(service, category)
+            ):
                 continue
 
             name = compact_customer_service_name(
@@ -10710,16 +10920,20 @@ def format_service_menu_for_customer(
                 requested_category=requested_category,
             )
 
+            if (
+                not name
+                and not useful_children_exist
+                and service_is_generic_menu_parent(service, category)
+            ):
+                name = str(service.get("service_name") or "").strip()
+
             if not name:
                 continue
 
-            details = ""
-
-            if customer_menu_should_show_details(
+            details = customer_menu_service_details(
                 service,
                 requested_category,
-            ):
-                details = customer_menu_service_details(service)
+            )
 
             key = (
                 normalise_service_match_text(name),
@@ -10732,7 +10946,7 @@ def format_service_menu_for_customer(
             seen.add(key)
 
             if details:
-                bullets.append(f"\u2022 {name} - {details}")
+                bullets.append(f"\u2022 {name}: {details}")
             else:
                 bullets.append(f"\u2022 {name}")
 
@@ -10750,7 +10964,9 @@ def format_service_menu_for_customer(
         else "Sure - here's a quick overview:"
     )
     closing = (
-        "Tell me what you're interested in and I can help check availability."
+        "Tell me which one you're interested in and I can check availability."
+        if requested_category
+        else "Tell me what you're interested in and I can give prices or check availability."
     )
     return "\n\n".join([intro, *sections, closing])
 
