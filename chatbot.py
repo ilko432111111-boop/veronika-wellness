@@ -39,9 +39,32 @@ def read_positive_int_environment_variable(name: str, default: int) -> int:
 
 app = FastAPI()
 
+
+def configured_cors_origins() -> list[str]:
+    configured = [
+        origin.strip()
+        for origin in str(
+            os.getenv("ALLOWED_CORS_ORIGINS") or ""
+        ).split(",")
+        if origin.strip()
+    ]
+
+    if configured:
+        return configured
+
+    return [
+        "https://veronika-wellness.onrender.com",
+        "https://veronika-chatbot-api.onrender.com",
+        "http://localhost:8000",
+        "http://localhost:5173",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:5173",
+    ]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=configured_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -797,7 +820,7 @@ def resolve_schedule_input(
     if parsed_time:
         print(
             "requested_time_parsed "
-            f"source_message={latest_message} parsed_time={parsed_time}"
+            f"parsed_time={parsed_time}"
         )
     parsed_date = parse_validated_date_from_text(
         date_source,
@@ -8062,6 +8085,10 @@ def process_instagram_webhook_payload(payload: dict):
                         + " Is there anything else I can help with, such as "
                         "booking another treatment?"
                     )
+                    reply = append_instagram_privacy_notice(
+                        reply,
+                        history,
+                    )
 
                     save_message(
                         session_id=session_id,
@@ -8113,8 +8140,38 @@ def process_instagram_webhook_payload(payload: dict):
                 print(f"Could not process Instagram message: {error}")
 
 
+INSTAGRAM_PRIVACY_NOTICE = (
+    "Quick note: messages and any contact details you send here may be stored "
+    "so Veronika can respond to your enquiry. You can ask us to delete your "
+    "details at any time."
+)
+
+
+def instagram_privacy_notice_already_sent(history: list[ChatMessage]) -> bool:
+    notice_key = "messages and any contact details you send here may be stored"
+
+    return any(
+        message.role not in {"user", "customer"}
+        and notice_key in str(message.content or "").lower()
+        for message in history
+    )
+
+
+def append_instagram_privacy_notice(
+    reply: str,
+    history: list[ChatMessage],
+) -> str:
+    if not reply or instagram_privacy_notice_already_sent(history):
+        return reply
+
+    return collapse_repeated_reply_content(
+        f"{reply}\n\n{INSTAGRAM_PRIVACY_NOTICE}"
+    )
+
+
 @app.get("/instagram/status")
-async def instagram_status():
+async def instagram_status(request: Request):
+    require_authenticated_admin(request)
     return {
         "configured": instagram_is_configured(),
         "account_id_present": bool(INSTAGRAM_ACCOUNT_ID),
@@ -8176,7 +8233,8 @@ async def receive_instagram_webhook(
 
 
 @app.get("/ai/status")
-async def ai_status():
+async def ai_status(request: Request):
+    require_authenticated_admin(request)
     return {
         "live_chat_model": LIVE_CHAT_MODEL,
         "live_chat_reasoning_effort": LIVE_CHAT_REASONING_EFFORT,
@@ -8191,7 +8249,8 @@ async def root():
 
 
 @app.get("/google-calendar/connect")
-async def google_calendar_connect():
+async def google_calendar_connect(request: Request):
+    require_authenticated_admin(request)
     if not google_oauth_is_configured():
         return HTMLResponse(
             """
@@ -8288,7 +8347,8 @@ async def google_calendar_callback(
 
 
 @app.get("/google-calendar/status")
-async def google_calendar_status():
+async def google_calendar_status(request: Request):
+    require_authenticated_admin(request)
     return {
         "connected": bool(get_google_refresh_token()),
         "last_diagnostic_code": GOOGLE_CALENDAR_LAST_DIAGNOSTIC,
@@ -11954,7 +12014,7 @@ def apply_validated_state_patch(
         result["phone_declined"] = False
         print(
             "contact_phone_extracted "
-            f"phone={parsed_phone} source_message={latest_message}"
+            "phone_present=true"
         )
 
     name_candidate = str(patch.get("name") or "").strip()
@@ -11973,7 +12033,7 @@ def apply_validated_state_patch(
         result["name"] = name_candidate
         print(
             "contact_name_extracted "
-            f"name={name_candidate} source_message={latest_message}"
+            "name_present=true"
         )
 
     previous_treatment = result.get("treatment")
@@ -12021,7 +12081,7 @@ def apply_validated_state_patch(
                 "booking_service_extractor_rejected "
                 f"extracted={extracted_name} "
                 f"deterministic={deterministic_name} "
-                f"source_message={latest_message}"
+                "reason=latest_explicit_customer_service_wins"
             )
 
     if (
@@ -12047,7 +12107,7 @@ def apply_validated_state_patch(
             "booking_service_extractor_rejected "
             f"extracted={extractor_result['service_validation']['extracted_service']} "
             f"deterministic={previous_treatment} "
-            f"source_message={latest_message}"
+            "reason=slot_filling_message_preserved_active_service"
         )
 
     if grounded_treatment:
@@ -14052,7 +14112,7 @@ def sync_simple_single_request_projection(
                     f"session_id={session_id} "
                     f"previous_service={previous_service} "
                     f"new_service={item_payload.get('service_name')} "
-                    f"source_message={state.get('_latest_source_message')} "
+                    f"source_message_present={bool(state.get('_latest_source_message'))} "
                     f"extraction_output={state.get('_service_validation')} "
                     f"deterministic_match={locked_service} "
                     "reason=active_service_lock"
@@ -14315,6 +14375,11 @@ async def chat(
         latest_message=request.message,
         history=effective_history,
     )
+    if request_source == "instagram":
+        reply = append_instagram_privacy_notice(
+            reply,
+            effective_history,
+        )
 
     save_message(
         session_id=request.session_id,
