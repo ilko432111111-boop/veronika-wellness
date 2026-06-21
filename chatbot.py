@@ -1529,6 +1529,43 @@ def format_price_pence(value) -> str:
     return f"£{pounds:.2f}"
 
 
+def service_duration_price_options(service: dict | None) -> str:
+    """Format one service's duration/price choices from structured metadata."""
+    if not service:
+        return ""
+
+    durations = sorted({
+        int(value)
+        for value in service.get("allowed_durations_minutes") or []
+        if str(value).isdigit() and int(value) > 0
+    })
+    prices = service.get("price_by_duration") or {}
+    parts = []
+
+    for duration in durations:
+        duration_text = f"{duration} minutes"
+        price = format_price_pence(
+            prices.get(str(duration))
+        )
+        parts.append(
+            f"{duration_text} for {price}" if price else duration_text
+        )
+
+    if parts:
+        return format_natural_list(parts)
+
+    fixed_duration = format_minutes_as_duration(
+        service.get("fixed_duration_minutes")
+    )
+    fixed_price = format_price_pence(
+        service.get("price_pence")
+    )
+
+    return " for ".join(
+        part for part in [fixed_duration, fixed_price] if part
+    )
+
+
 def format_live_massage_services_context() -> tuple[str, bool]:
     """
     Produce the massage catalogue block sent to the LLM.
@@ -2919,28 +2956,27 @@ FALLBACK_FACIAL_SERVICES = [
         "description": "Facial treatment for young skin lasting 60 minutes.",
     },
     {
-        "service_name": "Hydraface Facial Treatment",
-        "booking_mode": "fixed_duration",
-        "fixed_duration_minutes": 60,
-        "price_pence": 6000,
+        "service_name": "Hydraface / Hydrafacial",
+        "booking_mode": "choose_duration",
+        "fixed_duration_minutes": None,
+        "allowed_durations_minutes": [60, 90],
+        "price_pence": None,
+        "price_by_duration": {
+            "60": 6000,
+            "90": 8000,
+        },
         "aliases": [
-            "hydraface facial treatment",
-            "hydraface facial",
             "hydraface",
-        ],
-        "description": "Hydraface Facial Treatment lasting 60 minutes.",
-    },
-    {
-        "service_name": "Hydrafacial",
-        "booking_mode": "fixed_duration",
-        "fixed_duration_minutes": 90,
-        "price_pence": 8000,
-        "aliases": [
+            "hydraface facial",
+            "hydraface facial treatment",
             "hydrafacial",
-            "hydrafacial 90 minutes",
-            "90 minute hydrafacial",
+            "hydra facial",
+            "hydra facial treatment",
         ],
-        "description": "Hydrafacial treatment lasting 90 minutes.",
+        "description": (
+            "Hydraface / Hydrafacial facial treatment with 60-minute "
+            "and 90-minute options."
+        ),
     },
 ]
 
@@ -2979,8 +3015,9 @@ def load_facial_services() -> tuple[list[dict], bool]:
             supabase.table("services")
             .select(
                 "service_name, aliases, fixed_duration_minutes, "
-                "price_pence, booking_mode, description, is_active, "
-                "display_order"
+                "allowed_durations_minutes, price_pence, "
+                "price_by_duration, booking_mode, description, "
+                "is_active, display_order"
             )
             .eq("business_slug", BUSINESS_SLUG)
             .eq("category", "facials")
@@ -3006,11 +3043,21 @@ def load_facial_services() -> tuple[list[dict], bool]:
                 except (TypeError, ValueError):
                     fixed_duration = None
 
+            allowed_durations = sorted({
+                int(value)
+                for value in row.get("allowed_durations_minutes") or []
+                if str(value).isdigit() and int(value) > 0
+            })
+
             rows.append({
                 "service_name": service_name,
                 "aliases": list(row.get("aliases") or []),
                 "fixed_duration_minutes": fixed_duration,
+                "allowed_durations_minutes": allowed_durations,
                 "price_pence": row.get("price_pence"),
+                "price_by_duration": dict(
+                    row.get("price_by_duration") or {}
+                ),
                 "booking_mode": booking_mode,
                 "description": str(row.get("description") or "").strip(),
                 "display_order": row.get("display_order") or 0,
@@ -3114,8 +3161,8 @@ def apply_dynamic_facial_details(
     Handle facials dynamically from public.services.
 
     A generic facial request remains unresolved until the customer chooses a
-    specific facial. Specific services receive their fixed duration
-    automatically from Supabase.
+    specific facial. Fixed-duration services receive their duration
+    automatically; selectable-duration services keep duration open.
     """
     result = dict(lead_data)
     current_treatment = normalise_treatment_name(
@@ -3218,19 +3265,11 @@ def format_live_facial_services_context() -> tuple[str, bool]:
     ]
 
     for service in services:
-        duration = format_minutes_as_duration(
-            service.get("fixed_duration_minutes")
-        )
-        price = format_price_pence(
-            service.get("price_pence")
-        )
+        options = service_duration_price_options(service)
         details = []
 
-        if duration:
-            details.append(duration)
-
-        if price:
-            details.append(price)
+        if options:
+            details.append(options)
 
         if service.get("description"):
             details.append(service["description"])
@@ -3242,6 +3281,31 @@ def format_live_facial_services_context() -> tuple[str, bool]:
         )
 
     return "\n".join(lines), from_supabase
+
+
+def build_facial_variant_prompt() -> str:
+    services, _ = load_facial_services()
+    options = []
+
+    for service in services:
+        service_name = str(service.get("service_name") or "").strip()
+
+        if not service_name:
+            continue
+
+        details = service_duration_price_options(service)
+        options.append(
+            f"{service_name} ({details})" if details else service_name
+        )
+
+    if not options:
+        return "Which facial would you like?"
+
+    return (
+        "We offer "
+        + format_natural_list(options)
+        + ". Which facial would you like?"
+    )
 
 
 FALLBACK_DERMAL_FILLER_SERVICES = [
@@ -4860,8 +4924,7 @@ def meaningful_variant_tokens(
 
     Broad category words are removed so a reply such as "facial" does not
     accidentally select one facial service. More specific replies such as
-    "radio frequency", "stretch marks", and "hydrafacial 90 minutes" remain
-    useful.
+    "radio frequency", "stretch marks", and "hydrafacial" remain useful.
     """
     cleaned = normalise_service_match_text(value)
 
@@ -5221,12 +5284,7 @@ def build_schedule_first_question(lead_data: dict) -> str:
         )
 
     if needs_facial_variant(lead_data):
-        return (
-            "We offer Deep Facial Cleanse (£60, 60 minutes), Radio Frequency "
-            "Facial (£60, 60 minutes), Facial Treatment for Young Skin "
-            "(£45, 60 minutes), Hydraface Facial Treatment (£60, 60 minutes), "
-            "and Hydrafacial (£80, 90 minutes). Which facial would you like?"
-        )
+        return build_facial_variant_prompt()
 
     if needs_dermal_filler_variant(lead_data):
         return build_dermal_filler_variant_prompt(
@@ -8206,7 +8264,12 @@ def clean_admin_service_payload(values: dict, require_all: bool = True) -> dict:
         raise HTTPException(status_code=422, detail="duration_minutes must be an integer between 5 and 300.")
 
     price = cleaned.get("price_pence")
-    if not isinstance(price, int) or not 0 <= price <= 100000:
+    if requires_choice:
+        if price is not None and (
+            not isinstance(price, int) or not 0 <= price <= 100000
+        ):
+            raise HTTPException(status_code=422, detail="price_pence must be an integer between 0 and 100000.")
+    elif not isinstance(price, int) or not 0 <= price <= 100000:
         raise HTTPException(status_code=422, detail="price_pence must be an integer between 0 and 100000.")
 
     sort_order = cleaned.get("sort_order", 0)
@@ -8228,6 +8291,9 @@ def clean_admin_service_payload(values: dict, require_all: bool = True) -> dict:
             raise HTTPException(status_code=422, detail="Duration prices must be between 0 and 100000 pence.")
         clean_duration_prices[str(int(minutes))] = amount
 
+    if requires_choice and not clean_duration_prices:
+        raise HTTPException(status_code=422, detail="Add at least one selectable duration price.")
+
     booking_mode = "choose_duration" if requires_choice else "fixed_duration"
     allowed_durations = sorted(int(value) for value in clean_duration_prices)
 
@@ -8240,7 +8306,7 @@ def clean_admin_service_payload(values: dict, require_all: bool = True) -> dict:
         "description": description,
         "duration_minutes": duration,
         "fixed_duration_minutes": None if requires_choice else duration,
-        "price_pence": price,
+        "price_pence": None if requires_choice else price,
         "is_active": is_active,
         "aliases": clean_aliases,
         "requires_duration_choice": requires_choice,
@@ -8277,6 +8343,65 @@ def admin_service_response(row: dict) -> dict:
     return result
 
 
+def service_alias_identity_set(service_name, aliases) -> set[str]:
+    if isinstance(aliases, str):
+        aliases = [aliases]
+
+    values = [
+        service_name,
+        *(aliases or []),
+    ]
+    return {
+        normalise_service_match_text(value)
+        for value in values
+        if normalise_service_match_text(value)
+    }
+
+
+def reject_active_service_alias_conflicts(
+    cleaned: dict,
+    service_id: int | None = None,
+) -> None:
+    if cleaned.get("is_active") is False:
+        return
+
+    new_aliases = service_alias_identity_set(
+        cleaned.get("service_name"),
+        cleaned.get("aliases") or [],
+    )
+
+    if not new_aliases:
+        return
+
+    response = (
+        supabase.table("services")
+        .select("id, service_name, aliases, is_active")
+        .eq("business_slug", BUSINESS_SLUG)
+        .eq("is_active", True)
+        .execute()
+    )
+
+    for row in response.data or []:
+        if service_id is not None and int(row.get("id") or 0) == int(service_id):
+            continue
+
+        overlap = new_aliases.intersection(
+            service_alias_identity_set(
+                row.get("service_name"),
+                row.get("aliases") or [],
+            )
+        )
+
+        if overlap:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Another active service already uses one of these "
+                    f"aliases: {', '.join(sorted(overlap))}."
+                ),
+            )
+
+
 @app.get("/admin/services")
 async def list_admin_services(request: Request):
     require_authenticated_admin(request)
@@ -8303,6 +8428,7 @@ async def create_admin_service(payload: AdminServicePayload, request: Request):
     require_authenticated_admin(request)
     values = payload.model_dump(exclude_unset=True)
     cleaned = clean_admin_service_payload(values, require_all=True)
+    reject_active_service_alias_conflicts(cleaned)
     response = supabase.table("services").insert(cleaned).execute()
     if not response.data:
         raise HTTPException(status_code=500, detail="Service could not be created.")
@@ -8326,6 +8452,7 @@ async def update_admin_service(service_id: int, payload: AdminServicePayload, re
     current = admin_service_response(existing.data[0])
     current.update(payload.model_dump(exclude_unset=True))
     cleaned = clean_admin_service_payload(current, require_all=True)
+    reject_active_service_alias_conflicts(cleaned, service_id)
     response = (
         supabase.table("services")
         .update(cleaned)
@@ -8341,6 +8468,21 @@ async def update_admin_service(service_id: int, payload: AdminServicePayload, re
 
 async def set_admin_service_active(service_id: int, active: bool, request: Request):
     require_authenticated_admin(request)
+    if active:
+        existing = (
+            supabase.table("services")
+            .select("*")
+            .eq("business_slug", BUSINESS_SLUG)
+            .eq("id", service_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Service not found.")
+        cleaned = admin_service_response(existing.data[0])
+        cleaned["is_active"] = True
+        reject_active_service_alias_conflicts(cleaned, service_id)
+
     response = (
         supabase.table("services")
         .update({"is_active": active})
@@ -11707,6 +11849,23 @@ def render_next_question(
         )
 
         if allowed:
+            metadata = active_service_metadata_from_state(state)
+            options_with_prices = service_duration_price_options(metadata)
+            has_duration_prices = bool(
+                (metadata or {}).get("price_by_duration")
+            )
+            service_name = str(
+                (metadata or {}).get("service_name")
+                or state.get("treatment")
+                or ""
+            ).strip()
+
+            if service_name and options_with_prices and has_duration_prices:
+                return (
+                    f"{service_name} is available as "
+                    f"{options_with_prices}. Which would you prefer?"
+                )
+
             return (
                 "How long would you like the session for: "
                 + format_duration_options(allowed)
@@ -12838,7 +12997,10 @@ def enforce_response_duration_consistency(reply: str, state: dict) -> str:
     if not canonical_minutes:
         return reply
 
-    metadata = authoritative_service_metadata(state.get("treatment"))
+    metadata = (
+        authoritative_service_metadata(state.get("treatment"))
+        or structured_service_identity(state.get("treatment"))
+    )
     canonical_price_pence = simple_request_price_pence(
         metadata,
         canonical_minutes,
@@ -12926,24 +13088,25 @@ def simple_request_price_pence(
     if not metadata:
         return None
 
+    prices = metadata.get("price_by_duration") or {}
+
+    if duration_minutes is not None:
+        value = prices.get(
+            str(duration_minutes)
+        )
+
+        if value not in [None, ""]:
+            return int(value)
+
+    if metadata.get("booking_mode") == "choose_duration":
+        return None
+
     fixed_price = metadata.get("price_pence")
 
     if fixed_price not in [None, ""]:
         return int(fixed_price)
 
-    prices = metadata.get("price_by_duration") or {}
-
-    if duration_minutes is None:
-        return None
-
-    value = prices.get(
-        str(duration_minutes)
-    )
-
-    if value in [None, ""]:
-        return None
-
-    return int(value)
+    return None
 
 
 def load_active_simple_request(

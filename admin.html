@@ -1248,7 +1248,7 @@
                 variant_name: get("variant_name").value.trim() || null,
                 description: get("description").value.trim() || null,
                 duration_minutes: requiresChoice ? null : Number(get("duration_minutes").value),
-                price_pence: requiresChoice ? Object.values(durationPrices)[0] : poundsToPence(get("price").value),
+                price_pence: requiresChoice ? null : poundsToPence(get("price").value),
                 aliases: get("aliases").value.split(",").map((item) => item.trim()).filter(Boolean),
                 requires_duration_choice: requiresChoice,
                 sort_order: Number(get("sort_order").value || 0),
