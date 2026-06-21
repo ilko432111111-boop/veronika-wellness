@@ -1221,6 +1221,24 @@ def explicit_duration_minutes_from_reply(
     ).get("minutes")
 
 
+def message_has_explicit_duration_signal(value: str | None) -> bool:
+    cleaned = str(value or "").strip().lower()
+
+    if not cleaned:
+        return False
+
+    return bool(
+        re.search(
+            r"\b(?:minutes?|mins?|min|hours?|hrs?|hr|h)\b",
+            cleaned,
+        )
+        or re.search(
+            r"\b(?:hour\s+and\s+a\s+half|half\s+(?:an?|one)\s+hour)\b",
+            cleaned,
+        )
+    )
+
+
 def duration_reply_resolution(
     latest_message: str,
     previous_assistant_message: str = "",
@@ -1232,6 +1250,9 @@ def duration_reply_resolution(
     duration_was_requested = (
         "how long" in lower_previous
         or "duration" in lower_previous
+    )
+    explicit_duration_signal = message_has_explicit_duration_signal(
+        latest_message
     )
     bare_options = allowed if allowed and (
         duration_was_requested or len(allowed) > 1
@@ -1245,6 +1266,11 @@ def duration_reply_resolution(
         if allowed
         else candidates
     )
+    explicit_duration_context = bool(
+        duration_was_requested
+        or explicit_duration_signal
+        or valid_candidates
+    )
 
     return {
         "minutes": (
@@ -1252,9 +1278,16 @@ def duration_reply_resolution(
             if len(valid_candidates) == 1 and len(candidates) == 1
             else None
         ),
-        "ambiguous": len(candidates) > 1,
+        "ambiguous": len(candidates) > 1 and explicit_duration_context,
         "candidates": sorted(candidates),
-        "explicit_invalid": len(candidates) == 1 and not valid_candidates,
+        "explicit_invalid": bool(
+            len(candidates) == 1
+            and not valid_candidates
+            and (
+                duration_was_requested
+                or explicit_duration_signal
+            )
+        ),
     }
 
 
@@ -10433,7 +10466,7 @@ BOOKING_INTENTS = {
 
 
 def serialisable_saved_state(state: dict) -> dict:
-    return {
+    result = {
         field: state.get(field)
         for field in [
             *CORE_STATE_FIELDS,
@@ -10445,6 +10478,24 @@ def serialisable_saved_state(state: dict) -> dict:
             "verified_alternatives",
         ]
     }
+    service_name = state.get("active_service_name") or state.get("treatment")
+    duration_minutes = parse_duration_minutes(
+        state.get("duration")
+    )
+    metadata = (
+        active_service_metadata_from_state(state)
+        if service_name
+        else None
+    )
+    price_pence = simple_request_price_pence(
+        metadata,
+        duration_minutes,
+    )
+
+    result["service_name"] = service_name
+    result["duration_minutes"] = duration_minutes
+    result["price_pence"] = price_pence
+    return result
 
 
 def build_authoritative_services_context() -> str:
@@ -13316,6 +13367,7 @@ def compose_verified_customer_reply(
             return enforce_response_duration_consistency(
                 policy_body or specific_price_body,
                 state,
+                calendar_result,
             )
 
         parts = []
@@ -13371,6 +13423,7 @@ def compose_verified_customer_reply(
                 "\n\n".join(parts)
             ),
             state,
+            calendar_result,
         )
 
     if info_only_without_booking_intent:
@@ -13543,10 +13596,124 @@ def compose_verified_customer_reply(
             )
         ),
         state,
+        calendar_result,
     )
 
 
-def enforce_response_duration_consistency(reply: str, state: dict) -> str:
+def canonical_duration_choice_is_complete(state: dict) -> bool:
+    canonical_minutes = parse_duration_minutes(state.get("duration"))
+
+    if not canonical_minutes:
+        return False
+
+    metadata = active_service_metadata_from_state(state)
+
+    if not metadata:
+        metadata = (
+            authoritative_service_metadata(state.get("treatment"))
+            or structured_service_identity(state.get("treatment"))
+        )
+
+    if not metadata:
+        return True
+
+    allowed = {
+        int(value)
+        for value in metadata.get("allowed_durations_minutes") or []
+        if str(value).isdigit()
+    }
+    fixed_minutes = metadata.get("fixed_duration_minutes")
+
+    if fixed_minutes not in [None, ""]:
+        allowed.add(int(fixed_minutes))
+
+    if allowed and canonical_minutes not in allowed:
+        return False
+
+    if metadata.get("booking_mode") == "choose_duration":
+        return simple_request_price_pence(
+            metadata,
+            canonical_minutes,
+        ) is not None
+
+    return True
+
+
+def response_asks_for_duration_choice(reply: str) -> bool:
+    cleaned = normalise_service_match_text(reply)
+
+    if not cleaned:
+        return False
+
+    duration_question_phrases = [
+        "which duration would you prefer",
+        "which duration do you prefer",
+        "which duration would you like",
+        "how long would you like",
+        "how long do you want",
+    ]
+
+    if any(phrase in cleaned for phrase in duration_question_phrases):
+        return True
+
+    return bool(
+        "which would you prefer" in cleaned
+        and re.search(
+            r"\b\d{1,3}\s*(?:minutes?|mins?|min|hours?|hrs?|hr)\b",
+            str(reply or "").lower(),
+        )
+    )
+
+
+def enforce_completed_duration_question_guard(
+    reply: str,
+    state: dict,
+    calendar_result: dict | None = None,
+) -> str:
+    if (
+        not canonical_duration_choice_is_complete(state)
+        or not response_asks_for_duration_choice(reply)
+    ):
+        return reply
+
+    next_detail = compute_next_required_detail(state, True)
+
+    if next_detail == "duration":
+        next_detail = None
+
+    parts = []
+    calendar_text = safe_calendar_customer_text(
+        state,
+        calendar_result or {"status": "not_checked"},
+    )
+    next_question = render_next_question(
+        state,
+        next_detail,
+    )
+
+    if calendar_text:
+        parts.append(calendar_text)
+
+    if next_question:
+        parts.append(next_question)
+
+    if parts:
+        return collapse_repeated_reply_content(
+            "\n\n".join(parts)
+        )
+
+    canonical_minutes = parse_duration_minutes(state.get("duration"))
+    return (
+        "I've noted the "
+        f"{format_minutes_as_duration(canonical_minutes)} duration."
+    )
+
+
+def enforce_response_duration_consistency(
+    reply: str,
+    state: dict,
+    calendar_result: dict | None = None,
+) -> str:
     """Remove model wording that contradicts canonical duration-linked state."""
     canonical_minutes = parse_duration_minutes(state.get("duration"))
 
@@ -13583,13 +13750,21 @@ def enforce_response_duration_consistency(reply: str, state: dict) -> str:
         safe_sentences.append(sentence)
 
     if not conflict_found:
-        return reply
+        return enforce_completed_duration_question_guard(
+            reply,
+            state,
+            calendar_result,
+        )
 
     safe_sentences.insert(
         0,
         f"I've noted the {format_minutes_as_duration(canonical_minutes)} duration.",
     )
-    return collapse_repeated_reply_content(" ".join(safe_sentences))
+    return enforce_completed_duration_question_guard(
+        collapse_repeated_reply_content(" ".join(safe_sentences)),
+        state,
+        calendar_result,
+    )
 
 
 def response_price_pence_values(value: str) -> set[int]:
